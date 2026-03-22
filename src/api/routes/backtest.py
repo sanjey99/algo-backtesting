@@ -138,13 +138,14 @@ def list_runs(db: DBDep, limit: int = 50):
     result = []
     for run in runs:
         m = get_metrics(db, run.id)
+        equity_pts = get_equity_curve(db, run.id)
         result.append(BacktestSummary(
             run_id=run.id,
             strategy_name=run.strategy_name,
             symbol=run.symbol,
             start_date=run.start_date,
             end_date=run.end_date,
-            final_equity=m.get("total_return", 0.0) * run.initial_capital + run.initial_capital,
+            final_equity=equity_pts[-1].equity if equity_pts else run.initial_capital,
             initial_capital=run.initial_capital,
             metrics=m,
         ))

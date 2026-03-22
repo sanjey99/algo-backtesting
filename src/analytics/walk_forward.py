@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from src.analytics.metrics import compute_all_metrics, equity_curve_to_returns, sharpe_ratio
@@ -22,10 +23,10 @@ from src.strategies.base import BaseStrategy
 @dataclass
 class WindowResult:
     window_index: int
-    in_sample_start: int
-    in_sample_end: int
-    oos_start: int
-    oos_end: int
+    in_sample_start: datetime
+    in_sample_end: datetime
+    oos_start: datetime
+    oos_end: datetime
     best_params: dict[str, Any]
     oos_sharpe: float
     oos_result: BacktestResult
@@ -162,10 +163,10 @@ class WalkForwardAnalyzer:
             windows.append(
                 WindowResult(
                     window_index=window_idx,
-                    in_sample_start=start,
-                    in_sample_end=is_end,
-                    oos_start=is_end,
-                    oos_end=oos_end,
+                    in_sample_start=candles[start].timestamp,
+                    in_sample_end=candles[is_end - 1].timestamp,
+                    oos_start=candles[is_end].timestamp,
+                    oos_end=candles[oos_end - 1].timestamp,
                     best_params=best_params,
                     oos_sharpe=oos_sharpe,
                     oos_result=oos_result,

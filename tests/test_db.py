@@ -60,7 +60,6 @@ SAMPLE_RUN = dict(
 class TestCRUD:
     def test_save_and_retrieve_run(self, db_session) -> None:
         run_id = save_backtest_run(db_session, **SAMPLE_RUN)
-        db_session.commit()
 
         run = get_backtest_run(db_session, run_id)
         assert run is not None
@@ -74,14 +73,12 @@ class TestCRUD:
 
     def test_custom_run_id(self, db_session) -> None:
         run_id = save_backtest_run(db_session, run_id="custom-id-123", **SAMPLE_RUN)
-        db_session.commit()
         assert run_id == "custom-id-123"
         run = get_backtest_run(db_session, "custom-id-123")
         assert run is not None
 
     def test_trades_persisted(self, db_session) -> None:
         run_id = save_backtest_run(db_session, **SAMPLE_RUN)
-        db_session.commit()
 
         trades = get_trades(db_session, run_id)
         assert len(trades) == 1
@@ -90,7 +87,6 @@ class TestCRUD:
 
     def test_equity_curve_persisted(self, db_session) -> None:
         run_id = save_backtest_run(db_session, **SAMPLE_RUN)
-        db_session.commit()
 
         curve = get_equity_curve(db_session, run_id)
         assert len(curve) == 2
@@ -98,7 +94,6 @@ class TestCRUD:
 
     def test_metrics_persisted(self, db_session) -> None:
         run_id = save_backtest_run(db_session, **SAMPLE_RUN)
-        db_session.commit()
 
         metrics = get_metrics(db_session, run_id)
         assert metrics["sharpe_ratio"] == pytest.approx(1.24)
@@ -107,7 +102,6 @@ class TestCRUD:
     def test_list_backtest_runs(self, db_session) -> None:
         save_backtest_run(db_session, **SAMPLE_RUN)
         save_backtest_run(db_session, **SAMPLE_RUN)
-        db_session.commit()
 
         runs = list_backtest_runs(db_session)
         assert len(runs) == 2
@@ -115,7 +109,6 @@ class TestCRUD:
     def test_round_trip_metrics_identical(self, db_session) -> None:
         """Save and load produces identical metrics."""
         run_id = save_backtest_run(db_session, **SAMPLE_RUN)
-        db_session.commit()
 
         loaded = get_metrics(db_session, run_id)
         for key, value in SAMPLE_RUN["metrics"].items():
@@ -138,6 +131,7 @@ class TestCRUD:
 
         # Read session — completely fresh
         session2 = SessionFactory()
+        session2.expire_all()  # force real DB round-trip
         run = get_backtest_run(session2, run_id)
         assert run is not None
         assert run.strategy_name == SAMPLE_RUN["strategy_name"]
