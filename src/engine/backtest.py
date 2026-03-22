@@ -82,7 +82,7 @@ class BacktestEngine:
 
     def __init__(self) -> None:
         self._pending_orders: list[Order] = []
-        self._pending_order_ages: dict[int, int] = {}   # id(order) -> bars pending
+        self._pending_order_ages: dict[str, int] = {}   # order_id -> bars pending
         self._event_queue: deque[Event] = deque()
 
     def run(
@@ -113,28 +113,28 @@ class BacktestEngine:
 
         for candle in candles:
             # Execute pending orders from previous bar at THIS bar's open → enqueue FillEvents
-            filled_object_ids: set[int] = set()
+            filled_ids: set[str] = set()
             for order in self._pending_orders:
                 fill = broker.execute(order, candle)
                 if fill is not None:
                     self._event_queue.append(fill)  # FillEvent directly
-                    filled_object_ids.add(id(order))
+                    filled_ids.add(order.order_id)
 
             # Keep unfilled LIMIT/STOP orders; discard filled orders and MARKET orders
             self._pending_orders = [
                 o for o in self._pending_orders
-                if id(o) not in filled_object_ids
+                if o.order_id not in filled_ids
                 and o.order_type != OrderType.MARKET
             ]
 
             # Increment age of persisting orders and expire old ones
             self._pending_order_ages = {
-                id(o): self._pending_order_ages.get(id(o), 0) + 1
+                o.order_id: self._pending_order_ages.get(o.order_id, 0) + 1
                 for o in self._pending_orders
             }
             self._pending_orders = [
                 o for o in self._pending_orders
-                if self._pending_order_ages.get(id(o), 0) <= MAX_BARS_PENDING
+                if self._pending_order_ages.get(o.order_id, 0) < MAX_BARS_PENDING
             ]
 
             # Enqueue market event for this bar
@@ -208,7 +208,7 @@ class BacktestEngine:
         if not has_position:
             # No position open — enter in the signal direction
             quantity = sizer.calculate(signal, portfolio, candle.close)
-            return Order(
+            order = Order(
                 symbol=symbol,
                 direction=signal.direction,
                 quantity=quantity,
@@ -216,6 +216,8 @@ class BacktestEngine:
                 limit_price=signal.limit_price,
                 stop_price=signal.stop_price,
             )
+            order.order_id = str(uuid.uuid4())[:8]
+            return order
 
         # Position already open — only act if signal is a reversal / close
         existing_dir = portfolio.open_positions[symbol][0]
@@ -225,12 +227,14 @@ class BacktestEngine:
             # as closing the existing leg.  We use the existing position's
             # quantity so we close exactly what we have.
             existing_qty = portfolio.open_positions[symbol][1]
-            return Order(
+            order = Order(
                 symbol=symbol,
                 direction=signal.direction,
                 quantity=existing_qty,
                 order_type=OrderType.MARKET,
             )
+            order.order_id = str(uuid.uuid4())[:8]
+            return order
 
         # Signal is in the same direction as existing position — ignore
         return None
