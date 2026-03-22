@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from src.models.candle import Candle
-from src.models.order import Direction, Order
+from src.models.order import Direction, Order, OrderType
 
 
 class Event(ABC):
@@ -29,6 +29,9 @@ class SignalEvent(Event):
     direction: Direction
     strength: float = 1.0  # 0.0-1.0, used by position sizer
     timestamp: datetime = field(default_factory=datetime.utcnow)
+    order_type: OrderType = OrderType.MARKET   # NEW
+    limit_price: float | None = None            # NEW
+    stop_price: float | None = None             # NEW
 
 
 @dataclass

@@ -214,3 +214,78 @@ class TestBacktestEngine:
         trade = result.trades[0]
         # 10% of 100_000 / 100.0 = 100 shares
         assert trade.quantity == 100
+
+    def test_limit_order_persists_until_condition_met(self) -> None:
+        """A LIMIT BUY at 95 placed on bar 0 should only fill when candle.low <= 95."""
+        from datetime import datetime, timedelta
+        from src.models.order import OrderType
+
+        def _make_bar(i: int, low: float, high: float, close: float) -> Candle:
+            return Candle(
+                timestamp=datetime(2023, 1, 2) + timedelta(days=i),
+                open=close - 0.5,
+                high=high,
+                low=low,
+                close=close,
+                volume=1_000_000,
+                adj_close=close,
+            )
+
+        candles = [
+            _make_bar(0, 97.0, 102.0, 100.0),  # signal bar — emit LIMIT BUY at 95
+            _make_bar(1, 97.0, 101.0, 99.0),   # low=97 > 95 → no fill
+            _make_bar(2, 97.0, 101.0, 98.5),   # low=97 > 95 → no fill
+            _make_bar(3, 97.0, 100.0, 98.0),   # low=97 > 95 → no fill
+            _make_bar(4, 93.0, 99.0, 95.0),    # low=93 <= 95 → FILLS at 95.0
+            _make_bar(5, 94.0, 98.0, 96.0),    # bar to let the fill settle
+        ]
+
+        class _LimitBuyDay0Strategy:
+            name = "limit_buy"
+            parameters: dict = {}
+            symbol: str = "X"
+            _bar = 0
+
+            def on_candle(self, candle: Candle) -> SignalEvent | None:
+                if self._bar == 0:
+                    self._bar += 1
+                    return SignalEvent(
+                        symbol=self.symbol,
+                        direction=Direction.LONG,
+                        order_type=OrderType.LIMIT,
+                        limit_price=95.0,
+                        timestamp=candle.timestamp,
+                    )
+                self._bar += 1
+                return None
+
+        strategy = _LimitBuyDay0Strategy()
+        config = BacktestConfig(initial_capital=100_000.0, commission_pct=0.0, slippage_pct=0.0)
+        result = BacktestEngine().run(strategy, candles, config, symbol="X")
+
+        # No closed trades (position was opened but never closed)
+        assert len(result.trades) == 0
+        # LIMIT filled on bar 4 at 95, price ends at 96 — equity reflects open LONG position
+        assert result.final_equity > 100_000.0
+
+    def test_breakout_strategy_emits_stop_entry_signal(self) -> None:
+        """BreakoutStrategy should emit STOP order type for entries."""
+        from src.strategies.breakout import Breakout
+        from src.models.order import OrderType
+
+        strategy = Breakout(period=3)
+        strategy.symbol = "X"
+
+        candles = make_candle_series(n=10, base=100.0)
+
+        signals = []
+        for c in candles:
+            s = strategy.on_candle(c)
+            if s is not None:
+                signals.append(s)
+
+        # All entry (LONG) signals should be STOP type with a stop_price set
+        long_signals = [s for s in signals if s.direction == Direction.LONG]
+        for s in long_signals:
+            assert s.order_type == OrderType.STOP
+            assert s.stop_price is not None

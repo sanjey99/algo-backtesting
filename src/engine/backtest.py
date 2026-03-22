@@ -82,6 +82,7 @@ class BacktestEngine:
 
     def __init__(self) -> None:
         self._pending_orders: list[Order] = []
+        self._pending_order_ages: dict[int, int] = {}   # id(order) -> bars pending
         self._event_queue: deque[Event] = deque()
 
     def run(
@@ -105,15 +106,36 @@ class BacktestEngine:
         strategy.symbol = symbol
 
         self._pending_orders.clear()
+        self._pending_order_ages.clear()
         self._event_queue.clear()
+
+        MAX_BARS_PENDING = 50  # GTC up to 50 bars, then cancel
 
         for candle in candles:
             # Execute pending orders from previous bar at THIS bar's open → enqueue FillEvents
+            filled_object_ids: set[int] = set()
             for order in self._pending_orders:
                 fill = broker.execute(order, candle)
                 if fill is not None:
                     self._event_queue.append(fill)  # FillEvent directly
-            self._pending_orders.clear()
+                    filled_object_ids.add(id(order))
+
+            # Keep unfilled LIMIT/STOP orders; discard filled orders and MARKET orders
+            self._pending_orders = [
+                o for o in self._pending_orders
+                if id(o) not in filled_object_ids
+                and o.order_type != OrderType.MARKET
+            ]
+
+            # Increment age of persisting orders and expire old ones
+            self._pending_order_ages = {
+                id(o): self._pending_order_ages.get(id(o), 0) + 1
+                for o in self._pending_orders
+            }
+            self._pending_orders = [
+                o for o in self._pending_orders
+                if self._pending_order_ages.get(id(o), 0) <= MAX_BARS_PENDING
+            ]
 
             # Enqueue market event for this bar
             self._event_queue.append(MarketEvent(symbol=symbol, candle=candle))
@@ -190,7 +212,9 @@ class BacktestEngine:
                 symbol=symbol,
                 direction=signal.direction,
                 quantity=quantity,
-                order_type=OrderType.MARKET,
+                order_type=signal.order_type,
+                limit_price=signal.limit_price,
+                stop_price=signal.stop_price,
             )
 
         # Position already open — only act if signal is a reversal / close

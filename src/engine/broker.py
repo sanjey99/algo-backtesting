@@ -79,7 +79,8 @@ class SimulatedBroker:
         return candle.open * (1.0 - self.slippage_pct)
 
     def _limit_fill(self, order: Order, candle: Candle) -> Optional[float]:
-        assert order.limit_price is not None  # guaranteed by Order.__post_init__
+        if order.limit_price is None:  # guaranteed by Order.__post_init__
+            raise ValueError("LIMIT order requires limit_price")
         limit = order.limit_price
         if order.direction == Direction.LONG:
             # We want to buy: fill only if market dropped to our bid
@@ -92,7 +93,8 @@ class SimulatedBroker:
         return None
 
     def _stop_fill(self, order: Order, candle: Candle) -> Optional[float]:
-        assert order.stop_price is not None  # guaranteed by Order.__post_init__
+        if order.stop_price is None:  # guaranteed by Order.__post_init__
+            raise ValueError("STOP order requires stop_price")
         stop = order.stop_price
         if order.direction == Direction.LONG:
             # Buy stop: triggered when price breaks *above* the stop level

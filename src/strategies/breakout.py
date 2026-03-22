@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 from src.engine.event import SignalEvent
 from src.models.candle import Candle
-from src.models.order import Direction
+from src.models.order import Direction, OrderType
 from src.strategies.base import BaseStrategy
 
 
@@ -64,13 +64,18 @@ class Breakout(BaseStrategy):
             return SignalEvent(
                 symbol=self.symbol,
                 direction=Direction.LONG,
+                strength=1.0,
                 timestamp=candle.timestamp,
+                order_type=OrderType.STOP,
+                stop_price=prev_high,
             )
         if candle.close < prev_low:
             return SignalEvent(
                 symbol=self.symbol,
                 direction=Direction.SHORT,
+                strength=1.0,
                 timestamp=candle.timestamp,
+                # order_type defaults to MARKET — exit at next open
             )
         return None
 
