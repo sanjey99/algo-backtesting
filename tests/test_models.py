@@ -231,3 +231,19 @@ class TestPortfolio:
         # Price moves to 110 — equity should reflect gain
         portfolio.update({"SPY": 110.0}, dt)
         assert portfolio.equity == pytest.approx(portfolio.cash + 100 * 110)
+
+    def test_record_fill_rejects_long_when_insufficient_cash(self) -> None:
+        """Portfolio should reject a LONG fill that exceeds available cash."""
+        portfolio = Portfolio(initial_capital=1000.0)
+        # Try to buy 100 shares at $100 = $10,000 + commission > $1,000
+        result = portfolio.record_fill(
+            symbol="X",
+            direction=Direction.LONG,
+            quantity=100,
+            fill_price=100.0,
+            fill_date=datetime(2023, 1, 1),
+            commission=10.0,
+        )
+        assert result is None
+        assert portfolio.cash == 1000.0  # cash unchanged
+        assert not portfolio.has_position("X")

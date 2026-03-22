@@ -199,3 +199,18 @@ class TestBacktestEngine:
         candles2 = make_candle_series(n=10, base=100.0)
         result2 = engine.run(strategy2, candles2, self._config(), symbol="TEST")
         assert result2.final_equity == self.INITIAL_CAPITAL
+
+    def test_fixed_fraction_sizer_is_respected(self) -> None:
+        """FixedFractionSizer with 10% equity at price ~100 should buy ~100 shares."""
+        from src.engine.position_sizer import FixedFractionSizer
+        candles = make_candle_series(n=51, base=100.0)
+        strategy = _BuyDay0SellDay49Strategy(symbol="TEST")
+        config = BacktestConfig(
+            initial_capital=100_000.0,
+            position_sizer=FixedFractionSizer(fraction=0.10),
+        )
+        result = BacktestEngine().run(strategy, candles, config, symbol="TEST")
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+        # 10% of 100_000 / 100.0 = 100 shares
+        assert trade.quantity == 100

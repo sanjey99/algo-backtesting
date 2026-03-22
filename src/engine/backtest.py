@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional, Protocol
 
 from src.engine.broker import SimulatedBroker
-from src.engine.event import FillEvent, OrderEvent, SignalEvent
+from src.engine.event import Event, FillEvent, MarketEvent, OrderEvent, SignalEvent
+from src.engine.position_sizer import FixedQuantitySizer, PositionSizer
 from src.models.candle import Candle
 from src.models.order import Direction, Order, OrderType
 from src.models.portfolio import EquityPoint, Portfolio
@@ -38,6 +40,7 @@ class BacktestConfig:
     initial_capital: float = 100_000.0
     commission_pct: float = 0.001
     slippage_pct: float = 0.0005
+    position_sizer: PositionSizer | None = None
 
 
 @dataclass
@@ -64,9 +67,10 @@ class BacktestEngine:
     Wiring per bar
     --------------
     1. Execute pending orders from the *previous* bar at THIS bar's open.
-    2. strategy.on_candle(candle)   -> Optional[SignalEvent]
-    3. portfolio.update({symbol: close}, timestamp)   (equity curve point)
-    4. If signal -> build Order and queue for execution on NEXT bar's open.
+    2. Enqueue MarketEvent for this bar.
+    3. Drain the event queue: MarketEvent -> strategy.on_candle -> SignalEvent
+       -> _build_order -> OrderEvent -> deferred to _pending_orders.
+    4. Mark portfolio to close (equity curve point) after all events settled.
 
     This deferred-fill approach eliminates look-ahead bias (R-23): the
     strategy sees the completed bar first, then orders fill at the *next*
@@ -78,6 +82,7 @@ class BacktestEngine:
 
     def __init__(self) -> None:
         self._pending_orders: list[Order] = []
+        self._event_queue: deque[Event] = deque()
 
     def run(
         self,
@@ -94,38 +99,30 @@ class BacktestEngine:
             slippage_pct=config.slippage_pct,
             commission_pct=config.commission_pct,
         )
+        sizer: PositionSizer = config.position_sizer or FixedQuantitySizer(1)
 
         # Set symbol on strategy so signals carry the correct ticker (R-03)
         strategy.symbol = symbol
 
         self._pending_orders.clear()
+        self._event_queue.clear()
 
         for candle in candles:
-            # Step 1: Execute pending orders from previous bar at THIS bar's open
+            # Execute pending orders from previous bar at THIS bar's open → enqueue FillEvents
             for order in self._pending_orders:
                 fill = broker.execute(order, candle)
                 if fill is not None:
-                    portfolio.record_fill(
-                        symbol=fill.symbol,
-                        direction=fill.direction,
-                        quantity=fill.quantity,
-                        fill_price=fill.fill_price,
-                        fill_date=fill.fill_date,
-                        commission=fill.commission,
-                    )
+                    self._event_queue.append(fill)  # FillEvent directly
             self._pending_orders.clear()
 
-            # Step 2: Strategy sees the completed bar
-            signal: Optional[SignalEvent] = strategy.on_candle(candle)
+            # Enqueue market event for this bar
+            self._event_queue.append(MarketEvent(symbol=symbol, candle=candle))
 
-            # Step 3: Mark portfolio to close (equity curve point)
+            # Drain the event queue
+            self._process_events(self._event_queue, strategy, portfolio, candle, sizer)
+
+            # Mark portfolio to close (equity curve point) after all events settled
             portfolio.update({symbol: candle.close}, candle.timestamp)
-
-            # Step 4: Queue order for execution on next bar's open
-            if signal is not None:
-                order = self._build_order(signal, portfolio, candle)
-                if order is not None:
-                    self._pending_orders.append(order)
 
         return BacktestResult(
             strategy_name=strategy.name,
@@ -143,11 +140,44 @@ class BacktestEngine:
     # Private helpers
     # ------------------------------------------------------------------
 
+    def _process_events(
+        self,
+        queue: deque[Event],
+        strategy: Strategy,
+        portfolio: Portfolio,
+        candle: Candle,
+        sizer: PositionSizer,
+    ) -> None:
+        """Drain the event queue for the current bar."""
+        while queue:
+            event = queue.popleft()
+            if isinstance(event, FillEvent):
+                portfolio.record_fill(
+                    symbol=event.symbol,
+                    direction=event.direction,
+                    quantity=event.quantity,
+                    fill_price=event.fill_price,
+                    fill_date=event.fill_date,
+                    commission=event.commission,
+                )
+            elif isinstance(event, MarketEvent):
+                signal = strategy.on_candle(event.candle)
+                if signal is not None:
+                    queue.append(signal)
+            elif isinstance(event, SignalEvent):
+                order = self._build_order(event, portfolio, candle, sizer)
+                if order is not None:
+                    queue.append(OrderEvent(order=order))
+            elif isinstance(event, OrderEvent):
+                # Deferred to next bar's open (R-23 look-ahead bias fix)
+                self._pending_orders.append(event.order)
+
     @staticmethod
     def _build_order(
         signal: SignalEvent,
         portfolio: Portfolio,
         candle: Candle,
+        sizer: PositionSizer,
     ) -> Optional[Order]:
         """Translate a SignalEvent into a MARKET Order, or None if nothing to do."""
         symbol = signal.symbol
@@ -155,10 +185,11 @@ class BacktestEngine:
 
         if not has_position:
             # No position open — enter in the signal direction
+            quantity = sizer.calculate(signal, portfolio, candle.close)
             return Order(
                 symbol=symbol,
                 direction=signal.direction,
-                quantity=1,
+                quantity=quantity,
                 order_type=OrderType.MARKET,
             )
 

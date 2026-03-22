@@ -114,6 +114,14 @@ class Portfolio:
         else:
             # Opening new position
             trade_id = str(uuid.uuid4())[:8]
+            if direction == Direction.LONG:
+                cost = quantity * fill_price + commission
+                if cost > self._cash:
+                    return None  # Insufficient funds — reject fill
+                self._cash -= cost
+            else:
+                # Short: receive proceeds
+                self._cash += quantity * fill_price - commission
             self._open_positions[symbol] = (
                 direction,
                 quantity,
@@ -122,11 +130,6 @@ class Portfolio:
                 trade_id,
                 commission,
             )
-            if direction == Direction.LONG:
-                self._cash -= quantity * fill_price + commission
-            else:
-                # Short: receive proceeds, subtract commission
-                self._cash += quantity * fill_price - commission
             return None
 
     # ------------------------------------------------------------------
