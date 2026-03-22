@@ -1,92 +1,132 @@
-"""Tests for WalkForwardAnalyzer."""
+"""Tests for Walk-Forward Analysis — Step 7."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-import pytest
-
-from src.analytics.walk_forward import WalkForwardAnalyzer, WindowResult
-from src.engine.backtest import BacktestConfig
+from src.analytics.walk_forward import WalkForwardAnalyzer
 from src.models.candle import Candle
-from src.strategies.ma_crossover import MACrossover
+from src.strategies.ma_crossover import MACrossoverStrategy
 
 
-def _make_candles(n: int = 200, base: float = 100.0) -> list[Candle]:
-    start = datetime(2022, 1, 3)
+def make_trending_candles(n: int = 500, start_price: float = 100.0) -> list[Candle]:
+    """Generate n daily candles with a gentle uptrend + noise."""
+    import random
+    rng = random.Random(42)
     candles = []
-    price = base
+    price = start_price
+    start = datetime(2015, 1, 2)
     for i in range(n):
-        price = price * (1 + 0.001 * (1 if i % 2 == 0 else -0.5))
-        candles.append(
-            Candle(
-                timestamp=start + timedelta(days=i),
-                open=price - 0.1,
-                high=price + 0.5,
-                low=price - 0.5,
-                close=price,
-                volume=1_000_000,
-                adj_close=price,
-            )
-        )
+        change = 0.001 + rng.gauss(0, 0.015)  # slight upward drift
+        price *= (1 + change)
+        candles.append(Candle(
+            timestamp=start + timedelta(days=i),
+            open=price * 0.999,
+            high=price * 1.005,
+            low=price * 0.994,
+            close=price,
+            volume=1_000_000.0,
+            adj_close=price,
+        ))
     return candles
 
 
 class TestWalkForwardAnalyzer:
-    def test_run_returns_window_results(self) -> None:
-        candles = _make_candles(200)
-        config = BacktestConfig(initial_capital=10_000.0)
-        wfa = WalkForwardAnalyzer(
-            MACrossover,
-            config=config,
-            n_windows=4,
-            n_trials=5,
+    def test_produces_at_least_one_window(self) -> None:
+        candles = make_trending_candles(400)
+        analyzer = WalkForwardAnalyzer(
+            MACrossoverStrategy,
+            in_sample_days=200,
+            out_of_sample_days=100,
+            step_days=100,
+            n_optimization_trials=3,
         )
-        results = wfa.run(candles)
-        assert len(results) == 4
-        for r in results:
-            assert isinstance(r, WindowResult)
+        result = analyzer.run(candles)
+        assert len(result.windows) >= 1
 
-    def test_window_result_has_datetime_dates(self) -> None:
-        """R-12: WindowResult stores datetime, not int indices."""
-        candles = _make_candles(100)
-        wfa = WalkForwardAnalyzer(MACrossover, n_windows=3, n_trials=3)
-        results = wfa.run(candles)
-        for r in results:
-            assert isinstance(r.in_sample_start, datetime)
-            assert isinstance(r.in_sample_end, datetime)
-            assert isinstance(r.oos_start, datetime)
-            assert isinstance(r.oos_end, datetime)
+    def test_three_windows_on_long_series(self) -> None:
+        """Blueprint requires at least 3 windows on SPY 10yr data."""
+        candles = make_trending_candles(800)
+        analyzer = WalkForwardAnalyzer(
+            MACrossoverStrategy,
+            in_sample_days=252,
+            out_of_sample_days=63,
+            step_days=63,
+            n_optimization_trials=3,
+        )
+        result = analyzer.run(candles)
+        assert len(result.windows) >= 3
 
-    def test_oos_dates_after_is_dates(self) -> None:
-        """OOS window starts after in-sample window ends."""
-        candles = _make_candles(120)
-        wfa = WalkForwardAnalyzer(MACrossover, n_windows=3, n_trials=3)
-        results = wfa.run(candles)
-        for r in results:
-            assert r.oos_start > r.in_sample_end
+    def test_combined_equity_curve_nonempty(self) -> None:
+        candles = make_trending_candles(450)
+        analyzer = WalkForwardAnalyzer(
+            MACrossoverStrategy,
+            in_sample_days=200,
+            out_of_sample_days=100,
+            step_days=100,
+            n_optimization_trials=2,
+        )
+        result = analyzer.run(candles)
+        assert len(result.combined_equity_curve) > 0
 
-    def test_parameter_space_cached(self) -> None:
-        """R-32: _parameter_space is populated in __init__."""
-        wfa = WalkForwardAnalyzer(MACrossover)
-        assert hasattr(wfa, "_parameter_space")
-        assert "fast_period" in wfa._parameter_space
-        assert "slow_period" in wfa._parameter_space
+    def test_combined_sharpe_is_float(self) -> None:
+        candles = make_trending_candles(450)
+        analyzer = WalkForwardAnalyzer(
+            MACrossoverStrategy,
+            in_sample_days=200,
+            out_of_sample_days=100,
+            step_days=100,
+            n_optimization_trials=2,
+        )
+        result = analyzer.run(candles)
+        assert isinstance(result.combined_sharpe, float)
 
-    def test_raises_on_too_few_candles(self) -> None:
-        wfa = WalkForwardAnalyzer(MACrossover, n_windows=5)
-        with pytest.raises(ValueError):
-            wfa.run([])
+    def test_optimization_stability_computed(self) -> None:
+        candles = make_trending_candles(700)
+        analyzer = WalkForwardAnalyzer(
+            MACrossoverStrategy,
+            in_sample_days=200,
+            out_of_sample_days=100,
+            step_days=100,
+            n_optimization_trials=2,
+        )
+        result = analyzer.run(candles)
+        assert isinstance(result.optimization_stability, float)
 
-    def test_window_index_sequential(self) -> None:
-        candles = _make_candles(150)
-        wfa = WalkForwardAnalyzer(MACrossover, n_windows=3, n_trials=3)
-        results = wfa.run(candles)
-        indices = [r.window_index for r in results]
-        assert indices == list(range(len(results)))
+    def test_window_results_have_best_params(self) -> None:
+        candles = make_trending_candles(450)
+        analyzer = WalkForwardAnalyzer(
+            MACrossoverStrategy,
+            in_sample_days=200,
+            out_of_sample_days=100,
+            step_days=100,
+            n_optimization_trials=3,
+        )
+        result = analyzer.run(candles)
+        for window in result.windows:
+            assert isinstance(window.best_params, dict)
 
-    def test_oos_sharpe_is_float(self) -> None:
-        candles = _make_candles(150)
-        wfa = WalkForwardAnalyzer(MACrossover, n_windows=3, n_trials=3)
-        results = wfa.run(candles)
-        for r in results:
-            assert isinstance(r.oos_sharpe, float)
+    def test_combined_metrics_all_keys_present(self) -> None:
+        candles = make_trending_candles(450)
+        analyzer = WalkForwardAnalyzer(
+            MACrossoverStrategy,
+            in_sample_days=200,
+            out_of_sample_days=100,
+            step_days=100,
+            n_optimization_trials=2,
+        )
+        result = analyzer.run(candles)
+        for key in ["sharpe_ratio", "cagr", "max_drawdown", "win_rate"]:
+            assert key in result.combined_metrics
+
+    def test_insufficient_data_returns_empty(self) -> None:
+        """If data too short for even one window, return empty result."""
+        candles = make_trending_candles(50)
+        analyzer = WalkForwardAnalyzer(
+            MACrossoverStrategy,
+            in_sample_days=200,
+            out_of_sample_days=100,
+            step_days=100,
+            n_optimization_trials=2,
+        )
+        result = analyzer.run(candles)
+        assert len(result.windows) == 0

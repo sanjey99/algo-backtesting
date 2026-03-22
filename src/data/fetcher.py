@@ -6,17 +6,15 @@ Provides a DataFetcher ABC plus two concrete implementations:
 """
 from __future__ import annotations
 
-import logging
 import os
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime
 
 import pandas as pd
-import requests
+import requests  # type: ignore[import-untyped]
 
-logger = logging.getLogger(__name__)
-
+DateLike = str | datetime
 
 _ALPHA_VANTAGE_BASE = "https://www.alphavantage.co/query"
 _ALPHA_VANTAGE_CALLS_PER_MIN = 5
@@ -35,8 +33,8 @@ class DataFetcher(ABC):
     def fetch(
         self,
         symbol: str,
-        start: datetime,
-        end: datetime,
+        start: DateLike,
+        end: DateLike,
         interval: str = "1d",
     ) -> pd.DataFrame:
         """Fetch OHLCV data for *symbol* between *start* and *end*.
@@ -87,19 +85,13 @@ class YFinanceFetcher(DataFetcher):
     def fetch(
         self,
         symbol: str,
-        start: datetime,
-        end: datetime,
+        start: DateLike,
+        end: DateLike,
         interval: str = "1d",
     ) -> pd.DataFrame:
-        import yfinance as yf  # lazy import so the class is mock-friendly in tests
+        import yfinance  # lazy import — imported as 'yfinance' so tests can patch 'yfinance.download'
 
-        logger.warning(
-            "YFinanceFetcher: %s data from Yahoo Finance may be subject to "
-            "survivorship bias — only currently-listed companies are available.",
-            symbol,
-        )
-
-        raw: pd.DataFrame = yf.download(
+        raw: pd.DataFrame = yfinance.download(
             symbol,
             start=start,
             end=end,
@@ -186,8 +178,8 @@ class AlphaVantageFetcher(DataFetcher):
     def fetch(
         self,
         symbol: str,
-        start: datetime,
-        end: datetime,
+        start: DateLike,
+        end: DateLike,
         interval: str = "1d",
     ) -> pd.DataFrame:
         """Fetch daily adjusted OHLCV data from Alpha Vantage.
@@ -196,12 +188,6 @@ class AlphaVantageFetcher(DataFetcher):
         ``TIME_SERIES_DAILY_ADJUSTED``. The *interval* parameter is accepted
         for API compatibility but only ``"1d"`` is currently supported.
         """
-        # Coerce start/end to datetime (R-09: fix str/datetime comparison)
-        start_dt: datetime = datetime.fromisoformat(str(start)) if isinstance(start, str) else start
-        end_dt: datetime = datetime.fromisoformat(str(end)) if isinstance(end, str) else end
-
-        logger.info("Fetching %s from Alpha Vantage (%s to %s)", symbol, start_dt.date(), end_dt.date())
-
         params = {
             "function": "TIME_SERIES_DAILY_ADJUSTED",
             "symbol": symbol,
@@ -221,7 +207,7 @@ class AlphaVantageFetcher(DataFetcher):
         rows = []
         for date_str, values in ts_data.items():
             dt = datetime.strptime(date_str, "%Y-%m-%d")
-            if start_dt <= dt <= end_dt:
+            if start <= dt <= end:
                 rows.append(
                     {
                         "timestamp": dt,
@@ -237,7 +223,7 @@ class AlphaVantageFetcher(DataFetcher):
         if not rows:
             raise ValueError(
                 f"Alpha Vantage returned no data for {symbol!r} "
-                f"between {start_dt.date()} and {end_dt.date()}."
+                f"between {start.date()} and {end.date()}."
             )
 
         df = pd.DataFrame(rows).set_index("timestamp").sort_index()

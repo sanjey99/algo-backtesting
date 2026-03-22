@@ -1,7 +1,8 @@
-"""RSI Mean-Reversion strategy — incremental Wilder's RSI, O(1) per bar."""
+"""RSI Mean Reversion strategy — computed from scratch (no TA-Lib)."""
 from __future__ import annotations
 
-from typing import Any, Optional
+from collections import deque
+from typing import Any
 
 from src.engine.event import SignalEvent
 from src.models.candle import Candle
@@ -10,20 +11,17 @@ from src.strategies.base import BaseStrategy
 
 
 class RSIMeanReversionStrategy(BaseStrategy):
-    """Emit LONG when RSI drops below *oversold* and SHORT when RSI
-    rises above *exit_level*.
+    """Buy when RSI falls below oversold threshold; exit when RSI recovers to 50.
 
-    Uses true incremental Wilder's smoothing — O(1) per bar after the
-    seeding phase (first ``period`` price changes).
+    RSI is computed from scratch using Wilder's exponential smoothing:
+      avg_gain = ((prev_avg_gain * (period-1)) + gain) / period
+      avg_loss = ((prev_avg_loss * (period-1)) + loss) / period
+      RS = avg_gain / avg_loss
+      RSI = 100 - (100 / (1 + RS))
 
-    Parameters
-    ----------
-    period : int
-        RSI lookback window (default 14).
-    oversold : float
-        RSI level below which we buy (default 30).
-    exit_level : float
-        RSI level above which we sell (default 50).
+    Interview talking point:
+      Computing RSI from scratch (not via ta-lib or pandas_ta) demonstrates
+      understanding of the underlying math — a standard quant interview signal.
     """
 
     name = "rsi_mean_reversion"
@@ -38,7 +36,6 @@ class RSIMeanReversionStrategy(BaseStrategy):
         oversold: float = 30.0,
         exit_level: float = 50.0,
     ) -> None:
-        super().__init__()
         self.period = period
         self.oversold = oversold
         self.exit_level = exit_level
@@ -47,94 +44,73 @@ class RSIMeanReversionStrategy(BaseStrategy):
             "oversold": oversold,
             "exit_level": exit_level,
         }
-        # Seeding phase: collect first `period` price changes
-        self._seed_gains: list[float] = []
-        self._seed_losses: list[float] = []
-        self._prev_price: float | None = None
+        self._prices: deque[float] = deque(maxlen=period + 1)
         self._avg_gain: float | None = None
         self._avg_loss: float | None = None
         self._rsi: float | None = None
+        self._in_position: bool = False
         self._bar_count: int = 0
 
-    # ------------------------------------------------------------------
-    # BaseStrategy interface
-    # ------------------------------------------------------------------
+    def _compute_rsi(self, prices: list[float]) -> float:
+        """Compute RSI from a price series using Wilder's smoothing."""
+        gains: list[float] = []
+        losses: list[float] = []
+        for i in range(1, len(prices)):
+            diff = prices[i] - prices[i - 1]
+            gains.append(max(diff, 0.0))
+            losses.append(max(-diff, 0.0))
 
-    def on_candle(self, candle: Candle) -> Optional[SignalEvent]:
-        price = candle.adj_close
+        if not gains:
+            return 50.0
+
+        # Seed with simple average over first period
+        avg_gain = sum(gains[:self.period]) / self.period
+        avg_loss = sum(losses[:self.period]) / self.period
+
+        # Wilder's smoothing for remaining periods
+        for gain, loss in zip(gains[self.period:], losses[self.period:]):
+            avg_gain = (avg_gain * (self.period - 1) + gain) / self.period
+            avg_loss = (avg_loss * (self.period - 1) + loss) / self.period
+
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    def on_candle(self, candle: Candle) -> SignalEvent | None:
+        self._prices.append(candle.adj_close)
         self._bar_count += 1
 
-        if self._prev_price is None:
-            # First bar — just record price
-            self._prev_price = price
+        if self._bar_count < self.period + 1:
             return None
 
-        gain = max(price - self._prev_price, 0.0)
-        loss = max(self._prev_price - price, 0.0)
-        self._prev_price = price
+        self._rsi = self._compute_rsi(list(self._prices))
 
-        if self._avg_gain is None:
-            # Phase 1: accumulate seed data
-            self._seed_gains.append(gain)
-            self._seed_losses.append(loss)
+        signal: SignalEvent | None = None
 
-            if len(self._seed_gains) == self.period:
-                # Seed complete — compute initial averages
-                self._avg_gain = sum(self._seed_gains) / self.period
-                self._avg_loss = sum(self._seed_losses) / self.period
-                # Clear seed lists (no longer needed)
-                self._seed_gains.clear()
-                self._seed_losses.clear()
-                self._rsi = self._rsi_from_averages()
-        else:
-            # Phase 2: incremental Wilder update
-            self._avg_gain = (self._avg_gain * (self.period - 1) + gain) / self.period
-            self._avg_loss = (self._avg_loss * (self.period - 1) + loss) / self.period
-            self._rsi = self._rsi_from_averages()
-
-        if self._rsi is None:
-            return None
-
-        signal: Optional[SignalEvent] = None
-        if self._rsi < self.oversold:
+        if not self._in_position and self._rsi < self.oversold:
             signal = SignalEvent(
-                symbol=self.symbol,
+                symbol="",
                 direction=Direction.LONG,
                 strength=(self.oversold - self._rsi) / self.oversold,
                 timestamp=candle.timestamp,
             )
-        elif self._rsi >= self.exit_level:
+            self._in_position = True
+        elif self._in_position and self._rsi >= self.exit_level:
             signal = SignalEvent(
-                symbol=self.symbol,
+                symbol="",
                 direction=Direction.SHORT,
                 strength=1.0,
                 timestamp=candle.timestamp,
             )
+            self._in_position = False
+
         return signal
 
     def reset(self) -> None:
-        self._seed_gains.clear()
-        self._seed_losses.clear()
-        self._prev_price = None
+        self._prices.clear()
         self._avg_gain = None
         self._avg_loss = None
         self._rsi = None
+        self._in_position = False
         self._bar_count = 0
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _rsi_from_averages(self) -> float:
-        """Compute RSI from current avg_gain and avg_loss."""
-        if self._avg_loss == 0.0:
-            return 100.0
-        rs = self._avg_gain / self._avg_loss  # type: ignore[operator]
-        return 100.0 - (100.0 / (1.0 + rs))
-
-
-# ---------------------------------------------------------------------------
-# Backwards-compatible alias (existing code that imports RSIMeanReversion
-# by the old name will still work).
-# ---------------------------------------------------------------------------
-RSIMeanReversion = RSIMeanReversionStrategy

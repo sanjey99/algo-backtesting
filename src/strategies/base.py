@@ -1,31 +1,40 @@
-"""BaseStrategy — abstract base class for all concrete strategies."""
+"""BaseStrategy — ABC that all concrete strategies inherit from."""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any
 
 from src.engine.event import SignalEvent
 from src.models.candle import Candle
 
 
 class BaseStrategy(ABC):
-    """Abstract base that concrete strategies inherit from.
+    """Abstract trading strategy.
 
-    Provides instance-level dicts so subclasses never accidentally share
-    mutable class-level state (R-14).  The ``symbol`` attribute is set by
-    the engine before the bar-loop begins (R-03).
+    Concrete strategies must implement:
+    - on_candle(candle) -> Optional[SignalEvent]
+    - reset() — clear all indicator state for a fresh backtest
+
+    They should set:
+    - name: human-readable identifier
+    - parameters: current hyperparameter values
+    - parameter_space: dict[str, (min, max, step)] — used by WalkForwardAnalyzer
     """
 
     name: str = "base_strategy"
-
-    def __init__(self) -> None:
-        self.parameters: dict[str, Any] = {}
-        self.parameter_space: dict[str, tuple[float, float, float]] = {}
-        self.symbol: str = "UNKNOWN"
+    parameters: dict[str, Any] = {}
+    parameter_space: dict[str, tuple[float, float, float]] = {}
 
     @abstractmethod
-    def on_candle(self, candle: Candle) -> Optional[SignalEvent]:
-        """Process one OHLCV candle and optionally emit a signal."""
+    def on_candle(self, candle: Candle) -> SignalEvent | None:
+        """Process one bar; return a SignalEvent or None."""
+        ...
 
+    @abstractmethod
     def reset(self) -> None:
-        """Reset all internal state so the strategy can be re-used."""
+        """Clear all indicator state. Called before each backtest run."""
+        ...
+
+    def generate_orders(self, candle: Candle) -> SignalEvent | None:
+        """Alias for on_candle — kept for API compatibility."""
+        return self.on_candle(candle)

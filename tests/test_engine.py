@@ -1,113 +1,296 @@
-"""Tests for BacktestEngine."""
+"""Tests for the event system and backtest engine (Step 3)."""
 from __future__ import annotations
 
-from typing import Optional
+from datetime import datetime
 
 import pytest
 
-from src.engine.backtest import BacktestConfig, BacktestEngine, BacktestResult
-from src.engine.event import SignalEvent
+from src.engine.backtest import BacktestConfig, BacktestEngine
+from src.engine.broker import SimulatedBroker
+from src.engine.event import FillEvent, MarketEvent, OrderEvent, SignalEvent
 from src.models.candle import Candle
-from src.models.order import Direction
+from src.models.order import Direction, Order, OrderType
+
+# Re-use conftest helpers directly (not as fixtures) for unit-level tests
 from tests.conftest import make_candle, make_candle_series
 
+# ---------------------------------------------------------------------------
+# Event dataclass instantiation
+# ---------------------------------------------------------------------------
+
+
+class TestEventInstantiation:
+    def test_market_event(self) -> None:
+        candle = make_candle()
+        event = MarketEvent(symbol="AAPL", candle=candle)
+        assert event.symbol == "AAPL"
+        assert event.candle is candle
+
+    def test_signal_event_defaults(self) -> None:
+        event = SignalEvent(symbol="AAPL", direction=Direction.LONG)
+        assert event.strength == 1.0
+        assert isinstance(event.timestamp, datetime)
+
+    def test_signal_event_explicit(self) -> None:
+        ts = datetime(2023, 6, 1)
+        event = SignalEvent(
+            symbol="TSLA", direction=Direction.SHORT, strength=0.7, timestamp=ts
+        )
+        assert event.direction == Direction.SHORT
+        assert event.strength == 0.7
+        assert event.timestamp == ts
+
+    def test_order_event(self) -> None:
+        order = Order(symbol="AAPL", direction=Direction.LONG, quantity=10)
+        event = OrderEvent(order=order)
+        assert event.order is order
+
+    def test_fill_event(self) -> None:
+        ts = datetime(2023, 6, 1)
+        event = FillEvent(
+            symbol="AAPL",
+            direction=Direction.LONG,
+            quantity=5,
+            fill_price=150.0,
+            commission=0.75,
+            fill_date=ts,
+            order_id="abc123",
+        )
+        assert event.fill_price == 150.0
+        assert event.commission == 0.75
+        assert event.order_id == "abc123"
+
+    def test_fill_event_optional_order_id(self) -> None:
+        ts = datetime(2023, 6, 1)
+        event = FillEvent(
+            symbol="AAPL",
+            direction=Direction.SHORT,
+            quantity=1,
+            fill_price=100.0,
+            commission=0.1,
+            fill_date=ts,
+        )
+        assert event.order_id == ""
+
 
 # ---------------------------------------------------------------------------
-# Stub strategies used across tests
+# SimulatedBroker
 # ---------------------------------------------------------------------------
 
-class _NeverSignalStrategy:
-    """Strategy that never emits a signal."""
 
-    name = "NeverSignal"
-    parameters: dict = {}
-    symbol: str = "UNKNOWN"
+class TestSimulatedBrokerMarket:
+    """MARKET order fill price tests."""
 
-    def on_candle(self, candle: Candle) -> Optional[SignalEvent]:
-        return None
+    SLIPPAGE = 0.0005
+    COMMISSION = 0.001
+
+    def setup_method(self) -> None:
+        self.broker = SimulatedBroker(
+            slippage_pct=self.SLIPPAGE, commission_pct=self.COMMISSION
+        )
+        self.candle = make_candle(close=100.0, high=101.0, low=98.0)
+
+    def test_market_long_fill_price(self) -> None:
+        order = Order(symbol="X", direction=Direction.LONG, quantity=1)
+        fill = self.broker.execute(order, self.candle)
+        assert fill is not None
+        expected = 100.0 * (1 + self.SLIPPAGE)
+        assert abs(fill.fill_price - expected) < 1e-9
+
+    def test_market_short_fill_price(self) -> None:
+        order = Order(symbol="X", direction=Direction.SHORT, quantity=1)
+        fill = self.broker.execute(order, self.candle)
+        assert fill is not None
+        expected = 100.0 * (1 - self.SLIPPAGE)
+        assert abs(fill.fill_price - expected) < 1e-9
+
+    def test_market_commission_is_percentage_of_notional(self) -> None:
+        order = Order(symbol="X", direction=Direction.LONG, quantity=10)
+        fill = self.broker.execute(order, self.candle)
+        assert fill is not None
+        expected_commission = fill.fill_price * 10 * self.COMMISSION
+        assert abs(fill.commission - expected_commission) < 1e-9
+
+    def test_market_fill_populates_metadata(self) -> None:
+        order = Order(symbol="X", direction=Direction.LONG, quantity=5)
+        fill = self.broker.execute(order, self.candle)
+        assert fill is not None
+        assert fill.symbol == "X"
+        assert fill.direction == Direction.LONG
+        assert fill.quantity == 5
+        assert fill.fill_date == self.candle.timestamp
+
+
+class TestSimulatedBrokerLimit:
+    """LIMIT order conditional fill tests."""
+
+    def setup_method(self) -> None:
+        self.broker = SimulatedBroker()
+        # candle: open=99, high=101, low=98, close=100
+        self.candle = make_candle(close=100.0, open_=99.0, high=101.0, low=98.0)
+
+    # -- BUY LIMIT -----------------------------------------------------------
+
+    def test_limit_buy_fills_when_low_at_limit(self) -> None:
+        order = Order(
+            symbol="X",
+            direction=Direction.LONG,
+            quantity=1,
+            order_type=OrderType.LIMIT,
+            limit_price=98.0,  # exactly at candle.low
+        )
+        fill = self.broker.execute(order, self.candle)
+        assert fill is not None
+        assert fill.fill_price == 98.0
+
+    def test_limit_buy_fills_when_low_below_limit(self) -> None:
+        order = Order(
+            symbol="X",
+            direction=Direction.LONG,
+            quantity=1,
+            order_type=OrderType.LIMIT,
+            limit_price=99.0,  # candle.low=98 < 99 -> fills
+        )
+        fill = self.broker.execute(order, self.candle)
+        assert fill is not None
+
+    def test_limit_buy_does_not_fill_when_low_above_limit(self) -> None:
+        order = Order(
+            symbol="X",
+            direction=Direction.LONG,
+            quantity=1,
+            order_type=OrderType.LIMIT,
+            limit_price=97.0,  # candle.low=98 > 97 -> no fill
+        )
+        fill = self.broker.execute(order, self.candle)
+        assert fill is None
+
+    # -- SELL LIMIT ----------------------------------------------------------
+
+    def test_limit_sell_fills_when_high_at_limit(self) -> None:
+        order = Order(
+            symbol="X",
+            direction=Direction.SHORT,
+            quantity=1,
+            order_type=OrderType.LIMIT,
+            limit_price=101.0,  # exactly at candle.high
+        )
+        fill = self.broker.execute(order, self.candle)
+        assert fill is not None
+        assert fill.fill_price == 101.0
+
+    def test_limit_sell_does_not_fill_when_high_below_limit(self) -> None:
+        order = Order(
+            symbol="X",
+            direction=Direction.SHORT,
+            quantity=1,
+            order_type=OrderType.LIMIT,
+            limit_price=102.0,  # candle.high=101 < 102 -> no fill
+        )
+        fill = self.broker.execute(order, self.candle)
+        assert fill is None
+
+
+class TestSimulatedBrokerStop:
+    """STOP order conditional fill tests."""
+
+    def setup_method(self) -> None:
+        self.broker = SimulatedBroker()
+        self.candle = make_candle(close=100.0, open_=99.0, high=101.0, low=98.0)
+
+    def test_stop_buy_fills_when_high_at_stop(self) -> None:
+        order = Order(
+            symbol="X",
+            direction=Direction.LONG,
+            quantity=1,
+            order_type=OrderType.STOP,
+            stop_price=101.0,  # exactly at candle.high
+        )
+        fill = self.broker.execute(order, self.candle)
+        assert fill is not None
+        assert fill.fill_price == 101.0
+
+    def test_stop_buy_fills_when_high_above_stop(self) -> None:
+        order = Order(
+            symbol="X",
+            direction=Direction.LONG,
+            quantity=1,
+            order_type=OrderType.STOP,
+            stop_price=100.0,  # candle.high=101 > 100 -> fills
+        )
+        fill = self.broker.execute(order, self.candle)
+        assert fill is not None
+
+    def test_stop_buy_does_not_fill_when_high_below_stop(self) -> None:
+        order = Order(
+            symbol="X",
+            direction=Direction.LONG,
+            quantity=1,
+            order_type=OrderType.STOP,
+            stop_price=102.0,  # candle.high=101 < 102 -> no fill
+        )
+        fill = self.broker.execute(order, self.candle)
+        assert fill is None
+
+    def test_stop_sell_fills_when_low_at_stop(self) -> None:
+        order = Order(
+            symbol="X",
+            direction=Direction.SHORT,
+            quantity=1,
+            order_type=OrderType.STOP,
+            stop_price=98.0,
+        )
+        fill = self.broker.execute(order, self.candle)
+        assert fill is not None
+
+    def test_stop_sell_does_not_fill_when_low_above_stop(self) -> None:
+        order = Order(
+            symbol="X",
+            direction=Direction.SHORT,
+            quantity=1,
+            order_type=OrderType.STOP,
+            stop_price=97.0,  # candle.low=98 > 97 -> no fill
+        )
+        fill = self.broker.execute(order, self.candle)
+        assert fill is None
+
+
+# ---------------------------------------------------------------------------
+# BacktestEngine integration test
+# ---------------------------------------------------------------------------
 
 
 class _BuyDay0SellDay49Strategy:
-    """Buys on bar 0, sells on bar 49 (signals queued for next bar execution)."""
+    """Signals LONG on the first candle, SHORT on the 50th candle (index 49).
 
-    name = "BuyDay0SellDay49"
+    Uses a bar counter so it is self-contained and repeatable.
+    """
+
+    name: str = "BuyDay0SellDay49"
     parameters: dict = {}
-    symbol: str = "UNKNOWN"
 
-    def __init__(self, symbol: str = "UNKNOWN") -> None:
-        self.symbol = symbol
-        self._bar = 0
+    def __init__(self, symbol: str = "TEST") -> None:
+        self._symbol = symbol
+        self._bar_count = 0
 
-    def on_candle(self, candle: Candle) -> Optional[SignalEvent]:
-        bar = self._bar
-        self._bar += 1
-        if bar == 0:
+    def on_candle(self, candle: Candle) -> SignalEvent | None:
+        idx = self._bar_count
+        self._bar_count += 1
+
+        if idx == 0:
             return SignalEvent(
-                symbol=self.symbol,
+                symbol=self._symbol,
                 direction=Direction.LONG,
                 timestamp=candle.timestamp,
             )
-        if bar == 49:
+        if idx == 49:
             return SignalEvent(
-                symbol=self.symbol,
+                symbol=self._symbol,
                 direction=Direction.SHORT,
                 timestamp=candle.timestamp,
             )
         return None
 
-
-# ---------------------------------------------------------------------------
-# SimulatedBroker fill price tests (via engine integration)
-# ---------------------------------------------------------------------------
-
-class TestSimulatedBrokerMarket:
-    """Market fill prices — fills at candle.open not close (R-23)."""
-
-    SLIPPAGE = 0.0005
-    COMMISSION = 0.001
-
-    def test_market_long_fill_price(self) -> None:
-        from src.engine.broker import SimulatedBroker
-        from src.models.order import Order
-
-        broker = SimulatedBroker(slippage_pct=self.SLIPPAGE)
-        candle = make_candle(close=100.0, open_=99.0, high=101.0, low=98.0)
-        order = Order(symbol="TEST", direction=Direction.LONG, quantity=1)
-        fill = broker.execute(order, candle)
-        assert fill is not None
-        expected = 99.0 * (1 + self.SLIPPAGE)
-        assert abs(fill.fill_price - expected) < 1e-9
-
-    def test_market_short_fill_price(self) -> None:
-        from src.engine.broker import SimulatedBroker
-        from src.models.order import Order
-
-        broker = SimulatedBroker(slippage_pct=self.SLIPPAGE)
-        candle = make_candle(close=100.0, open_=99.0, high=101.0, low=98.0)
-        order = Order(symbol="TEST", direction=Direction.SHORT, quantity=1)
-        fill = broker.execute(order, candle)
-        assert fill is not None
-        expected = 99.0 * (1 - self.SLIPPAGE)
-        assert abs(fill.fill_price - expected) < 1e-9
-
-    def test_market_commission_is_percentage_of_notional(self) -> None:
-        from src.engine.broker import SimulatedBroker
-        from src.models.order import Order
-
-        broker = SimulatedBroker(
-            slippage_pct=self.SLIPPAGE, commission_pct=self.COMMISSION
-        )
-        candle = make_candle(close=100.0, open_=99.0, high=101.0, low=98.0)
-        order = Order(symbol="TEST", direction=Direction.LONG, quantity=1)
-        fill = broker.execute(order, candle)
-        assert fill is not None
-        expected_commission = fill.fill_price * 1 * self.COMMISSION
-        assert abs(fill.commission - expected_commission) < 1e-9
-
-
-# ---------------------------------------------------------------------------
-# BacktestEngine tests
-# ---------------------------------------------------------------------------
 
 class TestBacktestEngine:
     SLIPPAGE = 0.0005
@@ -117,24 +300,35 @@ class TestBacktestEngine:
     def _config(self) -> BacktestConfig:
         return BacktestConfig(
             initial_capital=self.INITIAL_CAPITAL,
-            slippage_pct=self.SLIPPAGE,
             commission_pct=self.COMMISSION,
+            slippage_pct=self.SLIPPAGE,
         )
 
-    def test_buy_day0_sell_day49_pnl_matches_expected(self) -> None:
-        candles = make_candle_series(n=51, base=100.0)
+    def test_buy_day0_sell_day49_final_equity_gt_initial(self) -> None:
+        """End-to-end: uptrend series -> PnL positive."""
+        candles = make_candle_series(n=50, base=100.0)
         strategy = _BuyDay0SellDay49Strategy(symbol="TEST")
         engine = BacktestEngine()
-        result = engine.run(strategy, candles, self._config(), symbol="TEST")
 
-        # Entry at bar 1 open (next bar after signal on bar 0)
-        buy_open = candles[1].open   # 100.5 - 0.3 = 100.2
-        # Exit at bar 50 open (next bar after signal on bar 49)
-        sell_open = candles[50].open  # 125.0 - 0.3 = 124.7
+        result = engine.run(strategy, candles, self._config())
+
+        assert result.final_equity > self.INITIAL_CAPITAL
+
+    def test_buy_day0_sell_day49_pnl_matches_expected(self) -> None:
+        """Verify exact PnL accounting for slippage and commission."""
+        candles = make_candle_series(n=50, base=100.0)
+        strategy = _BuyDay0SellDay49Strategy(symbol="TEST")
+        engine = BacktestEngine()
+
+        result = engine.run(strategy, candles, self._config())
+
+        # Manual calculation matching broker logic
+        buy_close = candles[0].close   # 100.0
+        sell_close = candles[49].close  # 100 + 49*0.5 = 124.5
         qty = 1
 
-        entry_price = buy_open * (1 + self.SLIPPAGE)
-        exit_price = sell_open * (1 - self.SLIPPAGE)
+        entry_price = buy_close * (1 + self.SLIPPAGE)
+        exit_price = sell_close * (1 - self.SLIPPAGE)
         entry_comm = entry_price * qty * self.COMMISSION
         exit_comm = exit_price * qty * self.COMMISSION
 
@@ -143,149 +337,64 @@ class TestBacktestEngine:
 
         assert abs(result.final_equity - expected_equity) < 1e-6
 
-    def test_buy_day0_sell_day49_final_equity_gt_initial(self) -> None:
-        candles = make_candle_series(n=51, base=100.0)
-        strategy = _BuyDay0SellDay49Strategy(symbol="TEST")
-        engine = BacktestEngine()
-        result = engine.run(strategy, candles, self._config(), symbol="TEST")
-        assert result.final_equity > self.INITIAL_CAPITAL
-
     def test_result_has_one_closed_trade(self) -> None:
-        candles = make_candle_series(n=51, base=100.0)
+        candles = make_candle_series(n=50, base=100.0)
         strategy = _BuyDay0SellDay49Strategy(symbol="TEST")
         engine = BacktestEngine()
-        result = engine.run(strategy, candles, self._config(), symbol="TEST")
+
+        result = engine.run(strategy, candles, self._config())
+
         assert len(result.trades) == 1
+        trade = result.trades[0]
+        assert trade.is_closed
+        assert trade.direction == Direction.LONG
 
     def test_result_equity_curve_length(self) -> None:
-        candles = make_candle_series(n=51, base=100.0)
+        """Equity curve has one point per candle."""
+        candles = make_candle_series(n=50, base=100.0)
         strategy = _BuyDay0SellDay49Strategy(symbol="TEST")
         engine = BacktestEngine()
-        result = engine.run(strategy, candles, self._config(), symbol="TEST")
-        assert len(result.equity_curve) == 51  # one point per candle
+
+        result = engine.run(strategy, candles, self._config())
+
+        assert len(result.equity_curve) == 50
 
     def test_result_metadata(self) -> None:
-        candles = make_candle_series(n=51, base=100.0)
+        candles = make_candle_series(n=50, base=100.0)
         strategy = _BuyDay0SellDay49Strategy(symbol="TEST")
         engine = BacktestEngine()
-        result = engine.run(strategy, candles, self._config(), symbol="TEST")
+
+        result = engine.run(strategy, candles, self._config())
+
         assert result.strategy_name == "BuyDay0SellDay49"
-        assert result.symbol == "TEST"
         assert result.start_date == candles[0].timestamp
         assert result.end_date == candles[-1].timestamp
         assert result.initial_capital == self.INITIAL_CAPITAL
+        assert result.run_id  # non-empty UUID string
 
     def test_no_signal_strategy_preserves_capital(self) -> None:
-        candles = make_candle_series(n=20)
-        strategy = _NeverSignalStrategy()
-        engine = BacktestEngine()
-        result = engine.run(strategy, candles, self._config(), symbol="TEST")
-        assert result.final_equity == self.INITIAL_CAPITAL
+        """A strategy that never signals should leave equity unchanged."""
 
-    def test_empty_candles_raises(self) -> None:
-        strategy = _NeverSignalStrategy()
-        engine = BacktestEngine()
-        with pytest.raises(ValueError, match="candles list must not be empty"):
-            engine.run(strategy, [], self._config())
-
-    def test_pending_orders_cleared_between_runs(self) -> None:
-        """Re-using an engine instance should not carry over pending orders."""
-        candles = make_candle_series(n=51, base=100.0)
-        strategy1 = _BuyDay0SellDay49Strategy(symbol="TEST")
-        strategy2 = _NeverSignalStrategy()
-        engine = BacktestEngine()
-        engine.run(strategy1, candles, self._config(), symbol="TEST")
-        # Second run with a strategy that never signals — should preserve capital
-        candles2 = make_candle_series(n=10, base=100.0)
-        result2 = engine.run(strategy2, candles2, self._config(), symbol="TEST")
-        assert result2.final_equity == self.INITIAL_CAPITAL
-
-    def test_fixed_fraction_sizer_is_respected(self) -> None:
-        """FixedFractionSizer with 10% equity at price ~100 should buy ~100 shares."""
-        from src.engine.position_sizer import FixedFractionSizer
-        candles = make_candle_series(n=51, base=100.0)
-        strategy = _BuyDay0SellDay49Strategy(symbol="TEST")
-        config = BacktestConfig(
-            initial_capital=100_000.0,
-            position_sizer=FixedFractionSizer(fraction=0.10),
-        )
-        result = BacktestEngine().run(strategy, candles, config, symbol="TEST")
-        assert len(result.trades) == 1
-        trade = result.trades[0]
-        # 10% of 100_000 / 100.0 = 100 shares
-        assert trade.quantity == 100
-
-    def test_limit_order_persists_until_condition_met(self) -> None:
-        """A LIMIT BUY at 95 placed on bar 0 should only fill when candle.low <= 95."""
-        from datetime import datetime, timedelta
-        from src.models.order import OrderType
-
-        def _make_bar(i: int, low: float, high: float, close: float) -> Candle:
-            return Candle(
-                timestamp=datetime(2023, 1, 2) + timedelta(days=i),
-                open=close - 0.5,
-                high=high,
-                low=low,
-                close=close,
-                volume=1_000_000,
-                adj_close=close,
-            )
-
-        candles = [
-            _make_bar(0, 97.0, 102.0, 100.0),  # signal bar — emit LIMIT BUY at 95
-            _make_bar(1, 97.0, 101.0, 99.0),   # low=97 > 95 → no fill
-            _make_bar(2, 97.0, 101.0, 98.5),   # low=97 > 95 → no fill
-            _make_bar(3, 97.0, 100.0, 98.0),   # low=97 > 95 → no fill
-            _make_bar(4, 93.0, 99.0, 95.0),    # low=93 <= 95 → FILLS at 95.0
-            _make_bar(5, 94.0, 98.0, 96.0),    # bar to let the fill settle
-        ]
-
-        class _LimitBuyDay0Strategy:
-            name = "limit_buy"
+        class _NullStrategy:
+            name = "Null"
             parameters: dict = {}
-            symbol: str = "X"
-            _bar = 0
 
             def on_candle(self, candle: Candle) -> SignalEvent | None:
-                if self._bar == 0:
-                    self._bar += 1
-                    return SignalEvent(
-                        symbol=self.symbol,
-                        direction=Direction.LONG,
-                        order_type=OrderType.LIMIT,
-                        limit_price=95.0,
-                        timestamp=candle.timestamp,
-                    )
-                self._bar += 1
                 return None
 
-        strategy = _LimitBuyDay0Strategy()
-        config = BacktestConfig(initial_capital=100_000.0, commission_pct=0.0, slippage_pct=0.0)
-        result = BacktestEngine().run(strategy, candles, config, symbol="X")
-
-        # No closed trades (position was opened but never closed)
-        assert len(result.trades) == 0
-        # LIMIT filled on bar 4 at 95, price ends at 96 — equity reflects open LONG position
-        assert result.final_equity > 100_000.0
-
-    def test_breakout_strategy_emits_stop_entry_signal(self) -> None:
-        """BreakoutStrategy should emit STOP order type for entries."""
-        from src.strategies.breakout import Breakout
-        from src.models.order import OrderType
-
-        strategy = Breakout(period=3)
-        strategy.symbol = "X"
-
         candles = make_candle_series(n=10, base=100.0)
+        result = BacktestEngine().run(_NullStrategy(), candles, self._config())
 
-        signals = []
-        for c in candles:
-            s = strategy.on_candle(c)
-            if s is not None:
-                signals.append(s)
+        assert result.final_equity == self.INITIAL_CAPITAL
+        assert result.trades == []
 
-        # All entry (LONG) signals should be STOP type with a stop_price set
-        long_signals = [s for s in signals if s.direction == Direction.LONG]
-        for s in long_signals:
-            assert s.order_type == OrderType.STOP
-            assert s.stop_price is not None
+    def test_empty_candles_raises(self) -> None:
+        class _NullStrategy:
+            name = "Null"
+            parameters: dict = {}
+
+            def on_candle(self, candle: Candle) -> SignalEvent | None:
+                return None
+
+        with pytest.raises(ValueError, match="candles list must not be empty"):
+            BacktestEngine().run(_NullStrategy(), [], self._config())

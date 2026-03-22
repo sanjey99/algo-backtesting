@@ -1,11 +1,6 @@
 """SimulatedBroker — converts OrderEvents to FillEvents with slippage and commission."""
 from __future__ import annotations
 
-import logging
-from typing import Optional
-
-logger = logging.getLogger(__name__)
-
 from src.engine.event import FillEvent
 from src.models.candle import Candle
 from src.models.order import Direction, Order, OrderType
@@ -20,7 +15,7 @@ class SimulatedBroker:
     Fill logic
     ----------
     MARKET orders
-        Fill at open * (1 + slippage) for LONG, open * (1 - slippage) for SHORT.
+        Fill at close * (1 + slippage) for LONG, close * (1 - slippage) for SHORT.
 
     LIMIT orders
         BUY  fills when candle.low  <= limit_price  (price came down to our bid)
@@ -45,21 +40,13 @@ class SimulatedBroker:
     # Public API
     # ------------------------------------------------------------------
 
-    def execute(self, order: Order, candle: Candle) -> Optional[FillEvent]:
+    def execute(self, order: Order, candle: Candle) -> FillEvent | None:
         """Try to fill *order* against *candle*. Returns None if unfilled."""
         fill_price = self._calculate_fill_price(order, candle)
         if fill_price is None:
             return None
 
         commission = fill_price * order.quantity * self.commission_pct
-        logger.debug(
-            "Fill: %s %s %d @ %.4f commission=%.4f",
-            order.symbol,
-            order.direction.value,
-            order.quantity,
-            fill_price,
-            commission,
-        )
         return FillEvent(
             symbol=order.symbol,
             direction=order.direction,
@@ -74,7 +61,7 @@ class SimulatedBroker:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _calculate_fill_price(self, order: Order, candle: Candle) -> Optional[float]:
+    def _calculate_fill_price(self, order: Order, candle: Candle) -> float | None:
         if order.order_type == OrderType.MARKET:
             return self._market_fill(order, candle)
         if order.order_type == OrderType.LIMIT:
@@ -84,14 +71,13 @@ class SimulatedBroker:
         return None  # unknown order type
 
     def _market_fill(self, order: Order, candle: Candle) -> float:
-        """Slip away from open in the direction adverse to the trader."""
+        """Slip away from close in the direction that is adverse to the trader."""
         if order.direction == Direction.LONG:
-            return candle.open * (1.0 + self.slippage_pct)
-        return candle.open * (1.0 - self.slippage_pct)
+            return candle.close * (1.0 + self.slippage_pct)
+        return candle.close * (1.0 - self.slippage_pct)
 
-    def _limit_fill(self, order: Order, candle: Candle) -> Optional[float]:
-        if order.limit_price is None:  # guaranteed by Order.__post_init__
-            raise ValueError("LIMIT order requires limit_price")
+    def _limit_fill(self, order: Order, candle: Candle) -> float | None:
+        assert order.limit_price is not None  # guaranteed by Order.__post_init__
         limit = order.limit_price
         if order.direction == Direction.LONG:
             # We want to buy: fill only if market dropped to our bid
@@ -103,9 +89,8 @@ class SimulatedBroker:
                 return limit
         return None
 
-    def _stop_fill(self, order: Order, candle: Candle) -> Optional[float]:
-        if order.stop_price is None:  # guaranteed by Order.__post_init__
-            raise ValueError("STOP order requires stop_price")
+    def _stop_fill(self, order: Order, candle: Candle) -> float | None:
+        assert order.stop_price is not None  # guaranteed by Order.__post_init__
         stop = order.stop_price
         if order.direction == Direction.LONG:
             # Buy stop: triggered when price breaks *above* the stop level

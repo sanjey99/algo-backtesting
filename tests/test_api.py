@@ -1,0 +1,300 @@
+"""Tests for FastAPI endpoints — Step 10.
+
+Uses TestClient with an in-memory SQLite DB and patched data fetching.
+"""
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from unittest.mock import patch
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from src.api.deps import get_db
+from src.api.main import app
+from src.db.tables import Base
+from src.models.candle import Candle
+
+# ---------------------------------------------------------------------------
+# In-memory DB override — StaticPool ensures all connections share one DB
+# ---------------------------------------------------------------------------
+
+TEST_DB_URL = "sqlite:///:memory:"
+_engine = create_engine(
+    TEST_DB_URL,
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+_TestSession = sessionmaker(bind=_engine, autocommit=False, autoflush=False)
+
+
+def override_get_db():
+    db = _TestSession()
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+Base.metadata.create_all(bind=_engine)
+app.dependency_overrides[get_db] = override_get_db
+
+
+# ---------------------------------------------------------------------------
+# Fixture: synthetic candles
+# ---------------------------------------------------------------------------
+
+def _make_candles(n: int = 150) -> list[Candle]:
+    import random
+    rng = random.Random(42)
+    candles = []
+    price = 100.0
+    start = datetime(2020, 1, 2)
+    for i in range(n):
+        price *= 1 + rng.gauss(0.001, 0.015)
+        candles.append(Candle(
+            timestamp=start + timedelta(days=i),
+            open=price * 0.999,
+            high=price * 1.005,
+            low=price * 0.994,
+            close=price,
+            volume=1_000_000.0,
+            adj_close=price,
+        ))
+    return candles
+
+
+FAKE_CANDLES = _make_candles(150)
+
+
+@pytest.fixture()
+def client():
+    with TestClient(app) as c:
+        yield c
+
+
+# ---------------------------------------------------------------------------
+# /health
+# ---------------------------------------------------------------------------
+
+class TestHealth:
+    def test_health_ok(self, client: TestClient):
+        r = client.get("/health")
+        assert r.status_code == 200
+        assert r.json()["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# GET /api/strategies
+# ---------------------------------------------------------------------------
+
+class TestStrategies:
+    def test_lists_strategies(self, client: TestClient):
+        r = client.get("/api/strategies")
+        assert r.status_code == 200
+        keys = {s["key"] for s in r.json()}
+        assert "ma_crossover" in keys
+        assert "rsi_mean_reversion" in keys
+        assert "breakout" in keys
+
+    def test_strategy_has_parameter_space(self, client: TestClient):
+        r = client.get("/api/strategies")
+        for strat in r.json():
+            assert "parameter_space" in strat
+            assert isinstance(strat["parameter_space"], dict)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/backtest
+# ---------------------------------------------------------------------------
+
+PATCH_TARGET = "src.api.routes.backtest._fetch_candles"
+
+
+class TestRunBacktest:
+    def test_returns_201_and_run_id(self, client: TestClient):
+        with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
+            r = client.post("/api/backtest", json={
+                "strategy": "ma_crossover",
+                "symbol": "SPY",
+                "start": "2020-01-01",
+                "end": "2022-12-31",
+                "params": {"fast_period": 5, "slow_period": 20},
+            })
+        assert r.status_code == 201
+        body = r.json()
+        assert "run_id" in body
+        assert body["strategy_name"] == "ma_crossover"
+
+    def test_metrics_present(self, client: TestClient):
+        with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
+            r = client.post("/api/backtest", json={
+                "strategy": "ma_crossover",
+                "symbol": "SPY",
+                "start": "2020-01-01",
+                "end": "2022-12-31",
+            })
+        assert r.status_code == 201
+        assert "sharpe_ratio" in r.json()["metrics"]
+
+    def test_invalid_strategy_returns_400(self, client: TestClient):
+        with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
+            r = client.post("/api/backtest", json={
+                "strategy": "does_not_exist",
+                "symbol": "SPY",
+                "start": "2020-01-01",
+                "end": "2022-12-31",
+            })
+        assert r.status_code == 400
+
+    def test_empty_candles_returns_422(self, client: TestClient):
+        with patch(PATCH_TARGET, return_value=[]):
+            r = client.post("/api/backtest", json={
+                "strategy": "ma_crossover",
+                "symbol": "FAKE",
+                "start": "2020-01-01",
+                "end": "2022-12-31",
+            })
+        assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# GET /api/backtest/{run_id}
+# ---------------------------------------------------------------------------
+
+class TestGetBacktest:
+    def test_get_existing_run(self, client: TestClient):
+        with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
+            post = client.post("/api/backtest", json={
+                "strategy": "ma_crossover",
+                "symbol": "SPY",
+                "start": "2020-01-01",
+                "end": "2022-12-31",
+            })
+        run_id = post.json()["run_id"]
+
+        r = client.get(f"/api/backtest/{run_id}")
+        assert r.status_code == 200
+        assert r.json()["run_id"] == run_id
+
+    def test_get_nonexistent_run_returns_404(self, client: TestClient):
+        r = client.get("/api/backtest/nonexistent-id")
+        assert r.status_code == 404
+
+    def test_get_trades_endpoint(self, client: TestClient):
+        with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
+            post = client.post("/api/backtest", json={
+                "strategy": "ma_crossover",
+                "symbol": "SPY",
+                "start": "2020-01-01",
+                "end": "2022-12-31",
+                "params": {"fast_period": 5, "slow_period": 20},
+            })
+        run_id = post.json()["run_id"]
+
+        r = client.get(f"/api/backtest/{run_id}/trades")
+        assert r.status_code == 200
+        assert isinstance(r.json(), list)
+
+    def test_get_equity_curve_endpoint(self, client: TestClient):
+        with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
+            post = client.post("/api/backtest", json={
+                "strategy": "ma_crossover",
+                "symbol": "SPY",
+                "start": "2020-01-01",
+                "end": "2022-12-31",
+                "params": {"fast_period": 5, "slow_period": 20},
+            })
+        run_id = post.json()["run_id"]
+
+        r = client.get(f"/api/backtest/{run_id}/equity-curve")
+        assert r.status_code == 200
+        data = r.json()
+        assert isinstance(data, list)
+        if data:
+            assert "equity" in data[0]
+            assert "drawdown_pct" in data[0]
+
+
+# ---------------------------------------------------------------------------
+# GET /api/backtest (list)
+# ---------------------------------------------------------------------------
+
+class TestListBacktests:
+    def test_list_returns_array(self, client: TestClient):
+        r = client.get("/api/backtest")
+        assert r.status_code == 200
+        assert isinstance(r.json(), list)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/backtest/permutation-test (202 + poll)
+# ---------------------------------------------------------------------------
+
+class TestPermutationEndpoint:
+    def test_returns_202_and_job_id(self, client: TestClient):
+        with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
+            r = client.post("/api/backtest/permutation-test", json={
+                "strategy": "ma_crossover",
+                "symbol": "SPY",
+                "start": "2020-01-01",
+                "end": "2022-12-31",
+                "n_permutations": 5,
+            })
+        assert r.status_code == 202
+        assert "job_id" in r.json()
+
+    def test_poll_job(self, client: TestClient):
+        with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
+            r = client.post("/api/backtest/permutation-test", json={
+                "strategy": "ma_crossover",
+                "symbol": "SPY",
+                "start": "2020-01-01",
+                "end": "2022-12-31",
+                "n_permutations": 5,
+            })
+        job_id = r.json()["job_id"]
+        poll = client.get(f"/api/backtest/permutation-test/{job_id}")
+        assert poll.status_code == 200
+        assert poll.json()["job_id"] == job_id
+
+    def test_poll_missing_job_404(self, client: TestClient):
+        r = client.get("/api/backtest/permutation-test/no-such-job")
+        assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /api/data/fetch
+# ---------------------------------------------------------------------------
+
+class TestDataFetch:
+    def test_fetch_returns_candle_count(self, client: TestClient):
+        # Patch df_to_candles so we don't need a real DataFrame
+        with patch("src.data.fetcher.YFinanceFetcher"), \
+             patch("src.api.routes.data.df_to_candles", return_value=FAKE_CANDLES):
+            r = client.post("/api/data/fetch", json={
+                "symbol": "SPY",
+                "start": "2020-01-01",
+                "end": "2022-12-31",
+                "use_cache": False,
+            })
+        assert r.status_code == 200
+        assert r.json()["n_candles"] == len(FAKE_CANDLES)
+
+    def test_fetch_empty_returns_422(self, client: TestClient):
+        with patch("src.data.fetcher.YFinanceFetcher"), \
+             patch("src.api.routes.data.df_to_candles", return_value=[]):
+            r = client.post("/api/data/fetch", json={
+                "symbol": "FAKE",
+                "start": "2020-01-01",
+                "end": "2020-01-05",
+                "use_cache": False,
+            })
+        assert r.status_code == 422
