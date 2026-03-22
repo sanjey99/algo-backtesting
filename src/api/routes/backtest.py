@@ -41,12 +41,20 @@ DBDep = Annotated[Session, Depends(get_db)]
 
 
 def _fetch_candles(symbol: str, start: str, end: str) -> list[Any]:
-    """Fetch candles via YFinanceFetcher (lazy import avoids yf at module load)."""
+    """Fetch candles via YFinanceFetcher, with parquet caching via DataStore."""
+    from datetime import datetime
     from src.data import df_to_candles
     from src.data.fetcher import YFinanceFetcher
+    from src.data.store import DataStore
 
     fetcher = YFinanceFetcher()
-    df = fetcher.fetch(symbol, start, end)
+    store = DataStore()
+    df = store.fetch_or_cache(
+        symbol,
+        datetime.fromisoformat(start),
+        datetime.fromisoformat(end),
+        fetcher,
+    )
     return df_to_candles(df)
 
 
