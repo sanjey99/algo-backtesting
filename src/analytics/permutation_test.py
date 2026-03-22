@@ -58,10 +58,8 @@ def _run_single_permutation_worker(
 ) -> float:
     """Top-level function for ProcessPoolExecutor (must be picklable)."""
     synth_candles = _shuffle_candles(candles, seed)
-    try:
-        strategy = strategy_cls(**strategy_params)
-    except (TypeError, ValueError):
-        strategy = strategy_cls()
+    strategy = strategy_cls(**strategy_params)
+    # No try/except — let construction errors propagate to caller
     engine = BacktestEngine()
     result = engine.run(strategy, synth_candles, config)
     metrics = compute_all_metrics(result)
@@ -172,7 +170,7 @@ class PermutationTest:
                     for future in as_completed(futures):
                         try:
                             permuted_metrics.append(future.result())
-                        except (ValueError, RuntimeError) as e:
+                        except (TypeError, ValueError, RuntimeError) as e:
                             failed_count += 1
                             logger.warning("Permutation failed: %s", e)
                         except Exception as e:
