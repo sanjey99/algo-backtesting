@@ -1,11 +1,14 @@
 """BacktestEngine — bar-by-bar event-driven backtest runner."""
 from __future__ import annotations
 
+import logging
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Protocol
+
+logger = logging.getLogger(__name__)
 
 from src.engine.broker import SimulatedBroker
 from src.engine.event import Event, FillEvent, MarketEvent, OrderEvent, SignalEvent
@@ -95,6 +98,8 @@ class BacktestEngine:
         if not candles:
             raise ValueError("candles list must not be empty")
 
+        logger.info("Starting backtest: strategy=%s symbol=%s bars=%d", strategy.name, symbol, len(candles))
+
         portfolio = Portfolio(initial_capital=config.initial_capital)
         broker = SimulatedBroker(
             slippage_pct=config.slippage_pct,
@@ -145,6 +150,8 @@ class BacktestEngine:
 
             # Mark portfolio to close (equity curve point) after all events settled
             portfolio.update({symbol: candle.close}, candle.timestamp)
+
+        logger.info("Backtest complete: trades=%d final_equity=%.2f", len(portfolio.trades), portfolio.equity)
 
         return BacktestResult(
             strategy_name=strategy.name,

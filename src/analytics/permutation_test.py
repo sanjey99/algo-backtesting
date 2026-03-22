@@ -136,6 +136,12 @@ class PermutationTest:
 
     def run(self) -> PermutationTestResult:
         """Execute the permutation test and return results."""
+        logger.info(
+            "Permutation test: n=%d metric=%s",
+            self.n_permutations,
+            self.metric,
+        )
+
         # 1. Run actual strategy
         self.strategy.reset()
         engine = BacktestEngine()
@@ -143,6 +149,8 @@ class PermutationTest:
         self.strategy.reset()
         actual_metrics = compute_all_metrics(actual_result)
         actual_metric = actual_metrics.get(self.metric, 0.0)
+
+        logger.info("Permutation test: actual=%.4f", actual_metric)
 
         # 2. Run permutations
         seeds = [self.random_seed + i for i in range(self.n_permutations)]
@@ -213,7 +221,7 @@ class PermutationTest:
         count_gte = sum(1 for m in permuted_metrics if m >= actual_metric)
         p_value = (count_gte + 1) / (n + 1) if n > 0 else 1.0
 
-        return PermutationTestResult(
+        result = PermutationTestResult(
             actual_metric=actual_metric,
             permuted_metrics=permuted_metrics,
             p_value=p_value,
@@ -221,3 +229,5 @@ class PermutationTest:
             metric=self.metric,
             failed_count=failed_count,
         )
+        logger.info("p-value=%.4f significant=%s", result.p_value, result.is_significant)
+        return result

@@ -1,7 +1,10 @@
 """SimulatedBroker — converts OrderEvents to FillEvents with slippage and commission."""
 from __future__ import annotations
 
+import logging
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from src.engine.event import FillEvent
 from src.models.candle import Candle
@@ -49,6 +52,14 @@ class SimulatedBroker:
             return None
 
         commission = fill_price * order.quantity * self.commission_pct
+        logger.debug(
+            "Fill: %s %s %d @ %.4f commission=%.4f",
+            order.symbol,
+            order.direction.value,
+            order.quantity,
+            fill_price,
+            commission,
+        )
         return FillEvent(
             symbol=order.symbol,
             direction=order.direction,

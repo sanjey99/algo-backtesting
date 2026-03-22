@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
@@ -35,7 +35,7 @@ class Order:
     order_type: OrderType = OrderType.MARKET
     limit_price: Optional[float] = None
     stop_price: Optional[float] = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     order_id: str = field(default="")
 
     def __post_init__(self) -> None:

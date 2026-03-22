@@ -117,6 +117,15 @@ class WalkForwardAnalyzer:
             is_candles = candles[start:is_end]
             oos_candles = candles[is_end:oos_end]
 
+            logger.info(
+                "WFA window %d: IS=%s to %s, OOS=%s to %s",
+                window_idx,
+                is_candles[0].timestamp.date(),
+                is_candles[-1].timestamp.date(),
+                oos_candles[0].timestamp.date(),
+                oos_candles[-1].timestamp.date(),
+            )
+
             # In-sample optimisation: random search
             best_params: dict[str, Any] = {}
             best_score = float("-inf")
@@ -134,6 +143,8 @@ class WalkForwardAnalyzer:
             oos_result = self._run_backtest(oos_candles, best_params)
             oos_returns = equity_returns(oos_result.equity_curve)
             oos_sharpe = sharpe_ratio(oos_returns)
+
+            logger.info("WFA window %d: best_params=%s oos_sharpe=%.3f", window_idx, best_params, oos_sharpe)
 
             windows.append(
                 WindowResult(
