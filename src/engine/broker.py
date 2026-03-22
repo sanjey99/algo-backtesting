@@ -17,7 +17,7 @@ class SimulatedBroker:
     Fill logic
     ----------
     MARKET orders
-        Fill at close * (1 + slippage) for LONG, close * (1 - slippage) for SHORT.
+        Fill at open * (1 + slippage) for LONG, open * (1 - slippage) for SHORT.
 
     LIMIT orders
         BUY  fills when candle.low  <= limit_price  (price came down to our bid)
@@ -73,10 +73,10 @@ class SimulatedBroker:
         return None  # unknown order type
 
     def _market_fill(self, order: Order, candle: Candle) -> float:
-        """Slip away from close in the direction that is adverse to the trader."""
+        """Slip away from open in the direction adverse to the trader."""
         if order.direction == Direction.LONG:
-            return candle.close * (1.0 + self.slippage_pct)
-        return candle.close * (1.0 - self.slippage_pct)
+            return candle.open * (1.0 + self.slippage_pct)
+        return candle.open * (1.0 - self.slippage_pct)
 
     def _limit_fill(self, order: Order, candle: Candle) -> Optional[float]:
         assert order.limit_price is not None  # guaranteed by Order.__post_init__

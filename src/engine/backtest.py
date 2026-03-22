@@ -62,12 +62,14 @@ class BacktestEngine:
 
     Wiring per bar
     --------------
-    1. strategy.on_candle(candle)   -> Optional[SignalEvent]
-    2. If signal and no open position    -> create MARKET OrderEvent (open)
-       If signal is opposite open position -> create MARKET OrderEvent (close)
-    3. broker.execute(order, candle) -> Optional[FillEvent]
-    4. portfolio.record_fill(...)
-    5. portfolio.update({symbol: close}, timestamp)
+    1. Execute pending orders from the *previous* bar at THIS bar's open.
+    2. strategy.on_candle(candle)   -> Optional[SignalEvent]
+    3. portfolio.update({symbol: close}, timestamp)   (equity curve point)
+    4. If signal -> build Order and queue for execution on NEXT bar's open.
+
+    This deferred-fill approach eliminates look-ahead bias (R-23): the
+    strategy sees the completed bar first, then orders fill at the *next*
+    bar's open price.
 
     The engine is stateless between runs: a fresh Portfolio and
     SimulatedBroker are constructed from *config* on every call to run().
@@ -78,6 +80,7 @@ class BacktestEngine:
         strategy: Strategy,
         candles: list[Candle],
         config: BacktestConfig,
+        symbol: str = "UNKNOWN",
     ) -> BacktestResult:
         if not candles:
             raise ValueError("candles list must not be empty")
@@ -88,35 +91,38 @@ class BacktestEngine:
             commission_pct=config.commission_pct,
         )
 
-        # Infer symbol from candles (engine is single-symbol per run)
-        # Strategies emit signals that carry their own symbol; we capture it
-        # from the first signal seen, defaulting to "UNKNOWN" if none fires.
-        symbol: str = "UNKNOWN"
+        # Set symbol on strategy so signals carry the correct ticker (R-03)
+        if hasattr(strategy, "symbol"):
+            strategy.symbol = symbol  # type: ignore[attr-defined]
+
+        self._pending_orders: list[Order] = []
 
         for candle in candles:
+            # Step 1: Execute pending orders from previous bar at THIS bar's open
+            for order in self._pending_orders:
+                fill = broker.execute(order, candle)
+                if fill is not None:
+                    portfolio.record_fill(
+                        symbol=fill.symbol,
+                        direction=fill.direction,
+                        quantity=fill.quantity,
+                        fill_price=fill.fill_price,
+                        fill_date=fill.fill_date,
+                        commission=fill.commission,
+                    )
+            self._pending_orders.clear()
+
+            # Step 2: Strategy sees the completed bar
             signal: Optional[SignalEvent] = strategy.on_candle(candle)
 
-            if signal is not None:
-                symbol = signal.symbol
-                order: Optional[Order] = self._build_order(
-                    signal, portfolio, candle
-                )
-                if order is not None:
-                    order_event = OrderEvent(order=order)
-                    fill: Optional[FillEvent] = broker.execute(
-                        order_event.order, candle
-                    )
-                    if fill is not None:
-                        portfolio.record_fill(
-                            symbol=fill.symbol,
-                            direction=fill.direction,
-                            quantity=fill.quantity,
-                            fill_price=fill.fill_price,
-                            fill_date=fill.fill_date,
-                            commission=fill.commission,
-                        )
-
+            # Step 3: Mark portfolio to close (equity curve point)
             portfolio.update({symbol: candle.close}, candle.timestamp)
+
+            # Step 4: Queue order for execution on next bar's open
+            if signal is not None:
+                order = self._build_order(signal, portfolio, candle)
+                if order is not None:
+                    self._pending_orders.append(order)
 
         return BacktestResult(
             strategy_name=strategy.name,
