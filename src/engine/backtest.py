@@ -5,7 +5,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Optional, Protocol
+from typing import Any, Protocol
 
 from src.engine.broker import SimulatedBroker
 from src.engine.event import Event, FillEvent, MarketEvent, OrderEvent, SignalEvent
@@ -27,7 +27,7 @@ class Strategy(Protocol):
     parameters: dict[str, Any]
     symbol: str
 
-    def on_candle(self, candle: Candle) -> Optional[SignalEvent]:
+    def on_candle(self, candle: Candle) -> SignalEvent | None:
         ...
 
 
@@ -178,7 +178,7 @@ class BacktestEngine:
         portfolio: Portfolio,
         candle: Candle,
         sizer: PositionSizer,
-    ) -> Optional[Order]:
+    ) -> Order | None:
         """Translate a SignalEvent into a MARKET Order, or None if nothing to do."""
         symbol = signal.symbol
         has_position = portfolio.has_position(symbol)
