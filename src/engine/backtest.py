@@ -23,6 +23,7 @@ class Strategy(Protocol):
 
     name: str
     parameters: dict[str, Any]
+    symbol: str
 
     def on_candle(self, candle: Candle) -> Optional[SignalEvent]:
         ...
@@ -75,6 +76,9 @@ class BacktestEngine:
     SimulatedBroker are constructed from *config* on every call to run().
     """
 
+    def __init__(self) -> None:
+        self._pending_orders: list[Order] = []
+
     def run(
         self,
         strategy: Strategy,
@@ -92,10 +96,9 @@ class BacktestEngine:
         )
 
         # Set symbol on strategy so signals carry the correct ticker (R-03)
-        if hasattr(strategy, "symbol"):
-            strategy.symbol = symbol  # type: ignore[attr-defined]
+        strategy.symbol = symbol
 
-        self._pending_orders: list[Order] = []
+        self._pending_orders.clear()
 
         for candle in candles:
             # Step 1: Execute pending orders from previous bar at THIS bar's open
