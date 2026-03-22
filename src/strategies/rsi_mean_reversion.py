@@ -1,4 +1,4 @@
-"""RSI Mean-Reversion strategy."""
+"""RSI Mean-Reversion strategy — incremental Wilder's RSI, O(1) per bar."""
 from __future__ import annotations
 
 from typing import Any, Optional
@@ -9,9 +9,12 @@ from src.models.order import Direction
 from src.strategies.base import BaseStrategy
 
 
-class RSIMeanReversion(BaseStrategy):
+class RSIMeanReversionStrategy(BaseStrategy):
     """Emit LONG when RSI drops below *oversold* and SHORT when RSI
     rises above *exit_level*.
+
+    Uses true incremental Wilder's smoothing — O(1) per bar after the
+    seeding phase (first ``period`` price changes).
 
     Parameters
     ----------
@@ -20,83 +23,118 @@ class RSIMeanReversion(BaseStrategy):
     oversold : float
         RSI level below which we buy (default 30).
     exit_level : float
-        RSI level above which we sell (default 70).
+        RSI level above which we sell (default 50).
     """
 
-    name: str = "rsi_mean_reversion"
+    name = "rsi_mean_reversion"
+    parameter_space: dict[str, tuple[float, float, float]] = {
+        "period": (7, 21, 2),
+        "oversold": (20, 40, 5),
+    }
 
     def __init__(
         self,
         period: int = 14,
         oversold: float = 30.0,
-        exit_level: float = 70.0,
-        symbol: str = "UNKNOWN",
+        exit_level: float = 50.0,
     ) -> None:
         super().__init__()
+        self.period = period
+        self.oversold = oversold
+        self.exit_level = exit_level
         self.parameters: dict[str, Any] = {
             "period": period,
             "oversold": oversold,
             "exit_level": exit_level,
         }
-        self.parameter_space: dict[str, tuple[float, float, float]] = {
-            "period": (5.0, 30.0, 1.0),
-            "oversold": (20.0, 40.0, 5.0),
-            "exit_level": (60.0, 80.0, 5.0),
-        }
-        self.symbol = symbol
-
-        self._period = period
-        self.oversold = oversold
-        self.exit_level = exit_level
-        self._closes: list[float] = []
-        self._rsi: Optional[float] = None
+        # Seeding phase: collect first `period` price changes
+        self._seed_gains: list[float] = []
+        self._seed_losses: list[float] = []
+        self._prev_price: float | None = None
+        self._avg_gain: float | None = None
+        self._avg_loss: float | None = None
+        self._rsi: float | None = None
+        self._bar_count: int = 0
 
     # ------------------------------------------------------------------
     # BaseStrategy interface
     # ------------------------------------------------------------------
 
     def on_candle(self, candle: Candle) -> Optional[SignalEvent]:
-        self._closes.append(candle.close)
-        if len(self._closes) < self._period + 1:
+        price = candle.adj_close
+        self._bar_count += 1
+
+        if self._prev_price is None:
+            # First bar — just record price
+            self._prev_price = price
             return None
 
-        self._rsi = self._calc_rsi()
+        gain = max(price - self._prev_price, 0.0)
+        loss = max(self._prev_price - price, 0.0)
+        self._prev_price = price
 
+        if self._avg_gain is None:
+            # Phase 1: accumulate seed data
+            self._seed_gains.append(gain)
+            self._seed_losses.append(loss)
+
+            if len(self._seed_gains) == self.period:
+                # Seed complete — compute initial averages
+                self._avg_gain = sum(self._seed_gains) / self.period
+                self._avg_loss = sum(self._seed_losses) / self.period
+                # Clear seed lists (no longer needed)
+                self._seed_gains.clear()
+                self._seed_losses.clear()
+                self._rsi = self._rsi_from_averages()
+        else:
+            # Phase 2: incremental Wilder update
+            self._avg_gain = (self._avg_gain * (self.period - 1) + gain) / self.period
+            self._avg_loss = (self._avg_loss * (self.period - 1) + loss) / self.period
+            self._rsi = self._rsi_from_averages()
+
+        if self._rsi is None:
+            return None
+
+        signal: Optional[SignalEvent] = None
         if self._rsi < self.oversold:
-            return SignalEvent(
+            signal = SignalEvent(
                 symbol=self.symbol,
                 direction=Direction.LONG,
+                strength=(self.oversold - self._rsi) / self.oversold,
                 timestamp=candle.timestamp,
             )
-        if self._rsi >= self.exit_level:
-            return SignalEvent(
+        elif self._rsi >= self.exit_level:
+            signal = SignalEvent(
                 symbol=self.symbol,
                 direction=Direction.SHORT,
+                strength=1.0,
                 timestamp=candle.timestamp,
             )
-        return None
+        return signal
 
     def reset(self) -> None:
-        self._closes = []
+        self._seed_gains.clear()
+        self._seed_losses.clear()
+        self._prev_price = None
+        self._avg_gain = None
+        self._avg_loss = None
         self._rsi = None
+        self._bar_count = 0
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _calc_rsi(self) -> float:
-        """Compute RSI using Wilder's smoothing over the last *period* changes."""
-        changes = [
-            self._closes[i] - self._closes[i - 1]
-            for i in range(len(self._closes) - self._period, len(self._closes))
-        ]
-        gains = [c for c in changes if c > 0]
-        losses = [-c for c in changes if c < 0]
-
-        avg_gain = sum(gains) / self._period
-        avg_loss = sum(losses) / self._period
-
-        if avg_loss == 0:
+    def _rsi_from_averages(self) -> float:
+        """Compute RSI from current avg_gain and avg_loss."""
+        if self._avg_loss == 0.0:
             return 100.0
-        rs = avg_gain / avg_loss
+        rs = self._avg_gain / self._avg_loss  # type: ignore[operator]
         return 100.0 - (100.0 / (1.0 + rs))
+
+
+# ---------------------------------------------------------------------------
+# Backwards-compatible alias (existing code that imports RSIMeanReversion
+# by the old name will still work).
+# ---------------------------------------------------------------------------
+RSIMeanReversion = RSIMeanReversionStrategy
