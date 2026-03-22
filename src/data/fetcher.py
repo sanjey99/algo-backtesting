@@ -75,7 +75,7 @@ class DataFetcher(ABC):
         }
         df = df.rename(columns=rename_map)
         if df.index.name:
-            df.index.name = df.index.name.lower()
+            df.index.name = str(df.index.name).lower()
         return df
 
 
@@ -204,10 +204,12 @@ class AlphaVantageFetcher(DataFetcher):
             )
 
         ts_data: dict[str, dict[str, str]] = data[key]
+        start_dt = datetime.strptime(start, "%Y-%m-%d") if isinstance(start, str) else start
+        end_dt = datetime.strptime(end, "%Y-%m-%d") if isinstance(end, str) else end
         rows = []
         for date_str, values in ts_data.items():
             dt = datetime.strptime(date_str, "%Y-%m-%d")
-            if start <= dt <= end:
+            if start_dt <= dt <= end_dt:
                 rows.append(
                     {
                         "timestamp": dt,
@@ -223,7 +225,7 @@ class AlphaVantageFetcher(DataFetcher):
         if not rows:
             raise ValueError(
                 f"Alpha Vantage returned no data for {symbol!r} "
-                f"between {start.date()} and {end.date()}."
+                f"between {start_dt.date()} and {end_dt.date()}."
             )
 
         df = pd.DataFrame(rows).set_index("timestamp").sort_index()

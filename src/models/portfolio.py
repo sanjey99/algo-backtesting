@@ -120,7 +120,10 @@ class Portfolio:
                     return None  # Insufficient funds — reject fill
                 self._cash -= cost
             else:
-                # Short: receive proceeds
+                # NOTE: Simplified short model — cash increases on open (proceeds received).
+                # Not modeled: margin reserve (typically 150% of position value), borrowing
+                # costs, or margin calls. Add margin_requirement to BacktestConfig for
+                # production use.
                 self._cash += quantity * fill_price - commission
             self._open_positions[symbol] = (
                 direction,

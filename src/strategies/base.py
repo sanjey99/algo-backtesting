@@ -35,6 +35,18 @@ class BaseStrategy(ABC):
         """Clear all indicator state. Called before each backtest run."""
         ...
 
+    def vectorized_signal(self, candles: list[Candle]) -> list[SignalEvent]:
+        """Generate signals for a list of candles (fast path for optimization sweeps).
+
+        Default implementation loops on_candle(). Override for vectorized computation.
+        """
+        signals = []
+        for candle in candles:
+            signal = self.on_candle(candle)
+            if signal is not None:
+                signals.append(signal)
+        return signals
+
     def generate_orders(self, candle: Candle) -> SignalEvent | None:
         """Alias for on_candle — kept for API compatibility."""
         return self.on_candle(candle)

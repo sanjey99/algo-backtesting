@@ -1,6 +1,8 @@
 """Report generation — summarise BacktestResult as a dict or standalone HTML."""
 from __future__ import annotations
 
+from typing import Any
+
 from src.analytics.metrics import compute_all_metrics
 from src.engine.backtest import BacktestResult
 
@@ -12,7 +14,7 @@ except ImportError:
     PLOTLY_AVAILABLE = False
 
 
-def _build_equity_chart_html(equity_curve) -> str:
+def _build_equity_chart_html(equity_curve: list[Any]) -> str:
     """Return a standalone Plotly chart HTML snippet."""
     if not PLOTLY_AVAILABLE:
         return "<p>Plotly not available — install plotly to see the equity chart.</p>"
@@ -46,10 +48,10 @@ def _build_equity_chart_html(equity_curve) -> str:
         height=400,
         margin=dict(l=20, r=20, t=40, b=20),
     )
-    return pio.to_html(fig, full_html=False, include_plotlyjs=True)
+    return str(pio.to_html(fig, full_html=False, include_plotlyjs=True))
 
 
-def generate_html_report(result: BacktestResult, metrics: dict | None = None) -> str:
+def generate_html_report(result: BacktestResult, metrics: dict[str, Any] | None = None) -> str:
     """Return a fully standalone HTML report with embedded Plotly equity chart."""
     if metrics is None:
         metrics = compute_all_metrics(result)
@@ -96,7 +98,7 @@ def generate_html_report(result: BacktestResult, metrics: dict | None = None) ->
 </html>"""
 
 
-def generate_report(result: BacktestResult) -> dict:
+def generate_report(result: BacktestResult) -> dict[str, Any]:
     """Return a summary dict of all standard metrics for a BacktestResult."""
     metrics = compute_all_metrics(result)
     return {
