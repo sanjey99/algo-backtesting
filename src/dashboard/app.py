@@ -128,16 +128,18 @@ def render_sidebar() -> dict:
 
 def render_kpis(metrics: dict, initial_capital: float, final_equity: float):
     st.subheader("📊 Key Performance Indicators")
-    cols = st.columns(6)
     kpis = [
         ("Sharpe Ratio", f"{metrics.get('sharpe_ratio', 0):.2f}", ""),
+        ("Sortino Ratio", f"{metrics.get('sortino_ratio', 0):.2f}", ""),
         ("CAGR", f"{metrics.get('cagr', 0)*100:.1f}%", ""),
         ("Max Drawdown", f"{metrics.get('max_drawdown', 0)*100:.1f}%", ""),
         ("Win Rate", f"{metrics.get('win_rate', 0)*100:.1f}%", ""),
+        ("Profit Factor", f"{metrics.get('profit_factor', 0):.2f}", ""),
         ("Total Trades", f"{int(metrics.get('total_trades', 0))}", ""),
         ("Total Return", f"{metrics.get('total_return', 0)*100:.1f}%", ""),
     ]
-    for col, (label, value, delta) in zip(cols, kpis):
+    cols = st.columns(len(kpis))
+    for col, (label, value, _) in zip(cols, kpis):
         col.metric(label, value)
 
 
@@ -284,6 +286,8 @@ def render_walk_forward_tab(cfg: dict):
     step_days = col3.number_input("Step Days", min_value=10, value=63, step=21)
     n_trials = st.number_input("Optimization Trials", min_value=3, max_value=200, value=20, step=5)
 
+    wf = st.session_state.get("wfa_result")
+
     if st.button("▶ Run Walk-Forward", key="wfa_run"):
         with st.spinner("Running walk-forward analysis…"):
             from src.analytics.walk_forward import WalkForwardAnalyzer
@@ -304,7 +308,9 @@ def render_walk_forward_tab(cfg: dict):
                 config=BacktestConfig(initial_capital=cfg["initial_capital"]),
             )
             wf = analyzer.run(candles)
+            st.session_state["wfa_result"] = wf
 
+    if wf is not None:
         st.success(f"Completed {len(wf.windows)} windows")
         kpi_cols = st.columns(3)
         kpi_cols[0].metric("Combined Sharpe", f"{wf.combined_sharpe:.2f}")
@@ -338,6 +344,8 @@ def render_permutation_tab(cfg: dict, current_metrics: dict | None):
 
     n_perms = st.number_input("Number of Permutations", min_value=10, max_value=1000, value=100, step=10)
 
+    perm = st.session_state.get("perm_result")
+
     if st.button("▶ Run Permutation Test", key="perm_run"):
         with st.spinner(f"Running {n_perms} permutations…"):
             from src.analytics.permutation_test import PermutationTester
@@ -355,7 +363,9 @@ def render_permutation_tab(cfg: dict, current_metrics: dict | None):
                 n_permutations=int(n_perms),
             )
             perm = tester.run()
+            st.session_state["perm_result"] = perm
 
+    if perm is not None:
         status_color = "green" if perm.is_significant else "red"
         sig_label = "✅ Significant" if perm.is_significant else "❌ Not Significant"
 
@@ -400,8 +410,10 @@ def render_permutation_tab(cfg: dict, current_metrics: dict | None):
 def render_comparison_tab(cfg: dict):
     st.subheader("🆚 Strategy Comparison")
 
+    st.info("ℹ️ Strategies are compared using their **default parameters**. Run Walk-Forward Analysis first to find optimal parameters per strategy.")
+
     candles = None
-    results = {}
+    results = st.session_state.get("comparison_results", {})
 
     if st.button("▶ Compare All Strategies", key="compare_run"):
         with st.spinner("Running all strategies…"):
@@ -416,7 +428,9 @@ def render_comparison_tab(cfg: dict):
                 result = BacktestEngine().run(strategy, candles, config)
                 metrics = compute_all_metrics(result)
                 results[key] = metrics
+        st.session_state["comparison_results"] = results
 
+    if results:
         rows = []
         for key, m in results.items():
             rows.append({

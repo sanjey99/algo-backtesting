@@ -1,8 +1,99 @@
-"""Report generation — summarise BacktestResult as a dict or text."""
+"""Report generation — summarise BacktestResult as a dict or standalone HTML."""
 from __future__ import annotations
 
 from src.analytics.metrics import compute_all_metrics
 from src.engine.backtest import BacktestResult
+
+try:
+    import plotly.graph_objects as go
+    import plotly.io as pio
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+
+
+def _build_equity_chart_html(equity_curve) -> str:
+    """Return a standalone Plotly chart HTML snippet."""
+    if not PLOTLY_AVAILABLE:
+        return "<p>Plotly not available — install plotly to see the equity chart.</p>"
+    if not equity_curve:
+        return "<p>No equity data.</p>"
+
+    dates = [
+        pt["date"].isoformat() if hasattr(pt["date"], "isoformat") else str(pt["date"])
+        if isinstance(pt, dict)
+        else (pt.date.isoformat() if hasattr(pt.date, "isoformat") else str(pt.date))
+        for pt in equity_curve
+    ]
+    equities = [
+        pt["equity"] if isinstance(pt, dict) else pt.equity
+        for pt in equity_curve
+    ]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=dates,
+        y=equities,
+        mode="lines",
+        name="Equity",
+        line=dict(color="#00b4d8", width=2),
+    ))
+    fig.update_layout(
+        title="Portfolio Equity",
+        plot_bgcolor="#0e1117",
+        paper_bgcolor="#1a1f2e",
+        font=dict(color="#e2e8f0"),
+        height=400,
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
+    return pio.to_html(fig, full_html=False, include_plotlyjs=True)
+
+
+def generate_html_report(result: BacktestResult, metrics: dict | None = None) -> str:
+    """Return a fully standalone HTML report with embedded Plotly equity chart."""
+    if metrics is None:
+        metrics = compute_all_metrics(result)
+
+    chart_html = _build_equity_chart_html(result.equity_curve)
+
+    def fmt_pct(v: float) -> str:
+        return f"{v * 100:.2f}%"
+
+    def fmt_f(v: float) -> str:
+        return f"{v:.4f}"
+
+    rows_html = "".join(
+        f"<tr><td>{k.replace('_', ' ').title()}</td><td>{fmt_pct(v) if 'rate' in k or 'drawdown' in k or 'cagr' in k or 'return' in k else fmt_f(v)}</td></tr>"
+        for k, v in metrics.items()
+        if isinstance(v, (int, float))
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Backtest Report — {result.strategy_name} / {result.symbol}</title>
+<style>
+  body {{ font-family: sans-serif; background: #0e1117; color: #e2e8f0; margin: 0; padding: 24px; }}
+  h1 {{ color: #00b4d8; }}
+  table {{ border-collapse: collapse; width: 100%; max-width: 600px; margin-bottom: 32px; }}
+  th, td {{ border: 1px solid #2d3748; padding: 8px 12px; text-align: left; }}
+  th {{ background: #1a1f2e; }}
+</style>
+</head>
+<body>
+<h1>Backtest Report</h1>
+<p><strong>Strategy:</strong> {result.strategy_name} &nbsp;|&nbsp;
+   <strong>Symbol:</strong> {result.symbol} &nbsp;|&nbsp;
+   <strong>Period:</strong> {result.start_date} – {result.end_date}</p>
+<table>
+  <tr><th>Metric</th><th>Value</th></tr>
+  {rows_html}
+</table>
+{chart_html}
+</body>
+</html>"""
 
 
 def generate_report(result: BacktestResult) -> dict:
