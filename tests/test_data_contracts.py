@@ -139,6 +139,34 @@ def test_contract_metadata_and_error_evidence_are_recursively_redacted() -> None
     assert "page=1" in serialized
 
 
+def test_contract_redaction_removes_queryless_url_userinfo_and_basic_auth() -> None:
+    request = AcquisitionRequest("SPY", date(2024, 1, 2), date(2024, 1, 3))
+    userinfo_value = "redaction-userinfo-value"
+    basic_value = "redaction-basic-value"
+    batch = ProviderBatch(
+        Provider.YFINANCE,
+        request,
+        pd.DataFrame(),
+        response_metadata={
+            "endpoint": f"https://user:{userinfo_value}@example.test/path",
+        },
+    )
+    attempt = AttemptEvidence(
+        provider=Provider.YFINANCE,
+        attempt_number=1,
+        started_at=datetime(2024, 1, 3),
+        duration_seconds=0.1,
+        outcome="failed",
+        error_message=f"upstream returned Authorization: Basic {basic_value}",
+    )
+
+    serialized = f"{batch.to_dict()} {attempt}"
+
+    assert userinfo_value not in serialized
+    assert basic_value not in serialized
+    assert "[REDACTED]" in serialized
+
+
 def test_contract_mapping_evidence_is_defensively_immutable() -> None:
     request = AcquisitionRequest("SPY", date(2024, 1, 2), date(2024, 1, 3))
     metadata = {"nested": {"value": "before"}}

@@ -28,9 +28,13 @@ _SENSITIVE_KEY_PATTERN = re.compile(
 )
 _INLINE_CREDENTIAL_PATTERN = re.compile(
     r"(?i)\b(api[_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|token|secret|password|"
-    r"authorization|cookie)\b(\s*[=:]\s*)([^\s,;&]+)"
+    r"cookie)\b(\s*[=:]\s*)([^\s,;&]+)"
 )
 _BEARER_PATTERN = re.compile(r"(?i)\bbearer\s+[^\s,;&]+")
+_AUTHORIZATION_PATTERN = re.compile(
+    r"(?i)\b(?:proxy-)?authorization\b\s*[=:]\s*"
+    r"(?:[a-z][a-z0-9_-]*\s+)?[^\s,;&]+"
+)
 _REDACTED = "[REDACTED]"
 
 
@@ -163,17 +167,20 @@ def _redact_text(value: str) -> str:
         parsed = urlsplit(value)
     except ValueError:
         parsed = None
-    if parsed is not None and (parsed.scheme or parsed.netloc) and parsed.query:
-        query = urlencode(
-            [
-                (key, _REDACTED if _is_sensitive_key(key) else item)
-                for key, item in parse_qsl(parsed.query, keep_blank_values=True)
-            ]
-        )
+    if parsed is not None and (parsed.scheme or parsed.netloc):
+        query = parsed.query
+        if query:
+            query = urlencode(
+                [
+                    (key, _REDACTED if _is_sensitive_key(key) else item)
+                    for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+                ]
+            )
         netloc = parsed.netloc
         if "@" in netloc:
             netloc = f"{_REDACTED}@{netloc.rsplit('@', maxsplit=1)[1]}"
         value = urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
+    value = _AUTHORIZATION_PATTERN.sub(f"Authorization: {_REDACTED}", value)
     value = _BEARER_PATTERN.sub(f"Bearer {_REDACTED}", value)
     return _INLINE_CREDENTIAL_PATTERN.sub(rf"\1\2{_REDACTED}", value)
 
