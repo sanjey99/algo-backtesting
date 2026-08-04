@@ -1,8 +1,8 @@
 # Design: SQL Analytics and Data Extraction Layer
 
-**Status:** Approved design  
-**Date:** 2026-08-04  
-**Branch:** `blueprint/sql-analytics-layer`  
+**Status:** Approved design
+**Date:** 2026-08-04
+**Branch:** `blueprint/sql-analytics-layer`
 **Scope:** Architecture and implementation design only
 
 ## 1. Problem and Users
@@ -134,8 +134,9 @@ contract validation before export.
 
 ### 5.4 `ContractValidator`
 
-Checks exact ordered columns, row count, uniqueness keys, required-value nullability, and
-coercible numeric/date values. A contract failure blocks export.
+Checks exact ordered columns, row count, uniqueness keys, required-value nullability, numeric
+bounds, and coercible numeric/date values. It returns a normalized pandas frame with declared
+nullable dtypes. A contract failure blocks export.
 
 ### 5.5 `IntegrityService`
 
@@ -146,8 +147,9 @@ severity, affected table, observed count, capped sample identifiers, and remedia
 ### 5.6 `ArtifactWriter`
 
 Writes stable UTF-8 CSV and JSON artifacts with deterministic column ordering and explicit null
-representation. It writes to a temporary sibling file and atomically renames only after
-validation succeeds. Existing files are not overwritten without `--force`.
+representation. Comparison CSV and metadata are staged and published as an all-or-nothing bundle,
+with rollback of prior files if publication fails. Existing files are not overwritten without
+`--force`.
 
 ### 5.7 `BenchmarkRunner`
 
@@ -332,14 +334,19 @@ The current no-op Alembic revision is treated as a schema-management defect.
 1. Rewrite the currently ineffective initial revision to create the existing four-table baseline.
 2. Add a second revision for analytical hardening.
 3. Audit a legacy `create_all()` database before stamping or upgrading it.
-4. If the expected baseline exists without an Alembic version, stamp the corrected initial
+4. Classify the schema by exact tables, ordered columns, SQLite-affinity types, nullability,
+   primary keys, foreign keys, constraints, indexes, and Alembic revision. Refuse partial or unknown
+   schemas without stamping or DDL.
+5. If the expected baseline exists without an Alembic version, stamp the corrected initial
    revision and apply the hardening revision.
-5. If a database is already stamped at the initial revision, verify that the baseline tables
+6. If a database is already stamped at the initial revision, verify that the baseline tables
    actually exist before applying hardening. A stamped database with missing baseline tables is a
    fatal schema-state error and is not repaired silently.
-6. Stop without modifying the database when duplicates, orphans, or unexpected schema state would
+7. Stop without modifying the database when duplicates, orphans, or unexpected schema state would
    make hardening unsafe.
-7. Do not migrate silently during API startup. Startup verifies schema compatibility and reports
+8. Ensure Alembic honors an explicitly injected connection or database URL before environment
+   defaults so tests and migration commands cannot target an unintended database.
+9. Do not migrate silently during API startup. Startup verifies schema compatibility and reports
    the required migration command.
 
 The hardening revision adds:
@@ -402,7 +409,8 @@ The benchmark creates a deterministic synthetic database from recorded generator
 labels synthetic results as live market results.
 
 Two database copies contain identical rows: one uses the baseline schema and one uses the
-hardened/indexed schema. Both run `ANALYZE` before measurement.
+hardened/indexed schema. All connections are closed before using SQLite's backup API to create the
+second copy. Both run `ANALYZE` before measurement.
 
 Each report records:
 
