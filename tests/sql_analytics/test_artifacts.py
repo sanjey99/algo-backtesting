@@ -8,7 +8,11 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from src.analytics.sql_artifacts import ArtifactExistsError, write_comparison_bundle
+from src.analytics.sql_artifacts import (
+    ArtifactExistsError,
+    write_comparison_bundle,
+    write_json_artifact,
+)
 from src.analytics.sql_contracts import ComparisonMetadata, QueryId
 
 
@@ -130,6 +134,45 @@ def test_preflight_refuses_either_existing_destination_without_writing(tmp_path:
     assert metadata_path.read_text(encoding="utf-8") == "old metadata"
 
 
+@pytest.mark.parametrize("blocked_name", ["comparison.csv", "comparison.json"])
+def test_bundle_refuses_broken_symlink_destinations_without_force(
+    tmp_path: Path, blocked_name: str
+) -> None:
+    """A dangling symlink is still owned output and cannot be replaced without force."""
+    csv_path = tmp_path / "comparison.csv"
+    metadata_path = tmp_path / "comparison.json"
+    blocked = tmp_path / blocked_name
+    missing_target = tmp_path / "missing-target"
+    blocked.symlink_to(missing_target)
+
+    with pytest.raises(ArtifactExistsError, match=blocked_name):
+        write_comparison_bundle(
+            pd.DataFrame({"name": ["new"], "value": [1]}),
+            _metadata(row_count=1),
+            csv_path,
+            metadata_path,
+            force=False,
+        )
+
+    assert blocked.is_symlink()
+    assert blocked.readlink() == missing_target
+    other = metadata_path if blocked == csv_path else csv_path
+    assert not other.exists()
+
+
+def test_json_writer_refuses_broken_symlink_destination_without_force(tmp_path: Path) -> None:
+    """Validation JSON cannot overwrite a dangling symlink without explicit force."""
+    out = tmp_path / "validation.json"
+    missing_target = tmp_path / "missing-validation"
+    out.symlink_to(missing_target)
+
+    with pytest.raises(ArtifactExistsError, match="validation.json"):
+        write_json_artifact({"schema_version": "1.0"}, out, force=False)
+
+    assert out.is_symlink()
+    assert out.readlink() == missing_target
+
+
 def test_force_replaces_both_existing_artifacts(tmp_path: Path) -> None:
     """Dropping force-mode backup/publication would preserve stale output or only one new file."""
     frame = pd.DataFrame({"name": ["new"], "value": [1]})
@@ -245,3 +288,38 @@ def test_second_force_publish_failure_restores_both_originals(
         "comparison.csv",
         "comparison.json",
     ]
+
+
+def test_force_rollback_restores_broken_symlink_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dangling original remains recoverable when the second force publish fails."""
+    csv_path = tmp_path / "comparison.csv"
+    metadata_path = tmp_path / "comparison.json"
+    missing_target = tmp_path / "missing-target"
+    csv_path.symlink_to(missing_target)
+    metadata_path.write_bytes(b"original metadata\n")
+    original_replace = Path.replace
+    failed = False
+
+    def fail_second_publish(self: Path, target: Path) -> Path:
+        nonlocal failed
+        if Path(target) == metadata_path and not failed:
+            failed = True
+            raise OSError("controlled second publish failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_second_publish)
+
+    with pytest.raises(OSError, match="controlled second publish"):
+        write_comparison_bundle(
+            pd.DataFrame({"name": ["new"], "value": [1]}),
+            _metadata(row_count=1),
+            csv_path,
+            metadata_path,
+            force=True,
+        )
+
+    assert csv_path.is_symlink()
+    assert csv_path.readlink() == missing_target
+    assert metadata_path.read_bytes() == b"original metadata\n"

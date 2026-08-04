@@ -58,16 +58,23 @@ def test_required_subcommand_and_deferred_benchmark_return_invalid_input() -> No
     assert sql_cli.main(["benchmark"]) == 2
 
 
-@pytest.mark.parametrize(
-    "args",
-    [
-        ["compare", "--database", "missing.db", "--symbol", "SPY", "--start", "bad"],
-        ["compare", "--database", "missing.db", "--symbol", "SPY", "--start", "2024-1-1"],
-    ],
-)
-def test_compare_rejects_non_iso_dates(args: list[str]) -> None:
-    """Relaxing strict ISO parsing must retain exit 2 rather than reaching the database."""
+@pytest.mark.parametrize("invalid_date", ["bad", "2024-1-1"])
+def test_compare_rejects_non_iso_date_as_the_only_invalid_argument(
+    analytics_db: Engine,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    invalid_date: str,
+) -> None:
+    """Strict ISO date parsing is isolated from every other valid required argument."""
+    args = _compare_args(
+        _database_path(analytics_db), tmp_path / "comparison.csv", tmp_path / "comparison.json"
+    )
+    args[args.index("--start") + 1] = invalid_date
+
     assert sql_cli.main(args) == 2
+    stderr = capsys.readouterr().err
+    assert "date must use ISO YYYY-MM-DD format" in stderr
+    assert invalid_date not in stderr
 
 
 def test_compare_rejects_reversed_range_and_non_file_database(tmp_path: Path) -> None:
@@ -198,6 +205,19 @@ def test_compare_empty_cohort_is_success_with_header_only_artifact(
     assert json.loads(metadata_path.read_text(encoding="utf-8"))["row_count"] == 0
 
 
+def test_compare_preflight_creates_missing_output_directories(
+    analytics_db: Engine, tmp_path: Path
+) -> None:
+    """Early path validation permits and creates safe missing parent directories."""
+    output = tmp_path / "missing" / "nested"
+    csv_path = output / "comparison.csv"
+    metadata_path = output / "comparison.json"
+
+    assert sql_cli.main(_compare_args(_database_path(analytics_db), csv_path, metadata_path)) == 0
+    assert csv_path.is_file()
+    assert metadata_path.is_file()
+
+
 def test_existing_comparison_artifact_is_exit_2_without_partial_overwrite(
     analytics_db: Engine, tmp_path: Path
 ) -> None:
@@ -209,6 +229,65 @@ def test_existing_comparison_artifact_is_exit_2_without_partial_overwrite(
     assert sql_cli.main(_compare_args(_database_path(analytics_db), csv_path, metadata_path)) == 2
     assert csv_path.read_text(encoding="utf-8") == "owned"
     assert not metadata_path.exists()
+
+
+@pytest.mark.parametrize("blocked_output", ["csv", "metadata"])
+def test_compare_prevalidates_invalid_output_parent_before_database_work(
+    analytics_db: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    blocked_output: str,
+) -> None:
+    """A non-directory output ancestor is exit 2 before engine or service construction."""
+    blocked_parent = tmp_path / "blocked"
+    blocked_parent.write_text("not a directory", encoding="utf-8")
+    csv_path = tmp_path / "comparison.csv"
+    metadata_path = tmp_path / "comparison.json"
+    if blocked_output == "csv":
+        csv_path = blocked_parent / "comparison.csv"
+    else:
+        metadata_path = blocked_parent / "comparison.json"
+    engine_calls = 0
+
+    def reject_engine_work(database_url: str) -> Engine:
+        nonlocal engine_calls
+        engine_calls += 1
+        raise AssertionError("engine creation must not run")
+
+    monkeypatch.setattr(sql_cli, "create_db_engine", reject_engine_work)
+
+    assert sql_cli.main(_compare_args(_database_path(analytics_db), csv_path, metadata_path)) == 2
+    assert engine_calls == 0
+    stderr = capsys.readouterr().err
+    assert "invalid artifact path" in stderr
+    assert str(blocked_parent) not in stderr
+
+
+@pytest.mark.parametrize("blocked_output", ["csv", "metadata"])
+def test_compare_prevalidates_broken_symlink_before_database_work(
+    analytics_db: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_output: str,
+) -> None:
+    """A dangling comparison output is treated as existing before engine creation."""
+    csv_path = tmp_path / "comparison.csv"
+    metadata_path = tmp_path / "comparison.json"
+    blocked = csv_path if blocked_output == "csv" else metadata_path
+    blocked.symlink_to(tmp_path / "missing-target")
+    engine_calls = 0
+
+    def reject_engine_work(database_url: str) -> Engine:
+        nonlocal engine_calls
+        engine_calls += 1
+        raise AssertionError("engine creation must not run")
+
+    monkeypatch.setattr(sql_cli, "create_db_engine", reject_engine_work)
+
+    assert sql_cli.main(_compare_args(_database_path(analytics_db), csv_path, metadata_path)) == 2
+    assert engine_calls == 0
+    assert blocked.is_symlink()
 
 
 def test_validate_writes_versioned_report_and_force_controls_overwrite(
@@ -238,6 +317,75 @@ def test_validate_writes_versioned_report_and_force_controls_overwrite(
     assert sql_cli.main(args) == 2
     assert out.read_bytes() == original
     assert sql_cli.main([*args, "--force"]) == 0
+
+
+def test_validate_preflight_creates_missing_output_directories(
+    analytics_db: Engine, tmp_path: Path
+) -> None:
+    """Validation preflight accepts a creatable missing output parent."""
+    out = tmp_path / "missing" / "nested" / "validation.json"
+
+    code = sql_cli.main(
+        ["validate", "--database", str(_database_path(analytics_db)), "--out", str(out)]
+    )
+
+    assert code == 0
+    assert out.is_file()
+
+
+def test_validate_prevalidates_invalid_parent_before_database_work(
+    analytics_db: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A validation output under a file ancestor is exit 2 without engine creation."""
+    blocked_parent = tmp_path / "blocked"
+    blocked_parent.write_text("not a directory", encoding="utf-8")
+    engine_calls = 0
+
+    def reject_engine_work(database_url: str) -> Engine:
+        nonlocal engine_calls
+        engine_calls += 1
+        raise AssertionError("engine creation must not run")
+
+    monkeypatch.setattr(sql_cli, "create_db_engine", reject_engine_work)
+
+    code = sql_cli.main(
+        [
+            "validate",
+            "--database",
+            str(_database_path(analytics_db)),
+            "--out",
+            str(blocked_parent / "validation.json"),
+        ]
+    )
+    assert code == 2
+    assert engine_calls == 0
+
+
+def test_validate_prevalidates_broken_symlink_before_database_work(
+    analytics_db: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dangling validation output is protected without running database validation."""
+    out = tmp_path / "validation.json"
+    out.symlink_to(tmp_path / "missing-target")
+    engine_calls = 0
+
+    def reject_engine_work(database_url: str) -> Engine:
+        nonlocal engine_calls
+        engine_calls += 1
+        raise AssertionError("engine creation must not run")
+
+    monkeypatch.setattr(sql_cli, "create_db_engine", reject_engine_work)
+
+    code = sql_cli.main(
+        ["validate", "--database", str(_database_path(analytics_db)), "--out", str(out)]
+    )
+    assert code == 2
+    assert engine_calls == 0
+    assert out.is_symlink()
 
 
 def test_validate_writes_failed_report_before_returning_exit_5(
@@ -379,10 +527,45 @@ def test_symbol_and_strategy_injection_values_are_bound_and_read_only(
 
 @pytest.mark.parametrize("option", ["--sort", "--query-id"])
 def test_compare_rejects_arbitrary_sort_and_query_identifiers(
-    analytics_db: Engine, tmp_path: Path, option: str
+    analytics_db: Engine,
+    tmp_path: Path,
+    option: str,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Adding open query/sort inputs would bypass the closed catalogue boundary."""
     args = _compare_args(
         _database_path(analytics_db), tmp_path / "comparison.csv", tmp_path / "comparison.json"
     )
-    assert sql_cli.main([*args, option, "malicious"]) == 2
+    rejected_value = "credential=user:secret@example.invalid"
+
+    assert sql_cli.main([*args, option, rejected_value]) == 2
+    stderr = capsys.readouterr().err
+    assert "invalid command-line input" in stderr
+    assert option not in stderr
+    assert rejected_value not in stderr
+    assert "secret" not in stderr
+
+
+def test_malformed_numeric_input_uses_sanitized_stderr(
+    analytics_db: Engine, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Argument parsing never echoes a rejected value that could contain credentials."""
+    rejected_value = "credential=user:secret@example.invalid"
+
+    code = sql_cli.main(
+        [
+            "validate",
+            "--database",
+            str(_database_path(analytics_db)),
+            "--out",
+            str(tmp_path / "validation.json"),
+            "--tolerance",
+            rejected_value,
+        ]
+    )
+
+    assert code == 2
+    stderr = capsys.readouterr().err
+    assert "tolerance must be numeric" in stderr
+    assert rejected_value not in stderr
+    assert "secret" not in stderr

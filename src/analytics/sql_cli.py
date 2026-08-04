@@ -8,12 +8,15 @@ from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from math import isfinite
 from pathlib import Path
+from typing import NoReturn
 from urllib.parse import quote
 
 from sqlalchemy.exc import SQLAlchemyError
 
 from src.analytics.sql_artifacts import (
     ArtifactExistsError,
+    ArtifactPathError,
+    preflight_artifact_destinations,
     write_comparison_bundle,
     write_json_artifact,
 )
@@ -51,6 +54,13 @@ class _InvalidCliInputError(ValueError):
     """Signal cross-argument validation that argparse cannot express directly."""
 
 
+class _SanitizedArgumentParser(argparse.ArgumentParser):
+    """Convert argparse failures into safe messages handled by ``main``."""
+
+    def error(self, message: str) -> NoReturn:
+        raise _InvalidCliInputError(_sanitize_parse_error(message))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run a SQL analytics command and return its stable process exit code."""
     parser = _build_parser()
@@ -68,6 +78,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise _InvalidCliInputError("benchmark is not implemented yet")
     except ArtifactExistsError as error:
         return _error_exit(_INVALID_INPUT, "artifact destination already exists", error, verbose)
+    except ArtifactPathError as error:
+        return _error_exit(_INVALID_INPUT, "invalid artifact path", error, verbose)
     except _InvalidCliInputError as error:
         return _error_exit(_INVALID_INPUT, str(error), error, verbose)
     except RunNotFoundError as error:
@@ -85,7 +97,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="sql-analytics")
+    parser = _SanitizedArgumentParser(prog="sql-analytics")
     parser.add_argument("--verbose", action="store_true", help="show exception tracebacks")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -126,6 +138,9 @@ def _allow_subcommand_verbose(parser: argparse.ArgumentParser) -> None:
 def _run_compare(arguments: argparse.Namespace) -> int:
     if arguments.start >= arguments.end:
         raise _InvalidCliInputError("start date must be before end date")
+    preflight_artifact_destinations(
+        (arguments.csv, arguments.metadata), bool(arguments.force)
+    )
     start = datetime.combine(arguments.start, datetime.min.time())
     end = datetime.combine(arguments.end, datetime.min.time())
     filters = ComparisonFilters(
@@ -161,6 +176,7 @@ def _run_compare(arguments: argparse.Namespace) -> int:
 
 
 def _run_validate(arguments: argparse.Namespace) -> int:
+    preflight_artifact_destinations((arguments.out,), bool(arguments.force))
     engine = create_db_engine(_sqlite_url(arguments.database))
     try:
         report = IntegrityService(engine).validate(arguments.tolerance, arguments.sample_limit)
@@ -261,6 +277,12 @@ def _sample_limit(value: str) -> int:
     if not 1 <= parsed <= 100:
         raise argparse.ArgumentTypeError("sample limit must be from 1 to 100")
     return parsed
+
+
+def _sanitize_parse_error(message: str) -> str:
+    if message.startswith("unrecognized arguments:") or "invalid choice:" in message:
+        return "invalid command-line input"
+    return message
 
 
 def _error_exit(code: int, message: str, error: BaseException, verbose: bool) -> int:

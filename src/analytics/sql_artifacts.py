@@ -21,6 +21,10 @@ class ArtifactExistsError(FileExistsError):
     """Raised when an artifact destination exists without explicit force mode."""
 
 
+class ArtifactPathError(ValueError):
+    """Raised when an artifact destination cannot be safely prepared."""
+
+
 def serialize_supported_type(value: object) -> object:
     """Convert supported contract values to deterministic JSON primitives."""
     if isinstance(value, datetime):
@@ -45,8 +49,7 @@ def write_comparison_bundle(
 ) -> tuple[ArtifactInfo, ArtifactInfo]:
     """Publish a CSV and its metadata as one atomic bundle."""
     destinations = (csv_path, metadata_path)
-    _validate_distinct_destinations(destinations)
-    _prepare_destinations(destinations, force)
+    preflight_artifact_destinations(destinations, force)
     staged: tuple[Path, Path] | None = None
     try:
         csv_file = _temporary_text_file(csv_path)
@@ -91,7 +94,7 @@ def write_comparison_bundle(
 
 def write_json_artifact(value: object, path: Path, force: bool) -> ArtifactInfo:
     """Publish one deterministic versioned JSON artifact atomically."""
-    _prepare_destinations((path,), force)
+    preflight_artifact_destinations((path,), force)
     temporary = _temporary_text_file(path)
     staged = Path(temporary.name)
     try:
@@ -140,12 +143,21 @@ def _validate_distinct_destinations(destinations: tuple[Path, ...]) -> None:
         raise ValueError("Artifact destinations must be distinct")
 
 
-def _prepare_destinations(destinations: tuple[Path, ...], force: bool) -> None:
+def preflight_artifact_destinations(destinations: tuple[Path, ...], force: bool) -> None:
+    """Validate and create output parents without touching destination entries."""
+    _validate_distinct_destinations(destinations)
     for destination in destinations:
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise ArtifactPathError("Artifact output parent is not a usable directory") from error
+        if not destination.parent.is_dir():
+            raise ArtifactPathError("Artifact output parent is not a usable directory")
+        if _path_lexists(destination) and destination.is_dir():
+            raise ArtifactPathError("Artifact destination must not be a directory")
     if force:
         return
-    existing = tuple(destination for destination in destinations if destination.exists())
+    existing = tuple(destination for destination in destinations if _path_lexists(destination))
     if existing:
         names = ", ".join(str(path) for path in existing)
         raise ArtifactExistsError(f"Artifact destination already exists: {names}")
@@ -159,7 +171,7 @@ def _publish_staged(
     try:
         if force:
             for destination in destinations:
-                if destination.exists():
+                if _path_lexists(destination):
                     backup = _unused_backup_path(destination)
                     destination.replace(backup)
                     backups[destination] = backup
@@ -169,7 +181,7 @@ def _publish_staged(
     except BaseException:
         _remove_paths(tuple(reversed(published)))
         for destination, backup in backups.items():
-            if backup.exists():
+            if _path_lexists(backup):
                 backup.replace(destination)
         raise
     else:
@@ -193,6 +205,10 @@ def _unused_backup_path(destination: Path) -> Path:
 def _remove_paths(paths: tuple[Path, ...]) -> None:
     for path in paths:
         path.unlink(missing_ok=True)
+
+
+def _path_lexists(path: Path) -> bool:
+    return os.path.lexists(path)
 
 
 def _artifact_info(path: Path) -> ArtifactInfo:
