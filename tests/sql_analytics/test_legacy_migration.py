@@ -4,6 +4,8 @@ from __future__ import annotations
 import importlib
 import shutil
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -101,6 +103,30 @@ def test_empty_database_classifies_without_creating_schema(tmp_path: Path) -> No
     assert inspect(create_engine(_database_url(path))).get_table_names() == []
 
 
+def test_view_only_database_is_unknown_and_refused_without_mutation(tmp_path: Path) -> None:
+    """Ignoring non-table objects would mutate an unrelated view-only database as EMPTY."""
+    api = _migration_api()
+    path = tmp_path / "view-only.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE VIEW sentinel_view AS SELECT 1 AS value")
+    before = path.read_bytes()
+
+    assessment = _assessment(path)
+
+    assert assessment.state.value == "unknown"
+    assert assessment.current_revision is None
+    assert assessment.differences == (
+        "missing table: backtest_runs",
+        "missing table: equity_curve",
+        "missing table: metrics",
+        "missing table: trades",
+        "unexpected view: sentinel_view",
+    )
+    with pytest.raises(RuntimeError, match="UNKNOWN"):
+        api.upgrade_database(_database_url(path))
+    assert path.read_bytes() == before
+
+
 def test_tracked_database_classifies_as_exact_unversioned_baseline(tmp_path: Path) -> None:
     """Rejecting the shipped exact baseline would block the supported legacy workflow."""
     path = tmp_path / "tracked-copy.db"
@@ -111,6 +137,38 @@ def test_tracked_database_classifies_as_exact_unversioned_baseline(tmp_path: Pat
     assert assessment.state.value == "baseline_unversioned"
     assert assessment.current_revision is None
     assert assessment.differences == ()
+
+
+def test_extra_view_and_trigger_make_exact_schema_unknown(tmp_path: Path) -> None:
+    """Exact tables and revision cannot hide unrelated SQLite objects."""
+    api = _migration_api()
+    path = tmp_path / "extra-objects.db"
+    _current(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE VIEW run_symbols AS SELECT id, symbol FROM backtest_runs"
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER observe_runs AFTER INSERT ON backtest_runs
+            BEGIN
+                SELECT NEW.id;
+            END
+            """
+        )
+    before = _schema_snapshot(path)
+
+    assessment = _assessment(path)
+
+    assert assessment.state.value == "unknown"
+    assert assessment.current_revision == HEAD_REVISION
+    assert assessment.differences == (
+        "unexpected trigger: observe_runs",
+        "unexpected view: run_symbols",
+    )
+    with pytest.raises(RuntimeError, match="UNKNOWN"):
+        api.upgrade_database(_database_url(path))
+    assert _schema_snapshot(path) == before
 
 
 def test_empty_version_table_is_unknown_and_refused_without_mutation(tmp_path: Path) -> None:
@@ -129,6 +187,53 @@ def test_empty_version_table_is_unknown_and_refused_without_mutation(tmp_path: P
     assert assessment.differences == ("alembic_version table has no revision",)
     with pytest.raises(RuntimeError, match="UNKNOWN"):
         api.upgrade_database(_database_url(path))
+    assert _schema_snapshot(path) == before
+
+
+def test_multiple_version_rows_are_unknown_and_refused_without_mutation(tmp_path: Path) -> None:
+    """Multiple Alembic heads are malformed metadata, not an exception or upgrade target."""
+    api = _migration_api()
+    path = tmp_path / "multiple-version-rows.db"
+    _baseline(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO alembic_version (version_num) VALUES ('second_revision')"
+        )
+    before = _schema_snapshot(path)
+
+    assessment = _assessment(path)
+
+    assert assessment.state.value == "unknown"
+    assert assessment.current_revision is None
+    assert assessment.differences == (
+        "alembic_version table has 2 rows, expected 1",
+    )
+    with pytest.raises(RuntimeError, match="UNKNOWN"):
+        api.upgrade_database(_database_url(path))
+    assert _schema_snapshot(path) == before
+
+
+def test_cli_cleanly_refuses_malformed_version_metadata(tmp_path: Path) -> None:
+    """Malformed metadata must return a sanitized nonzero CLI result without traceback."""
+    path = tmp_path / "malformed-version-table.db"
+    _baseline(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE alembic_version")
+        connection.execute("CREATE TABLE alembic_version (wrong_column TEXT)")
+    before = _schema_snapshot(path)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "src.db.migrate", "--database", str(path)],
+        cwd=PROJECT_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "state=unknown" in result.stdout
+    assert "UNKNOWN database schema" in result.stderr
+    assert "Traceback" not in result.stderr
     assert _schema_snapshot(path) == before
 
 

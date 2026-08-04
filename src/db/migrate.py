@@ -9,7 +9,6 @@ from enum import StrEnum
 from pathlib import Path
 
 from alembic.config import Config
-from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy import inspect
 from sqlalchemy.engine import Connection, Engine
@@ -180,10 +179,6 @@ def _head_revision() -> str:
     return head
 
 
-def _current_revision(connection: Connection) -> str | None:
-    return MigrationContext.configure(connection).get_current_revision()
-
-
 def _sqlite_affinity(declared_type: str) -> str:
     normalized = declared_type.upper()
     if "INT" in normalized:
@@ -195,6 +190,46 @@ def _sqlite_affinity(declared_type: str) -> str:
     if any(token in normalized for token in ("REAL", "FLOA", "DOUB")):
         return "REAL"
     return "NUMERIC"
+
+
+def _version_metadata(
+    connection: Connection, *, has_version_table: bool
+) -> tuple[str | None, tuple[str, ...]]:
+    if not has_version_table:
+        return None, ()
+    columns = tuple(connection.exec_driver_sql('PRAGMA table_info("alembic_version")'))
+    if (
+        len(columns) != 1
+        or str(columns[0][1]) != "version_num"
+        or _sqlite_affinity(str(columns[0][2])) != "TEXT"
+        or not bool(columns[0][3])
+        or int(columns[0][5]) != 1
+    ):
+        return None, ("alembic_version table is malformed",)
+    rows = tuple(connection.exec_driver_sql("SELECT version_num FROM alembic_version"))
+    if not rows:
+        return None, ("alembic_version table has no revision",)
+    if len(rows) != 1:
+        return None, (f"alembic_version table has {len(rows)} rows, expected 1",)
+    revision = rows[0][0]
+    if not isinstance(revision, str) or not revision:
+        return None, ("alembic_version table is malformed",)
+    return revision, ()
+
+
+def _unexpected_object_differences(
+    objects: tuple[tuple[str, str, str], ...], *, hardened: bool
+) -> tuple[str, ...]:
+    expected_indexes = {
+        name
+        for table_indexes in (_HARDENED_INDEXES if hardened else {}).values()
+        for name in table_indexes
+    }
+    return tuple(
+        f"unexpected {object_type}: {name}"
+        for object_type, name, _ in objects
+        if object_type != "table" and not (object_type == "index" and name in expected_indexes)
+    )
 
 
 def _column_differences(connection: Connection, table_name: str) -> list[str]:
@@ -341,24 +376,27 @@ def assess_schema(engine: Engine) -> SchemaAssessment:
     """Classify a schema exactly without issuing stamps or DDL."""
     head_revision = _head_revision()
     with engine.connect() as connection:
-        current_revision = _current_revision(connection)
-        raw_table_names = {
-            str(row[0])
+        objects = tuple(
+            (str(row[0]), str(row[1]), str(row[2]))
             for row in connection.exec_driver_sql(
-                "SELECT name FROM sqlite_master "
-                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                "SELECT type, name, tbl_name FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
             )
-        }
+        )
+        raw_table_names = {name for object_type, name, _ in objects if object_type == "table"}
         has_version_table = "alembic_version" in raw_table_names
+        current_revision, metadata_differences = _version_metadata(
+            connection, has_version_table=has_version_table
+        )
         table_names = raw_table_names - {"alembic_version"}
-        if not table_names and current_revision is None and not has_version_table:
+        if not objects:
             return SchemaAssessment(SchemaState.EMPTY, None, ())
         hardened = current_revision == head_revision
         differences = list(
             _structural_differences(connection, table_names, hardened=hardened)
         )
-        if has_version_table and current_revision is None:
-            differences.append("alembic_version table has no revision")
+        differences.extend(metadata_differences)
+        differences.extend(_unexpected_object_differences(objects, hardened=hardened))
         if current_revision not in (None, BASELINE_REVISION, head_revision):
             differences.append(f"unexpected revision: {current_revision}")
         sorted_differences = tuple(sorted(differences))
