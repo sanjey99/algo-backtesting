@@ -11,7 +11,7 @@ from types import MappingProxyType
 from sqlalchemy import bindparam, text
 from sqlalchemy.sql.elements import TextClause
 
-from src.analytics.sql_contracts import QueryId, QuerySpec, ResultContract
+from src.analytics.sql_contracts import COMPARISON_CONTRACT, QueryId, QuerySpec, ResultContract
 
 
 @dataclass(frozen=True)
@@ -27,8 +27,8 @@ _DEFAULT_SPECS: Mapping[QueryId, QuerySpec] = MappingProxyType(
     {
         QueryId.STRATEGY_RUN_COMPARISON: QuerySpec(
             resource="strategy_run_comparison.sql",
-            required_params=frozenset(),
-            contract=ResultContract(columns=()),
+            required_params=frozenset({"symbol", "start_date", "end_date", "strategy_name"}),
+            contract=COMPARISON_CONTRACT,
         ),
         QueryId.TRADE_SEQUENCE: QuerySpec(
             resource="trade_sequence.sql",
