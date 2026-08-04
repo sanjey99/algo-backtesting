@@ -20,6 +20,7 @@ from src.analytics.sql_artifacts import (
     write_comparison_bundle,
     write_json_artifact,
 )
+from src.analytics.sql_benchmark import BenchmarkConfig, BenchmarkRunner
 from src.analytics.sql_catalog import QueryCatalogue
 from src.analytics.sql_contracts import ComparisonFilters, ComparisonMetadata, QueryId
 from src.analytics.sql_service import (
@@ -75,7 +76,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_compare(arguments)
         if arguments.command == "validate":
             return _run_validate(arguments)
-        raise _InvalidCliInputError("benchmark is not implemented yet")
+        if arguments.command == "benchmark":
+            return _run_benchmark(arguments)
+        raise _InvalidCliInputError("invalid command-line input")
     except ArtifactExistsError as error:
         return _error_exit(_INVALID_INPUT, "artifact destination already exists", error, verbose)
     except ArtifactPathError as error:
@@ -121,8 +124,18 @@ def _build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--sample-limit", type=_sample_limit, default=20)
     validate.add_argument("--force", action="store_true")
 
-    benchmark = subparsers.add_parser("benchmark", help="benchmark support is added separately")
+    benchmark = subparsers.add_parser(
+        "benchmark", help="write deterministic SQLite benchmark evidence"
+    )
     _allow_subcommand_verbose(benchmark)
+    benchmark.add_argument("--seed", type=_integer, default=42)
+    benchmark.add_argument("--runs", type=_integer, default=150)
+    benchmark.add_argument("--equity-points-per-run", type=_integer, default=2_520)
+    benchmark.add_argument("--trades-per-run", type=_integer, default=40)
+    benchmark.add_argument("--warmups", type=_integer, default=3)
+    benchmark.add_argument("--repetitions", type=_integer, default=15)
+    benchmark.add_argument("--database-out", required=True, type=_output_path)
+    benchmark.add_argument("--out", required=True, type=_output_path)
     return parser
 
 
@@ -185,6 +198,33 @@ def _run_validate(arguments: argparse.Namespace) -> int:
         engine.dispose()
     if report.has_failures:
         raise _ValidationIntegrityError("validation report contains fatal findings")
+    return _SUCCESS
+
+
+def _run_benchmark(arguments: argparse.Namespace) -> int:
+    config = BenchmarkConfig(
+        seed=arguments.seed,
+        run_count=arguments.runs,
+        equity_points_per_run=arguments.equity_points_per_run,
+        trades_per_run=arguments.trades_per_run,
+        warmups=arguments.warmups,
+        repetitions=arguments.repetitions,
+    )
+    database_out = arguments.database_out.expanduser().absolute()
+    report_out = arguments.out.expanduser().absolute()
+    preflight_artifact_destinations((database_out, report_out), force=False)
+    report = BenchmarkRunner(database_out).run(config)
+    write_json_artifact(report, report_out, force=False)
+    fixture = report.fixture
+    if fixture is None:
+        raise RuntimeError("benchmark report is missing fixture metadata")
+    print(
+        "compare filters: "
+        f"--database {database_out} "
+        f"--symbol {fixture.symbol} "
+        f"--start {fixture.start_date.date().isoformat()} "
+        f"--end {fixture.end_date.date().isoformat()}"
+    )
     return _SUCCESS
 
 
@@ -277,6 +317,13 @@ def _sample_limit(value: str) -> int:
     if not 1 <= parsed <= 100:
         raise argparse.ArgumentTypeError("sample limit must be from 1 to 100")
     return parsed
+
+
+def _integer(value: str) -> int:
+    try:
+        return int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("value must be an integer") from error
 
 
 def _sanitize_parse_error(message: str) -> str:

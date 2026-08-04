@@ -52,10 +52,105 @@ def _snapshot(engine: Engine) -> tuple[tuple[str, int], ...]:
         )
 
 
-def test_required_subcommand_and_deferred_benchmark_return_invalid_input() -> None:
-    """Removing required subparsers or accidentally treating the stub as success breaks exit 2."""
+def test_required_subcommand_and_benchmark_outputs_return_invalid_input() -> None:
+    """Removing required subparsers or benchmark destinations breaks exit 2."""
     assert sql_cli.main([]) == 2
     assert sql_cli.main(["benchmark"]) == 2
+
+
+def test_benchmark_writes_report_preserves_database_and_prints_compare_filters(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Dropping the hardened database or guessed cohort filters breaks the CLI handoff."""
+    database = tmp_path / "benchmark?copy.db"
+    report_path = tmp_path / "benchmark.json"
+
+    code = sql_cli.main(
+        [
+            "benchmark",
+            "--seed",
+            "7",
+            "--runs",
+            "4",
+            "--equity-points-per-run",
+            "8",
+            "--trades-per-run",
+            "3",
+            "--warmups",
+            "1",
+            "--repetitions",
+            "3",
+            "--database-out",
+            str(database),
+            "--out",
+            str(report_path),
+        ]
+    )
+
+    assert code == 0
+    assert database.is_file()
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["schema_version"] == "1.0"
+    assert report["config"]["seed"] == 7
+    assert len(report["variants"]) == 2
+    assert len(report["measurements"]) == 8
+    assert all(len(item["timing"]["samples_ns"]) == 3 for item in report["measurements"])
+    assert all(item["sql_sha256"] for item in report["measurements"])
+    assert all(item["result_sha256"] for item in report["measurements"])
+    assert all(item["plan_rows"] for item in report["measurements"])
+    assert {"python", "sqlite", "sqlalchemy", "pandas", "platform"} <= set(
+        report["environment"]
+    )
+    stdout = capsys.readouterr().out
+    assert f"--database {database.resolve()}" in stdout
+    assert f"--symbol {report['fixture']['symbol']}" in stdout
+    assert f"--start {report['fixture']['start_date'][:10]}" in stdout
+    assert f"--end {report['fixture']['end_date'][:10]}" in stdout
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--seed", "-1"),
+        ("--runs", "0"),
+        ("--equity-points-per-run", "0"),
+        ("--trades-per-run", "0"),
+        ("--warmups", "-1"),
+        ("--repetitions", "101"),
+    ],
+)
+def test_benchmark_rejects_invalid_numeric_bounds_without_creating_outputs(
+    tmp_path: Path, option: str, value: str
+) -> None:
+    """Invalid benchmark sizes must not create either requested artifact."""
+    database = tmp_path / "benchmark.db"
+    report = tmp_path / "benchmark.json"
+
+    code = sql_cli.main(
+        [
+            "benchmark",
+            "--runs",
+            "2",
+            "--equity-points-per-run",
+            "2",
+            "--trades-per-run",
+            "1",
+            "--warmups",
+            "0",
+            "--repetitions",
+            "1",
+            "--database-out",
+            str(database),
+            "--out",
+            str(report),
+            option,
+            value,
+        ]
+    )
+
+    assert code == 2
+    assert not database.exists()
+    assert not report.exists()
 
 
 @pytest.mark.parametrize("invalid_date", ["bad", "2024-1-1"])
