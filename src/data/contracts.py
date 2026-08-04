@@ -84,8 +84,14 @@ class ActionCoverage(StrEnum):
 class DataAcquisitionError(Exception):
     """Base error for the acquisition subsystem, with safe error text."""
 
-    def __init__(self, message: object = "") -> None:
+    def __init__(self, message: object = "", *, acquisition_id: str | None = None) -> None:
         super().__init__(_redact_text(str(message)))
+        self.acquisition_id = acquisition_id
+
+    def assign_acquisition_id(self, acquisition_id: str) -> None:
+        """Attach the admitted request identity without changing safe error text."""
+        if self.acquisition_id is None:
+            self.acquisition_id = acquisition_id
 
 
 class InvalidRequestError(DataAcquisitionError):
@@ -122,6 +128,10 @@ class ProviderSchemaError(ProviderError):
 
 class NoUsableDataError(DataAcquisitionError):
     """No provider candidate supplied usable data."""
+
+
+class ProviderExhaustedError(NoUsableDataError):
+    """Every eligible provider path was exhausted without a usable response."""
 
 
 class QualityError(DataAcquisitionError):

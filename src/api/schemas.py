@@ -1,4 +1,5 @@
 """Pydantic request/response schemas for the FastAPI layer."""
+
 from __future__ import annotations
 
 from datetime import date, datetime
@@ -21,8 +22,8 @@ class BacktestRequest(BaseModel):
     commission_pct: float = Field(0.001, ge=0)
     slippage_pct: float = Field(0.0005, ge=0)
 
-    @model_validator(mode='after')
-    def _validate_dates(self) -> 'BacktestRequest':
+    @model_validator(mode="after")
+    def _validate_dates(self) -> BacktestRequest:
         try:
             s = date.fromisoformat(self.start)
             e = date.fromisoformat(self.end)
@@ -44,8 +45,8 @@ class WalkForwardRequest(BaseModel):
     n_optimization_trials: int = Field(50, gt=0)
     initial_capital: float = Field(100_000.0, gt=0)
 
-    @model_validator(mode='after')
-    def _validate_dates(self) -> 'WalkForwardRequest':
+    @model_validator(mode="after")
+    def _validate_dates(self) -> WalkForwardRequest:
         try:
             s = date.fromisoformat(self.start)
             e = date.fromisoformat(self.end)
@@ -66,8 +67,8 @@ class PermutationRequest(BaseModel):
     metric: str = Field("sharpe_ratio")
     initial_capital: float = Field(100_000.0, gt=0)
 
-    @model_validator(mode='after')
-    def _validate_dates(self) -> 'PermutationRequest':
+    @model_validator(mode="after")
+    def _validate_dates(self) -> PermutationRequest:
         try:
             s = date.fromisoformat(self.start)
             e = date.fromisoformat(self.end)
@@ -83,6 +84,9 @@ class DataFetchRequest(BaseModel):
     start: str
     end: str
     use_cache: bool = True
+    source: str = "auto"
+    calendar: str = "XNYS"
+    refresh: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -163,9 +167,25 @@ class StrategyInfo(BaseModel):
     parameter_space: dict[str, Any]
 
 
+class DataAcquisitionSummary(BaseModel):
+    acquisition_id: str
+    status: str
+    sources_used: list[str]
+    selected_source: str | None = None
+    cache_status: str
+    requested_sessions: int
+    accepted_rows: int
+    rejected_rows: int
+    missing_sessions: int
+    duplicates_removed: int
+    coverage: float | None
+    warnings: int
+
+
 class DataFetchOut(BaseModel):
     symbol: str
     n_candles: int
     start: str
     end: str
     from_cache: bool
+    summary: DataAcquisitionSummary

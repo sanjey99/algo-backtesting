@@ -29,6 +29,9 @@ from src.data.contracts import (
     NoUsableDataError,
     Provider,
     ProviderBatch,
+    ProviderExhaustedError,
+    ProviderQuotaError,
+    QualityError,
     QualityFinding,
     QualityPolicy,
     QualitySeverity,
@@ -158,7 +161,7 @@ class AcquisitionService:
                 evidence,
                 error,
             )
-            raise
+            raise self._identified(error, admission.acquisition_id)
 
         if not planned:
             final = evaluate_complete_request(
@@ -180,7 +183,7 @@ class AcquisitionService:
                     evidence,
                     full_cache_error,
                 )
-                raise full_cache_error
+                raise self._identified(full_cache_error, admission.acquisition_id)
             manifest = self._manifest(
                 admission.acquisition_id,
                 request,
@@ -195,7 +198,7 @@ class AcquisitionService:
                 self._cached_lineage(cache),
                 output_hash=self._cached_output_hash(cache),
             )
-            self._manifest_repository.archive(manifest)
+            self._archive_manifest(manifest)
             return AcquisitionResult(final.frame, manifest)
 
         providers: dict[Provider, AcquisitionProvider] = {}
@@ -264,12 +267,16 @@ class AcquisitionService:
                 admission.acquisition_id, request, started_at, cache_status, cache, evidence, error
             )
             if isinstance(error, (InvalidRequestError, ContractViolationError, CacheError)):
-                raise
+                raise self._identified(error, admission.acquisition_id)
             if isinstance(error, NoUsableDataError):
-                raise
+                raise self._identified(error, admission.acquisition_id)
+            if isinstance(error, (ProviderExhaustedError, ProviderQuotaError, QualityError)):
+                raise self._identified(error, admission.acquisition_id)
             if self._retry.classify(error) is FailureClassification.TERMINAL:
-                raise
-            raise NoUsableDataError("no provider supplied a complete usable result") from error
+                raise self._identified(error, admission.acquisition_id)
+            exhausted = ProviderExhaustedError("market data providers were exhausted")
+            exhausted.assign_acquisition_id(admission.acquisition_id)
+            raise exhausted from error
 
     def _read_cache(self, request: AcquisitionRequest) -> CacheReadResult:
         if not request.use_cache:
@@ -403,6 +410,11 @@ class AcquisitionService:
             except Exception as error:
                 if self._retry.classify(error) is FailureClassification.TERMINAL:
                     raise
+                if (
+                    isinstance(error, ProviderQuotaError)
+                    and SourcePreference(parent.source) is not SourcePreference.AUTO
+                ):
+                    raise
                 errors.append(error)
                 continue
             if batch.provider is not provider_id or batch.request != request:
@@ -413,7 +425,7 @@ class AcquisitionService:
             evidence.findings.extend(quality.findings)
             evidence.rejected_rows.extend(quality.rejected_rows)
             if quality.is_fatal or quality.frame is None:
-                errors.append(NoUsableDataError("provider range failed structural validation"))
+                errors.append(QualityError("provider range failed structural validation"))
                 continue
             return _AcceptedRange(
                 request,
@@ -423,8 +435,9 @@ class AcquisitionService:
                 batch.action_coverage,
                 quality.severity is QualitySeverity.WARNING,
             )
-        detail = type(errors[-1]).__name__ if errors else "NoEligibleProvider"
-        raise NoUsableDataError(f"provider candidates exhausted ({detail})")
+        if errors and all(isinstance(error, QualityError) for error in errors):
+            raise NoUsableDataError("provider candidates failed quality validation")
+        raise ProviderExhaustedError("market data providers were exhausted")
 
     @staticmethod
     def _provider_order(source: SourcePreference | str) -> tuple[Provider, ...]:
@@ -662,11 +675,28 @@ class AcquisitionService:
             started_at=started_at,
             completed_at=completed,
         )
-        self._manifest_repository.archive(manifest)
+        self._archive_manifest(manifest)
 
     def _archive_publication_if_needed(self, publication: GenerationPublication) -> None:
         if not self._store.archives_publications:
-            self._manifest_repository.archive(publication.manifest)
+            self._archive_manifest(publication.manifest)
+
+    def _archive_manifest(self, manifest: AcquisitionManifest) -> None:
+        try:
+            self._manifest_repository.archive(manifest)
+        except DataAcquisitionError as error:
+            error.assign_acquisition_id(manifest.acquisition_id)
+            raise
+
+    def lookup_manifest(self, acquisition_id: str) -> dict[str, Any] | None:
+        """Return one archived redacted report through the store fallback boundary."""
+        return self._store.lookup_manifest(acquisition_id)
+
+    @staticmethod
+    def _identified(error: Exception, acquisition_id: str) -> Exception:
+        if isinstance(error, DataAcquisitionError):
+            error.assign_acquisition_id(acquisition_id)
+        return error
 
     def _revalidate_rebase(
         self,
