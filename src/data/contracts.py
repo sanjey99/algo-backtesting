@@ -140,6 +140,10 @@ class ManifestError(DataAcquisitionError):
     """A manifest could not be serialized or stored."""
 
 
+class ArtifactError(ManifestError):
+    """A required acquisition evidence artifact could not be persisted."""
+
+
 class ConcurrentPublicationError(CachePublicationError):
     """Repeated optimistic cache publication conflicts exhausted retries."""
 
@@ -176,8 +180,9 @@ def _redact_text(value: str) -> str:
         if query:
             query = urlencode(
                 [
-                    (key, _REDACTED if _is_sensitive_key(key) else item)
+                    (key, item)
                     for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+                    if not _is_sensitive_key(key)
                 ]
             )
         netloc = parsed.netloc
@@ -409,6 +414,8 @@ class AcquisitionManifest:
     coverage: float | None = None
     output_hash: str | None = None
     duration_seconds: float | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -440,7 +447,10 @@ def json_safe(value: Any) -> Any:
         return value.value
     if isinstance(value, str):
         return _redact_text(value)
-    if isinstance(value, (datetime, date, pd.Timestamp)):
+    if isinstance(value, datetime):
+        timestamp = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+        return timestamp.isoformat()
+    if isinstance(value, (date, pd.Timestamp)):
         return value.isoformat()
     if isinstance(value, pd.DataFrame):
         raise TypeError("pandas frames are in-process values and cannot be serialized")
