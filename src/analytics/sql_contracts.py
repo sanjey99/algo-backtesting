@@ -1,9 +1,12 @@
 """Types describing the closed SQL analytics query interface."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from pathlib import Path
+from types import MappingProxyType
 from typing import TypeAlias
 
 Scalar: TypeAlias = str | int | float | datetime | None
@@ -60,6 +63,37 @@ class ValidationReport:
     def has_failures(self) -> bool:
         """Return whether any finding makes analytical output untrustworthy."""
         return any(finding.severity is Severity.FAIL for finding in self.findings)
+
+
+@dataclass(frozen=True)
+class ArtifactInfo:
+    """Identity and content fingerprint for one published artifact."""
+
+    path: Path
+    byte_count: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class ComparisonMetadata:
+    """Versioned provenance for a validated comparison CSV."""
+
+    schema_version: str
+    generated_at: datetime
+    query_id: QueryId
+    sql_sha256: str
+    bound_params: Mapping[str, Scalar]
+    database_identifier: str
+    row_count: int
+    ordered_columns: tuple[str, ...]
+    contract_version: str
+    contract_valid: bool
+    validation_report_path: str
+    diagnostic_override: bool
+
+    def __post_init__(self) -> None:
+        """Snapshot external bind provenance behind an immutable mapping."""
+        object.__setattr__(self, "bound_params", MappingProxyType(dict(self.bound_params)))
 
 
 class ColumnKind(StrEnum):
