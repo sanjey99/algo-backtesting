@@ -1,33 +1,34 @@
-"""Data fetcher abstractions and concrete implementations.
+"""Compatibility fetchers backed by the provider-adapter boundary.
 
-Provides a DataFetcher ABC plus two concrete implementations:
-- YFinanceFetcher  — wraps yfinance.download()
-- AlphaVantageFetcher — wraps the Alpha Vantage TIME_SERIES_DAILY_ADJUSTED endpoint
+New acquisition code should use :mod:`src.data.providers` and retain
+``ProviderBatch`` values until normalization.  The classes here preserve the
+original dataframe-returning API for dashboard, route, and store callers.
 """
+
 from __future__ import annotations
 
 import os
-import time
 from abc import ABC, abstractmethod
-from datetime import datetime
+from collections.abc import Mapping
+from datetime import date, datetime
+from typing import Any
 
 import pandas as pd
-import requests  # type: ignore[import-untyped]
+
+from src.data.contracts import AcquisitionRequest, DataAcquisitionError, ProviderSchemaError
+from src.data.providers import AlphaVantageProvider, YFinanceProvider
 
 DateLike = str | datetime
 
-_ALPHA_VANTAGE_BASE = "https://www.alphavantage.co/query"
-_ALPHA_VANTAGE_CALLS_PER_MIN = 5
-_ALPHA_VANTAGE_MIN_INTERVAL = 60.0 / _ALPHA_VANTAGE_CALLS_PER_MIN  # seconds between calls
+
+def _as_date(value: DateLike) -> date:
+    if isinstance(value, str):
+        return datetime.fromisoformat(value).date()
+    return value.date()
 
 
 class DataFetcher(ABC):
-    """Abstract base class for market-data fetchers.
-
-    All concrete implementations must return a :class:`pandas.DataFrame` with:
-    - A :class:`pandas.DatetimeIndex` named ``timestamp``
-    - Lowercase columns: ``open``, ``high``, ``low``, ``close``, ``volume``, ``adj_close``
-    """
+    """Legacy dataframe-returning fetcher contract."""
 
     @abstractmethod
     def fetch(
@@ -37,50 +38,27 @@ class DataFetcher(ABC):
         end: DateLike,
         interval: str = "1d",
     ) -> pd.DataFrame:
-        """Fetch OHLCV data for *symbol* between *start* and *end*.
-
-        Parameters
-        ----------
-        symbol:
-            Ticker symbol (e.g. ``"AAPL"``).
-        start:
-            Inclusive start date/time.
-        end:
-            Inclusive end date/time.
-        interval:
-            Bar interval string (e.g. ``"1d"``, ``"1h"``).  Interpretation is
-            provider-specific.
-
-        Returns
-        -------
-        pd.DataFrame
-            DataFrame with DatetimeIndex and columns
-            ``open, high, low, close, volume, adj_close``.
-        """
-
-    # ------------------------------------------------------------------
-    # Helpers shared by subclasses
-    # ------------------------------------------------------------------
+        """Fetch a normalized legacy OHLCV frame for an inclusive range."""
 
     @staticmethod
     def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
-        """Lower-case all column names and rename *adj close* variants."""
-        df = df.copy()
-        df.columns = [c.lower().strip() for c in df.columns]
-        # Rename common variant spellings produced by data providers
-        rename_map = {
-            "adj close": "adj_close",
-            "adjclose": "adj_close",
-            "adjusted close": "adj_close",
-        }
-        df = df.rename(columns=rename_map)
-        if df.index.name:
-            df.index.name = str(df.index.name).lower()
-        return df
+        """Lower-case legacy columns without changing the adapter's raw frame."""
+        normalized = df.copy()
+        normalized.columns = [str(column).lower().strip() for column in normalized.columns]
+        normalized = normalized.rename(
+            columns={
+                "adj close": "adj_close",
+                "adjclose": "adj_close",
+                "adjusted close": "adj_close",
+            }
+        )
+        if normalized.index.name:
+            normalized.index.name = str(normalized.index.name).lower()
+        return normalized
 
 
 class YFinanceFetcher(DataFetcher):
-    """Fetches data from Yahoo Finance via :mod:`yfinance`."""
+    """Compatibility wrapper for :class:`src.data.providers.YFinanceProvider`."""
 
     def fetch(
         self,
@@ -89,91 +67,42 @@ class YFinanceFetcher(DataFetcher):
         end: DateLike,
         interval: str = "1d",
     ) -> pd.DataFrame:
-        import yfinance  # lazy import — imported as 'yfinance' so tests can patch 'yfinance.download'
-
-        raw: pd.DataFrame = yfinance.download(
-            symbol,
-            start=start,
-            end=end,
-            interval=interval,
-            auto_adjust=False,
-            progress=False,
-        )
-
-        if raw.empty:
-            raise ValueError(f"yfinance returned no data for {symbol!r}")
-
-        # yfinance may return a MultiIndex when downloading a single ticker
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
-
-        df = self._normalise_columns(raw)
-
-        # Ensure adj_close exists (auto_adjust=False preserves "Adj Close")
-        if "adj_close" not in df.columns:
-            if "close" in df.columns:
-                df["adj_close"] = df["close"]
-            else:
+        try:
+            request = AcquisitionRequest(symbol, _as_date(start), _as_date(end), interval=interval)
+            raw = YFinanceProvider().fetch(request).frame
+        except DataAcquisitionError as error:
+            raise ValueError(str(error)) from error
+        frame = raw.copy()
+        if isinstance(frame.columns, pd.MultiIndex):
+            frame.columns = frame.columns.get_level_values(0)
+        normalized = self._normalise_columns(frame)
+        if "adj_close" not in normalized.columns:
+            if "close" not in normalized.columns:
                 raise KeyError("Could not locate adjusted-close column in yfinance output.")
-
-        # Keep only the canonical columns (drop extras like "dividends", "stock splits")
+            normalized["adj_close"] = normalized["close"]
         canonical = ["open", "high", "low", "close", "volume", "adj_close"]
-        df = df[[c for c in canonical if c in df.columns]]
-
-        df.index.name = "timestamp"
-        return df
+        normalized = normalized[[column for column in canonical if column in normalized.columns]]
+        normalized.index.name = "timestamp"
+        return normalized
 
 
 class AlphaVantageFetcher(DataFetcher):
-    """Fetches daily-adjusted data from the Alpha Vantage REST API.
-
-    Reads the API key from the ``ALPHA_VANTAGE_API_KEY`` environment variable.
-    Enforces a rate limit of 5 calls per minute using :func:`time.sleep`.
-
-    Raises
-    ------
-    ValueError
-        If ``ALPHA_VANTAGE_API_KEY`` is not set in the environment.
-    """
+    """Compatibility wrapper for the adjusted-daily Alpha Vantage adapter."""
 
     def __init__(self) -> None:
         api_key = os.environ.get("ALPHA_VANTAGE_API_KEY", "").strip()
         if not api_key:
-            raise ValueError(
-                "ALPHA_VANTAGE_API_KEY environment variable is not set. "
-                "Obtain a free key at https://www.alphavantage.co/support/#api-key"
-            )
+            raise ValueError("ALPHA_VANTAGE_API_KEY environment variable is not set")
         self._api_key = api_key
-        self._last_call_ts: float = 0.0
+        # The legacy class historically attempted the endpoint with a key.  New
+        # capability-aware orchestration uses AlphaVantageProvider directly and
+        # must opt into entitlement explicitly.
+        self._provider = AlphaVantageProvider(api_key=api_key, adjusted_daily_entitled=True)
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _rate_limit(self) -> None:
-        """Sleep if needed to stay within the 5-calls/min rate limit."""
-        elapsed = time.monotonic() - self._last_call_ts
-        if elapsed < _ALPHA_VANTAGE_MIN_INTERVAL:
-            time.sleep(_ALPHA_VANTAGE_MIN_INTERVAL - elapsed)
-        self._last_call_ts = time.monotonic()
-
-    def _request(self, params: dict[str, str]) -> dict:  # type: ignore[type-arg]
-        """Make a rate-limited GET request and return the JSON body."""
-        self._rate_limit()
-        params["apikey"] = self._api_key
-        response = requests.get(_ALPHA_VANTAGE_BASE, params=params, timeout=30)
-        response.raise_for_status()
-        data: dict = response.json()  # type: ignore[type-arg]
-        if "Error Message" in data:
-            raise ValueError(f"Alpha Vantage API error: {data['Error Message']}")
-        if "Note" in data:
-            # Rate-limit note from the API
-            raise RuntimeError(f"Alpha Vantage rate-limit note: {data['Note']}")
-        return data
-
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
+    def _request(self, params: dict[str, str]) -> dict[str, Any]:
+        """Legacy test seam delegating transport to the new provider adapter."""
+        payload = self._provider.request(params)
+        return dict(payload)
 
     def fetch(
         self,
@@ -182,53 +111,72 @@ class AlphaVantageFetcher(DataFetcher):
         end: DateLike,
         interval: str = "1d",
     ) -> pd.DataFrame:
-        """Fetch daily adjusted OHLCV data from Alpha Vantage.
+        if interval != "1d":
+            raise ValueError("Alpha Vantage adjusted-daily supports interval '1d' only")
+        try:
+            request = AcquisitionRequest(symbol, _as_date(start), _as_date(end), interval=interval)
+            payload = self._request(
+                {
+                    "function": "TIME_SERIES_DAILY_ADJUSTED",
+                    "symbol": request.symbol,
+                    "outputsize": "full",
+                    "datatype": "json",
+                }
+            )
+            batch = self._provider.parse(request, self._with_legacy_action_defaults(payload))
+        except DataAcquisitionError as error:
+            raise ValueError(str(error)) from error
+        return self._legacy_frame(batch.frame, request)
 
-        Note: Alpha Vantage free tier only supports daily intervals via
-        ``TIME_SERIES_DAILY_ADJUSTED``. The *interval* parameter is accepted
-        for API compatibility but only ``"1d"`` is currently supported.
-        """
-        params = {
-            "function": "TIME_SERIES_DAILY_ADJUSTED",
-            "symbol": symbol,
-            "outputsize": "full",
-            "datatype": "json",
+    @staticmethod
+    def _legacy_frame(frame: pd.DataFrame, request: AcquisitionRequest) -> pd.DataFrame:
+        indexed = frame.copy()
+        try:
+            indexed.index = pd.to_datetime(indexed.index)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Alpha Vantage response contains invalid dates") from error
+        in_range = (indexed.index.date >= request.start) & (indexed.index.date <= request.end)
+        indexed = indexed[in_range]
+        if indexed.empty:
+            raise ValueError("Alpha Vantage returned no data for the requested range")
+        columns = {
+            "1. open": "open",
+            "2. high": "high",
+            "3. low": "low",
+            "4. close": "close",
+            "5. adjusted close": "adj_close",
+            "6. volume": "volume",
         }
-        data = self._request(params)
+        try:
+            result = indexed[list(columns)].rename(columns=columns).astype(float)
+        except (KeyError, TypeError, ValueError) as error:
+            message = "Alpha Vantage response cannot form a legacy OHLCV frame"
+            raise ProviderSchemaError(message) from error
+        result.index.name = "timestamp"
+        return result.sort_index()
 
-        key = "Time Series (Daily)"
-        if key not in data:
-            raise ValueError(
-                f"Unexpected Alpha Vantage response structure for {symbol!r}. "
-                f"Keys: {list(data.keys())}"
+    @staticmethod
+    def _with_legacy_action_defaults(payload: dict[str, Any]) -> dict[str, Any]:
+        """Copy older legacy payloads and supply their historic action defaults.
+
+        The new adapter correctly rejects adjusted-daily payloads without
+        action fields.  The long-standing wrapper accepted six-field payloads,
+        so it retains that API by enriching a private copy only.
+        """
+        copied = dict(payload)
+        series = payload.get("Time Series (Daily)")
+        if not isinstance(series, Mapping):
+            return copied
+        copied["Time Series (Daily)"] = {
+            timestamp: (
+                {
+                    **values,
+                    "7. dividend amount": values.get("7. dividend amount", "0.0"),
+                    "8. split coefficient": values.get("8. split coefficient", "1.0"),
+                }
+                if isinstance(values, Mapping)
+                else values
             )
-
-        ts_data: dict[str, dict[str, str]] = data[key]
-        start_dt = datetime.strptime(start, "%Y-%m-%d") if isinstance(start, str) else start
-        end_dt = datetime.strptime(end, "%Y-%m-%d") if isinstance(end, str) else end
-        rows = []
-        for date_str, values in ts_data.items():
-            dt = datetime.strptime(date_str, "%Y-%m-%d")
-            if start_dt <= dt <= end_dt:
-                rows.append(
-                    {
-                        "timestamp": dt,
-                        "open": float(values["1. open"]),
-                        "high": float(values["2. high"]),
-                        "low": float(values["3. low"]),
-                        "close": float(values["4. close"]),
-                        "volume": float(values["6. volume"]),
-                        "adj_close": float(values["5. adjusted close"]),
-                    }
-                )
-
-        if not rows:
-            raise ValueError(
-                f"Alpha Vantage returned no data for {symbol!r} "
-                f"between {start_dt.date()} and {end_dt.date()}."
-            )
-
-        df = pd.DataFrame(rows).set_index("timestamp").sort_index()
-        df.index = pd.to_datetime(df.index)
-        df.index.name = "timestamp"
-        return df
+            for timestamp, values in series.items()
+        }
+        return copied

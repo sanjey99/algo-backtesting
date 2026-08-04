@@ -4,6 +4,7 @@ The contracts in this module deliberately contain no transport behaviour.  They
 are the boundary shared by providers, quality evaluation, cache publication,
 and the API/CLI adapters.
 """
+
 from __future__ import annotations
 
 import re
@@ -81,7 +82,10 @@ class ActionCoverage(StrEnum):
 
 
 class DataAcquisitionError(Exception):
-    """Base error for the acquisition subsystem."""
+    """Base error for the acquisition subsystem, with safe error text."""
+
+    def __init__(self, message: object = "") -> None:
+        super().__init__(_redact_text(str(message)))
 
 
 class InvalidRequestError(DataAcquisitionError):
@@ -284,6 +288,7 @@ class ProviderCapabilities:
     supports_actions: bool = False
     requires_api_key: bool = False
     supports_full_history: bool = True
+    output_size: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
