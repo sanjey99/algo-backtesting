@@ -22,6 +22,7 @@ from src.data.normalization import (
     CANONICAL_COLUMNS,
     NUMERIC_COLUMNS,
     NormalizationResult,
+    _diagnostic_candidate_frame,
 )
 
 _VALUE_COLUMNS = CANONICAL_COLUMNS[1:]
@@ -176,7 +177,7 @@ def evaluate_range_candidate(
     del policy
     expected = pd.DatetimeIndex(expected_sessions).tz_localize(None).normalize()
     findings = normalized.findings
-    frame = normalized.candidate_frame
+    frame = _diagnostic_candidate_frame(normalized)
     exact_removed = 0
     conflicting_rows = 0
     retained: list[pd.Series] = []

@@ -139,6 +139,23 @@ def test_identical_duplicates_keep_first_and_reconcile_after_unique_row_validati
     counters.assert_valid()
 
 
+def test_duplicate_diagnostics_keep_internal_source_rows_out_of_public_candidates() -> None:
+    invalid_duplicate = _row(High=9.0)
+    normalized = _normalized(
+        [_row(), invalid_duplicate, invalid_duplicate],
+        ["2024-01-02", "2024-01-03", "2024-01-03"],
+    )
+
+    result = evaluate_range_candidate(
+        normalized,
+        pd.DatetimeIndex(["2024-01-02", "2024-01-03"]),
+    )
+
+    assert tuple(normalized.candidate_frame.columns) == CANONICAL_COLUMNS
+    assert result.counters.exact_duplicate_rows_removed == 1
+    assert result.rejected_rows[0].source_row_number == 1
+
+
 def test_conflicting_duplicate_group_counts_every_member_and_is_fatal() -> None:
     normalized = _normalized(
         [_row(Open=10.0), _row(Open=10.1), _row()],

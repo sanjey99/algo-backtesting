@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, cast
+from zoneinfo import ZoneInfoNotFoundError
 
 import pandas as pd
 
@@ -91,7 +92,7 @@ class NormalizationResult:
 
     @property
     def candidate_frame(self) -> pd.DataFrame:
-        return self._candidate_frame.copy(deep=True)
+        return self._candidate_frame.loc[:, list(CANONICAL_COLUMNS)].copy(deep=True)
 
     @property
     def is_fatal(self) -> bool:
@@ -143,7 +144,7 @@ def _parse_daily_timestamp(value: object, native_timezone: str | None) -> pd.Tim
         if parsed.tzinfo is None and native_timezone is not None:
             parsed = parsed.tz_localize(native_timezone, ambiguous="raise", nonexistent="raise")
         return parsed.normalize().tz_localize(None)
-    except (TypeError, ValueError, OverflowError):
+    except (TypeError, ValueError, OverflowError, ZoneInfoNotFoundError):
         return None
 
 
@@ -283,6 +284,11 @@ def _fatal_schema_result(
         ),
         _candidate_frame=_empty_candidate_frame(),
     )
+
+
+def _diagnostic_candidate_frame(result: NormalizationResult) -> pd.DataFrame:
+    """Return internal source-row evidence for quality duplicate diagnostics only."""
+    return result._candidate_frame.copy(deep=True)
 
 
 normalize_batch = normalize_provider_batch

@@ -38,7 +38,7 @@ def _batch(
 
 
 @pytest.mark.parametrize("provider", [Provider.YFINANCE, Provider.ALPHA_VANTAGE])
-def test_maps_each_provider_shape_to_the_exact_internal_candidate_shape(provider: Provider) -> None:
+def test_maps_each_provider_shape_to_the_exact_public_canonical_shape(provider: Provider) -> None:
     if provider is Provider.YFINANCE:
         frame = pd.read_csv(FIXTURE_DIR / "yfinance_flat.csv", index_col="Date")
     else:
@@ -50,7 +50,7 @@ def test_maps_each_provider_shape_to_the_exact_internal_candidate_shape(provider
     result = normalize_provider_batch(_batch(provider, frame))
 
     assert result.is_fatal is False
-    assert tuple(result.candidate_frame.columns) == (*CANONICAL_COLUMNS, "_source_row_number")
+    assert tuple(result.candidate_frame.columns) == CANONICAL_COLUMNS
     assert result.candidate_frame["timestamp"].dtype == "datetime64[ns]"
     assert result.candidate_frame["symbol"].dtype == "string"
     assert result.candidate_frame["source"].dtype == "string"
@@ -89,7 +89,6 @@ def test_normalizes_naive_and_aware_daily_timestamps_stably_and_filters_inclusiv
         pd.Timestamp("2024-01-02"),
         pd.Timestamp("2024-01-03"),
     ]
-    assert candidate["_source_row_number"].tolist() == [2, 3, 1]
     assert result.counters.provider_rows == 5
     assert result.counters.out_of_range_rows == 2
     assert result.counters.in_range_rows == result.counters.dedupe_input_rows == 3
@@ -121,6 +120,32 @@ def test_records_every_unclassifiable_timestamp_before_range_filtering(
     assert result.counters.out_of_range_rows == 0
     assert result.counters.in_range_rows == 0
     assert result.timestamp_rejections[0].source_row_number == 0
+
+
+def test_invalid_native_timezone_is_an_unclassifiable_timestamp_row() -> None:
+    frame = pd.DataFrame(
+        {
+            "Open": [10.0],
+            "High": [11.0],
+            "Low": [9.0],
+            "Close": [10.5],
+            "Adj Close": [10.5],
+            "Volume": [100.0],
+            "Dividends": [0.0],
+            "Stock Splits": [1.0],
+        },
+        index=["2024-01-02"],
+    )
+
+    result = normalize_provider_batch(
+        _batch(Provider.YFINANCE, frame, timezone="Not/AZone")
+    )
+
+    assert result.counters.provider_rows == 1
+    assert result.counters.timestamp_unclassifiable_rows == 1
+    assert result.counters.out_of_range_rows == result.counters.in_range_rows == 0
+    assert result.timestamp_rejections[0].source_row_number == 0
+    result.counters.assert_valid()
 
 
 def test_defaults_missing_action_columns_only_for_declared_represented_coverage() -> None:
