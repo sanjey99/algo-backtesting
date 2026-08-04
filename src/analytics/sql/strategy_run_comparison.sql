@@ -3,8 +3,8 @@ WITH selected_runs AS (
            r.initial_capital, r.commission_pct, r.slippage_pct
     FROM backtest_runs AS r
     WHERE r.symbol = :symbol
-      AND datetime(r.start_date) = datetime(:start_date)
-      AND datetime(r.end_date) = datetime(:end_date)
+      AND r.start_date = :start_date
+      AND r.end_date = :end_date
       AND (:strategy_name IS NULL OR r.strategy_name = :strategy_name)
 ),
 metric_pivot AS (

@@ -1,6 +1,8 @@
 """Integration tests for the persisted strategy-run comparison query."""
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from pandas import isna
 from pandas.testing import assert_frame_equal
@@ -10,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from src.analytics.sql_contracts import COMPARISON_CONTRACT, ComparisonFilters
 from src.analytics.sql_service import AnalyticsService, ContractValidationError, validate_frame
-from src.db.tables import EquityCurvePoint, MetricRecord
+from src.db.tables import BacktestRun, EquityCurvePoint, MetricRecord
 from tests.sql_analytics.fixture_data import COMPARISON_END, COMPARISON_START, RUN_RSI_ID
 
 COMPARISON_FILTERS = ComparisonFilters(
@@ -31,6 +33,29 @@ def test_comparison_returns_one_row_per_run_with_correct_ranks(analytics_db: Eng
     assert frame.loc[0, "cumulative_trade_pnl"] == pytest.approx(150.0)
     assert frame.loc[0, "derived_total_return"] == pytest.approx(0.02)
     assert frame.loc[0, "total_return_delta"] == pytest.approx(0.0)
+
+
+def test_comparison_preserves_microsecond_precision_in_date_filters(analytics_db: Engine) -> None:
+    """A run differing only by a microsecond must not join the selected comparison cohort."""
+    with Session(analytics_db) as session:
+        session.add(
+            BacktestRun(
+                id="run-microsecond",
+                strategy_name="moving_average",
+                symbol="SPY",
+                start_date=COMPARISON_START + timedelta(microseconds=1),
+                end_date=COMPARISON_END,
+                params_json="{}",
+                initial_capital=10_000.0,
+                commission_pct=0.001,
+                slippage_pct=0.0005,
+            )
+        )
+        session.commit()
+
+    frame = AnalyticsService(analytics_db).compare_runs(COMPARISON_FILTERS)
+
+    assert frame["run_id"].tolist() == ["run-ma", "run-rsi"]
 
 
 def test_comparison_preaggregates_children_without_trade_fan_out(analytics_db: Engine) -> None:

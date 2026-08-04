@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime
 from typing import Any, cast
 
 import pandas as pd
@@ -57,12 +58,19 @@ class AnalyticsService:
             QueryId.STRATEGY_RUN_COMPARISON,
             {
                 "symbol": filters.symbol,
-                "start_date": filters.start_date,
-                "end_date": filters.end_date,
+                "start_date": _sqlite_datetime_text(filters.start_date),
+                "end_date": _sqlite_datetime_text(filters.end_date),
                 "strategy_name": filters.strategy_name,
             },
         )
         return validate_frame(raw_frame, COMPARISON_CONTRACT)
+
+
+def _sqlite_datetime_text(value: datetime) -> str:
+    """Render a naive datetime exactly as SQLAlchemy's SQLite DateTime storage does."""
+    if value.tzinfo is not None:
+        raise ValueError("comparison filter datetimes must be timezone-naive")
+    return value.strftime("%Y-%m-%d %H:%M:%S.%f")
 
 
 def validate_frame(frame: pd.DataFrame, contract: ResultContract) -> pd.DataFrame:
