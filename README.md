@@ -26,6 +26,7 @@ DataStore         SignalEvent          compute_all_metrics
 - **Permutation Test** — Monte Carlo statistical significance (p = (count_gte + 1) / (n + 1))
 - **Parquet caching** — `DataStore` caches OHLCV data locally; no duplicate network calls
 - **SQLite persistence** — SQLAlchemy 2.0 ORM; Alembic migrations for schema evolution
+- **Reviewed direct-SQL analytics** — packaged, named-bind queries for run comparison, trade and equity audits, cohort summaries, integrity validation, and reproducible SQLite evidence; see [SQL analytics verification](docs/sql-analytics.md)
 - **FastAPI REST API** — async background jobs for permutation tests, Pydantic v2 validation
 - **Streamlit dashboard** — interactive KPI cards, equity curves, comparison tab
 - **Standalone HTML reports** — embedded Plotly charts, no CDN dependency
@@ -57,10 +58,10 @@ alembic upgrade head
 | Language | Python 3.12 |
 | API | FastAPI + Uvicorn |
 | Dashboard | Streamlit + Plotly |
-| Database | SQLite (dev) / PostgreSQL (prod) via SQLAlchemy 2.0 |
+| Database | SQLite via SQLAlchemy 2.0 |
 | Migrations | Alembic |
 | Data | yfinance, Alpha Vantage, pandas |
-| Testing | pytest (245+ tests) |
+| Testing | pytest |
 | Type checking | mypy --strict |
 
 ## Project Structure
