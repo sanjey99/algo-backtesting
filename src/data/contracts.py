@@ -9,9 +9,11 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any, cast
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import pandas as pd
 
@@ -19,6 +21,17 @@ CONTRACT_VERSION = "1"
 DEFAULT_CALENDAR = "XNYS"
 DEFAULT_INTERVAL = "1d"
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
+_SENSITIVE_KEY_PATTERN = re.compile(
+    r"(?:api[_-]?key|x-api-key|authorization|access[_-]?token|refresh[_-]?token|token|secret|"
+    r"password|cookie|credential)",
+    re.IGNORECASE,
+)
+_INLINE_CREDENTIAL_PATTERN = re.compile(
+    r"(?i)\b(api[_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|token|secret|password|"
+    r"authorization|cookie)\b(\s*[=:]\s*)([^\s,;&]+)"
+)
+_BEARER_PATTERN = re.compile(r"(?i)\bbearer\s+[^\s,;&]+")
+_REDACTED = "[REDACTED]"
 
 
 class Provider(StrEnum):
@@ -140,6 +153,49 @@ def _coerce_enum(value: Any, enum_type: type[StrEnum], field_name: str) -> StrEn
         raise InvalidRequestError(message) from error
 
 
+def _is_sensitive_key(key: object) -> bool:
+    return bool(_SENSITIVE_KEY_PATTERN.search(str(key)))
+
+
+def _redact_text(value: str) -> str:
+    """Remove credentials from free-form errors and credential-bearing URLs."""
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        parsed = None
+    if parsed is not None and (parsed.scheme or parsed.netloc) and parsed.query:
+        query = urlencode(
+            [
+                (key, _REDACTED if _is_sensitive_key(key) else item)
+                for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+            ]
+        )
+        netloc = parsed.netloc
+        if "@" in netloc:
+            netloc = f"{_REDACTED}@{netloc.rsplit('@', maxsplit=1)[1]}"
+        value = urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
+    value = _BEARER_PATTERN.sub(f"Bearer {_REDACTED}", value)
+    return _INLINE_CREDENTIAL_PATTERN.sub(rf"\1\2{_REDACTED}", value)
+
+
+def _freeze_metadata(value: Any) -> Any:
+    """Defensively freeze and redact arbitrary evidence captured at a boundary."""
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {
+                str(key): _REDACTED if _is_sensitive_key(key) else _freeze_metadata(item)
+                for key, item in value.items()
+            }
+        )
+    if isinstance(value, str):
+        return _redact_text(value)
+    if isinstance(value, tuple | list):
+        return tuple(_freeze_metadata(item) for item in value)
+    if isinstance(value, frozenset | set):
+        return frozenset(_freeze_metadata(item) for item in value)
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class AcquisitionRequest:
     """A syntactically admitted, inclusive daily acquisition request."""
@@ -230,11 +286,14 @@ class ProviderBatch:
     provider: Provider
     request: AcquisitionRequest
     frame: pd.DataFrame = field(repr=False, compare=False)
-    received_at: datetime = field(default_factory=datetime.utcnow)
+    received_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     native_timezone: str | None = None
     raw_row_count: int = 0
-    response_metadata: Mapping[str, str] = field(default_factory=dict, repr=False)
+    response_metadata: Mapping[str, Any] = field(default_factory=dict, repr=False)
     action_coverage: ActionCoverage = ActionCoverage.UNKNOWN
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "response_metadata", _freeze_metadata(self.response_metadata))
 
     def to_dict(self) -> dict[str, Any]:
         """Return audit metadata without leaking or serializing the frame."""
@@ -256,6 +315,10 @@ class QualityFinding:
     message: str
     details: Mapping[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "message", _redact_text(self.message))
+        object.__setattr__(self, "details", _freeze_metadata(self.details))
+
 
 @dataclass(frozen=True, slots=True)
 class RejectedRow:
@@ -263,6 +326,10 @@ class RejectedRow:
     reason: str
     timestamp: str | None = None
     details: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "reason", _redact_text(self.reason))
+        object.__setattr__(self, "details", _freeze_metadata(self.details))
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +343,10 @@ class AttemptEvidence:
     error_type: str | None = None
     error_message: str | None = None
 
+    def __post_init__(self) -> None:
+        if self.error_message is not None:
+            object.__setattr__(self, "error_message", _redact_text(self.error_message))
+
 
 @dataclass(frozen=True, slots=True)
 class CacheEvidence:
@@ -285,6 +356,14 @@ class CacheEvidence:
     compatibility_reason: str | None = None
     covered_sessions: int = 0
     missing_sessions: int = 0
+
+    def __post_init__(self) -> None:
+        if self.compatibility_reason is not None:
+            object.__setattr__(
+                self,
+                "compatibility_reason",
+                _redact_text(self.compatibility_reason),
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,6 +398,14 @@ class AcquisitionManifest:
     output_hash: str | None = None
     duration_seconds: float | None = None
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "environment_versions",
+            _freeze_metadata(self.environment_versions),
+        )
+        object.__setattr__(self, "counters", _freeze_metadata(self.counters))
+
     def to_dict(self) -> dict[str, Any]:
         return cast(dict[str, Any], json_safe(self))
 
@@ -339,6 +426,8 @@ def json_safe(value: Any) -> Any:
     """Convert contract values to deterministic JSON-compatible primitives."""
     if isinstance(value, StrEnum):
         return value.value
+    if isinstance(value, str):
+        return _redact_text(value)
     if isinstance(value, (datetime, date, pd.Timestamp)):
         return value.isoformat()
     if isinstance(value, pd.DataFrame):
@@ -346,7 +435,10 @@ def json_safe(value: Any) -> Any:
     if hasattr(value, "__dataclass_fields__"):
         return {item.name: json_safe(getattr(value, item.name)) for item in fields(value)}
     if isinstance(value, Mapping):
-        return {str(key): json_safe(item) for key, item in value.items()}
+        return {
+            str(key): _REDACTED if _is_sensitive_key(key) else json_safe(item)
+            for key, item in value.items()
+        }
     if isinstance(value, (tuple, list, frozenset, set)):
         return [json_safe(item) for item in value]
     return value

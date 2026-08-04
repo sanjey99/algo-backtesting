@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import date, datetime
 from importlib.metadata import version
+from types import MappingProxyType
 from typing import Protocol
 
 import pandas as pd
@@ -50,11 +51,13 @@ class XNYSCalendar:
         return sessions.normalize()
 
     def version_evidence(self) -> Mapping[str, str]:
-        return {
-            "calendar": self.calendar_id,
-            "calendar_version": version("pandas_market_calendars"),
-            "pandas_market_calendars": version("pandas_market_calendars"),
-        }
+        return MappingProxyType(
+            {
+                "calendar": self.calendar_id,
+                "calendar_version": version("pandas_market_calendars"),
+                "pandas_market_calendars": version("pandas_market_calendars"),
+            }
+        )
 
 
 _CALENDAR_REGISTRY: Mapping[str, type[MarketCalendar]] = {DEFAULT_CALENDAR: XNYSCalendar}

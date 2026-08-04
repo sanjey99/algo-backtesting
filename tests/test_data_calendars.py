@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import date
 
 import pandas as pd
+import pytest
 
 from src.data.calendars import XNYSCalendar, group_contiguous_sessions
 
@@ -38,3 +39,5 @@ def test_calendar_exposes_calendar_and_dependency_versions() -> None:
     assert evidence["calendar"] == "XNYS"
     assert evidence["calendar_version"]
     assert evidence["pandas_market_calendars"]
+    with pytest.raises(TypeError):
+        evidence["calendar"] = "changed"  # type: ignore[index]

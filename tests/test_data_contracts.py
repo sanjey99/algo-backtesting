@@ -4,16 +4,23 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 from datetime import date, datetime
 
+import pandas as pd
 import pytest
 
 from src.data.contracts import (
+    AcquisitionManifest,
     AcquisitionRequest,
     AcquisitionStatus,
+    ActionCoverage,
+    AttemptEvidence,
     CacheStatus,
     InvalidRequestError,
     Provider,
+    ProviderBatch,
+    QualityFinding,
     QualityPolicy,
     QualitySeverity,
+    RejectedRow,
     RetryPolicy,
     SourcePreference,
 )
@@ -84,3 +91,82 @@ def test_policies_have_documented_defaults_and_are_immutable() -> None:
 
     with pytest.raises(FrozenInstanceError):
         quality.minimum_coverage = 0.5  # type: ignore[misc]
+
+
+def test_contract_metadata_and_error_evidence_are_recursively_redacted() -> None:
+    request = AcquisitionRequest("SPY", date(2024, 1, 2), date(2024, 1, 3))
+    redaction_value = "redaction-test-value"
+    batch = ProviderBatch(
+        provider=Provider.YFINANCE,
+        request=request,
+        frame=pd.DataFrame(),
+        response_metadata={
+            "headers": {"Authorization": f"Bearer {redaction_value}"},
+            "callback": f"https://example.test/data?apikey={redaction_value}&page=1",
+        },
+        action_coverage=ActionCoverage.REPRESENTED,
+    )
+    manifest = AcquisitionManifest(
+        acquisition_id="acquisition-1",
+        request=request,
+        status=AcquisitionStatus.FAILED,
+        environment_versions={"nested": {"x-api-key": redaction_value}},
+        attempts=(
+            AttemptEvidence(
+                provider=Provider.YFINANCE,
+                attempt_number=1,
+                started_at=datetime(2024, 1, 3),
+                duration_seconds=0.1,
+                outcome="failed",
+                error_message=f"request failed: https://example.test/?token={redaction_value}",
+            ),
+        ),
+        findings=(
+            QualityFinding(
+                QualitySeverity.FATAL,
+                "provider_error",
+                "provider error",
+                {"response": {"password": redaction_value}},
+            ),
+        ),
+        rejected_rows=(RejectedRow(1, "bad row", details={"secret": redaction_value}),),
+    )
+
+    serialized = f"{batch.to_dict()} {manifest.to_dict()}"
+
+    assert redaction_value not in serialized
+    assert "[REDACTED]" in serialized
+    assert "page=1" in serialized
+
+
+def test_contract_mapping_evidence_is_defensively_immutable() -> None:
+    request = AcquisitionRequest("SPY", date(2024, 1, 2), date(2024, 1, 3))
+    metadata = {"nested": {"value": "before"}}
+    details = {"nested": {"value": "before"}}
+    environment = {"python": "3.12"}
+    counters = {"accepted": 1}
+    batch = ProviderBatch(Provider.YFINANCE, request, pd.DataFrame(), response_metadata=metadata)
+    finding = QualityFinding(QualitySeverity.INFO, "mapped", "mapped", details)
+    rejected = RejectedRow(1, "bad row", details=details)
+    manifest = AcquisitionManifest(
+        "acquisition-1",
+        request,
+        AcquisitionStatus.SUCCESS,
+        environment_versions=environment,
+        counters=counters,
+    )
+
+    metadata["nested"]["value"] = "after"
+    details["nested"]["value"] = "after"
+    environment["python"] = "3.13"
+    counters["accepted"] = 2
+
+    assert batch.response_metadata["nested"]["value"] == "before"
+    assert finding.details["nested"]["value"] == "before"
+    assert rejected.details["nested"]["value"] == "before"
+    assert manifest.environment_versions["python"] == "3.12"
+    assert manifest.counters["accepted"] == 1
+    with pytest.raises(TypeError):
+        batch.response_metadata["new"] = "value"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        manifest.counters["accepted"] = 2  # type: ignore[index]
