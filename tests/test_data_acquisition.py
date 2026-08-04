@@ -200,10 +200,14 @@ def service(
     *,
     now: datetime = NOW,
     calendar: FakeCalendar | None = None,
+    repository: ManifestRepository | None = None,
+    archive_in_store: bool = True,
 ) -> tuple[AcquisitionService, DataStore, ManifestRepository]:
     chosen_calendar = calendar or FakeCalendar()
-    repository = ManifestRepository(
-        tmp_path / "reports", id_factory=lambda: "acquisition-1", clock=lambda: now
+    selected_repository = repository or ManifestRepository(
+        tmp_path / "reports",
+        id_factory=lambda: "acquisition-1",
+        clock=lambda: now,
     )
     generation_number = 0
 
@@ -217,19 +221,19 @@ def service(
         calendar_versions=chosen_calendar.version_evidence(),
         generation_id_factory=generation_id,
         clock=lambda: now,
-        manifest_repository=repository,
+        manifest_repository=selected_repository if archive_in_store else None,
     )
     return (
         AcquisitionService(
             store=store,
-            manifest_repository=repository,
+            manifest_repository=selected_repository,
             calendar=chosen_calendar,
             provider_factories=factories,
             retry_executor=RetryExecutor(clock=lambda: now, sleeper=lambda _: None),
             clock=lambda: now,
         ),
         store,
-        repository,
+        selected_repository,
     )
 
 

@@ -132,6 +132,7 @@ def _acquire(args: argparse.Namespace, service: AcquisitionService) -> int:
             },
             "command": "acquire",
             "status": result.manifest.status.value,
+            "warnings": [warning.to_dict() for warning in result.warnings],
         }
     )
     return EXIT_OK

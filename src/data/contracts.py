@@ -442,15 +442,41 @@ class AcquisitionManifest:
 
 
 @dataclass(frozen=True, slots=True)
+class AcquisitionWarning:
+    """Fixed, redacted secondary evidence that does not alter committed manifests."""
+
+    code: str
+    message: str
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", self.code):
+            raise ValueError("warning code uses an invalid grammar")
+        object.__setattr__(self, "message", _redact_text(self.message))
+
+    def to_dict(self) -> dict[str, str]:
+        return {"code": self.code, "message": self.message}
+
+
+REPORT_ARCHIVE_DEFERRED_WARNING = AcquisitionWarning(
+    code="report_archive_deferred",
+    message="Cache committed; request report archival was deferred.",
+)
+
+
+@dataclass(frozen=True, slots=True)
 class AcquisitionResult:
     """A validated frame with its immutable acquisition evidence."""
 
     frame: pd.DataFrame = field(repr=False, compare=False)
     manifest: AcquisitionManifest
+    warnings: tuple[AcquisitionWarning, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         """Results never serialize canonical frames into manifest/API JSON."""
-        return {"manifest": self.manifest.to_dict()}
+        return {
+            "manifest": self.manifest.to_dict(),
+            "warnings": [warning.to_dict() for warning in self.warnings],
+        }
 
 
 def json_safe(value: Any) -> Any:

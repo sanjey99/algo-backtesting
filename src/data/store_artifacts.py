@@ -6,15 +6,18 @@ import hashlib
 import math
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Any, cast
 
 import pandas as pd
 
 from src.data.contracts import (
+    AcquisitionManifest,
     AcquisitionRequest,
     ActionCoverage,
     CachePublicationError,
+    CacheStatus,
     ContractViolationError,
     LineageSegment,
     Provider,
@@ -22,7 +25,41 @@ from src.data.contracts import (
 from src.data.normalization import CANONICAL_COLUMNS, NUMERIC_COLUMNS
 from src.data.quality import action_signature
 
-__all__ = ("_merge_lineage", "_rebase_lineage", "_validate_canonical")
+__all__ = (
+    "CacheReadResult",
+    "CleanupResult",
+    "GenerationPublication",
+    "_merge_lineage",
+    "_rebase_lineage",
+    "_validate_canonical",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CacheReadResult:
+    """Fail-closed result returned by a canonical generation read."""
+
+    status: CacheStatus
+    frame: pd.DataFrame | None = None
+    metadata: Mapping[str, Any] | None = None
+    manifest: Mapping[str, Any] | None = None
+    generation_id: str | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationPublication:
+    generation_id: str
+    frame: pd.DataFrame
+    metadata: Mapping[str, Any]
+    manifest: AcquisitionManifest
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class CleanupResult:
+    removed_generation_ids: tuple[str, ...]
+    warnings: tuple[str, ...] = ()
 
 
 def _validate_canonical(frame: pd.DataFrame, request: AcquisitionRequest) -> None:

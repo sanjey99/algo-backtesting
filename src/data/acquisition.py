@@ -13,6 +13,7 @@ import pandas as pd
 
 from src.data.calendars import MarketCalendar, group_contiguous_sessions
 from src.data.contracts import (
+    REPORT_ARCHIVE_DEFERRED_WARNING,
     AcquisitionManifest,
     AcquisitionRequest,
     AcquisitionResult,
@@ -259,9 +260,10 @@ class AcquisitionService:
                 revalidate=lambda candidate: self._revalidate_rebase(candidate, request, expected),
                 replace_ranges=tuple((start.date(), end.date()) for start, end in planned),
             )
-            self._archive_publication_if_needed(publication)
+            publication = self._archive_publication_if_needed(request, publication)
             result_frame = self._requested_frame(publication.frame, expected)
-            return AcquisitionResult(result_frame, publication.manifest)
+            warnings = (REPORT_ARCHIVE_DEFERRED_WARNING,) if publication.warnings else ()
+            return AcquisitionResult(result_frame, publication.manifest, warnings=warnings)
         except Exception as error:
             self._archive_failure(
                 admission.acquisition_id, request, started_at, cache_status, cache, evidence, error
@@ -677,9 +679,18 @@ class AcquisitionService:
         )
         self._archive_manifest(manifest)
 
-    def _archive_publication_if_needed(self, publication: GenerationPublication) -> None:
-        if not self._store.archives_publications:
-            self._archive_manifest(publication.manifest)
+    def _archive_publication_if_needed(
+        self,
+        request: AcquisitionRequest,
+        publication: GenerationPublication,
+    ) -> GenerationPublication:
+        if self._store.archives_publications:
+            return publication
+        return self._store.archive_committed_publication(
+            request,
+            publication,
+            self._manifest_repository,
+        )
 
     def _archive_manifest(self, manifest: AcquisitionManifest) -> None:
         try:

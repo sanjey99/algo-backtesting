@@ -17,11 +17,14 @@ from src.api.deps import get_acquisition_service, get_db
 from src.api.main import app
 from src.api.schemas import DataFetchRequest
 from src.data.contracts import (
+    REPORT_ARCHIVE_DEFERRED_WARNING,
     AcquisitionManifest,
     AcquisitionRequest,
     AcquisitionResult,
     AcquisitionStatus,
+    AcquisitionWarning,
     ActionCoverage,
+    ArtifactError,
     AttemptEvidence,
     CacheEvidence,
     CachePublicationError,
@@ -81,7 +84,10 @@ def _canonical_frame(rows: int = 2) -> pd.DataFrame:
     )
 
 
-def _result(rows: int = 2) -> AcquisitionResult:
+def _result(
+    rows: int = 2,
+    warnings: tuple[AcquisitionWarning, ...] = (),
+) -> AcquisitionResult:
     request = AcquisitionRequest("SPY", date(2020, 1, 1), date(2022, 12, 31))
     now = datetime(2024, 1, 5, tzinfo=UTC)
     manifest = AcquisitionManifest(
@@ -121,7 +127,7 @@ def _result(rows: int = 2) -> AcquisitionResult:
         started_at=now,
         completed_at=now,
     )
-    return AcquisitionResult(_canonical_frame(rows), manifest)
+    return AcquisitionResult(_canonical_frame(rows), manifest, warnings=warnings)
 
 
 @pytest.fixture()
@@ -232,6 +238,43 @@ def test_fetch_uses_service_forced_refresh_and_exact_compact_summary(
         "warnings": 1,
     }
     assert "frame" not in str(body).lower()
+
+
+def test_post_commit_archive_warning_keeps_api_200_and_increments_summary(
+    api_client: TestClient,
+) -> None:
+    service = FakeAcquisitionService(
+        result=_result(warnings=(REPORT_ARCHIVE_DEFERRED_WARNING,))
+    )
+    _override_service(service)
+
+    response = api_client.post(
+        "/api/data/fetch",
+        json={"symbol": "SPY", "start": "2020-01-01", "end": "2022-12-31"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["summary"]["warnings"] == 2
+
+
+def test_standalone_archive_failure_maps_api_500(api_client: TestClient) -> None:
+    service = FakeAcquisitionService(
+        error=ArtifactError("secret=archive-failure", acquisition_id="standalone")
+    )
+    _override_service(service)
+
+    response = api_client.post(
+        "/api/data/fetch",
+        json={"symbol": "SPY", "start": "2020-01-01", "end": "2022-12-31"},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == {
+        "code": "cache_publication_failed",
+        "message": "Market data artifacts could not be published.",
+        "acquisition_id": "standalone",
+    }
+    assert "archive-failure" not in response.text
 
 
 def test_report_lookup_returns_redacted_full_manifest(api_client: TestClient) -> None:

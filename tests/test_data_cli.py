@@ -10,6 +10,8 @@ import pytest
 
 from src.data import cli
 from src.data.contracts import (
+    REPORT_ARCHIVE_DEFERRED_WARNING,
+    AcquisitionWarning,
     ArtifactError,
     CachePublicationError,
     InvalidRequestError,
@@ -60,11 +62,47 @@ def test_acquire_writes_atomic_artifacts_and_prints_acquisition_id(
         "artifacts": {"canonical": str(canonical), "report": str(report)},
         "command": "acquire",
         "status": "partial_success",
+        "warnings": [],
     }
     assert report.exists()
     assert pd.read_parquet(canonical).shape == (2, 11)
     assert json.loads(report.read_text())["acquisition_id"] == "acquisition-123"
     assert list(canonical.parent.glob(".*.tmp")) == []
+
+
+def test_post_commit_archive_warning_keeps_cli_zero_and_prints_safe_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service = FakeAcquisitionService(
+        result=_result(warnings=(REPORT_ARCHIVE_DEFERRED_WARNING,))
+    )
+    _install_service(monkeypatch, service)
+
+    code = cli.main(
+        [
+            "acquire",
+            "--symbol",
+            "SPY",
+            "--start",
+            "2020-01-01",
+            "--end",
+            "2022-12-31",
+            "--canonical",
+            str(tmp_path / "bars.parquet"),
+            "--report",
+            str(tmp_path / "report.json"),
+        ]
+    )
+
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["warnings"] == [
+        AcquisitionWarning(
+            code="report_archive_deferred",
+            message="Cache committed; request report archival was deferred.",
+        ).to_dict()
+    ]
 
 
 def test_inspect_loads_existing_redacted_report(

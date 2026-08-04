@@ -13,7 +13,6 @@ from src.api.schemas import DataAcquisitionSummary, DataFetchOut, DataFetchReque
 from src.data import df_to_candles
 from src.data.acquisition import AcquisitionService
 from src.data.contracts import (
-    AcquisitionManifest,
     AcquisitionRequest,
     AcquisitionResult,
     CacheError,
@@ -58,7 +57,7 @@ def fetch_data(req: DataFetchRequest, service: AcquisitionDep) -> DataFetchOut:
         start=candles[0].timestamp.date().isoformat(),
         end=candles[-1].timestamp.date().isoformat(),
         from_cache=result.manifest.cache.status is CacheStatus.FULL_HIT,
-        summary=_compact_summary(result.manifest),
+        summary=_compact_summary(result),
     )
 
 
@@ -108,7 +107,8 @@ def _iso_date(value: str) -> date:
         raise InvalidRequestError("start and end must use YYYY-MM-DD") from error
 
 
-def _compact_summary(manifest: AcquisitionManifest) -> DataAcquisitionSummary:
+def _compact_summary(result: AcquisitionResult) -> DataAcquisitionSummary:
+    manifest = result.manifest
     counters = manifest.counters
     successful_sources = _ordered_unique(
         attempt.provider.value for attempt in manifest.attempts if attempt.outcome == "success"
@@ -133,7 +133,10 @@ def _compact_summary(manifest: AcquisitionManifest) -> DataAcquisitionSummary:
         missing_sessions=_counter(counters, "missing_sessions"),
         duplicates_removed=duplicates,
         coverage=manifest.coverage,
-        warnings=sum(finding.severity is QualitySeverity.WARNING for finding in manifest.findings),
+        warnings=(
+            sum(finding.severity is QualitySeverity.WARNING for finding in manifest.findings)
+            + len(result.warnings)
+        ),
     )
 
 

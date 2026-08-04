@@ -10,7 +10,7 @@ import shutil
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -32,7 +32,16 @@ from src.data.contracts import (
 )
 from src.data.fetcher import DataFetcher
 from src.data.manifest import ManifestRepository
-from src.data.store_artifacts import _merge_lineage, _rebase_lineage, _validate_canonical
+from src.data.store_artifacts import (
+    CacheReadResult,
+    CleanupResult,
+    GenerationPublication,
+    _merge_lineage,
+    _rebase_lineage,
+    _validate_canonical,
+)
+
+__all__ = ("CacheReadResult", "CleanupResult", "DataStore", "GenerationPublication")
 
 _ARTIFACT_NAMES = (
     "bars.parquet",
@@ -46,33 +55,6 @@ _POINTER_SCHEMA_VERSION = "1"
 
 class _LockFactory(Protocol):
     def __call__(self, path: Path) -> AbstractContextManager[Any]: ...
-
-
-@dataclass(frozen=True, slots=True)
-class CacheReadResult:
-    """Fail-closed result returned by a canonical generation read."""
-
-    status: CacheStatus
-    frame: pd.DataFrame | None = None
-    metadata: Mapping[str, Any] | None = None
-    manifest: Mapping[str, Any] | None = None
-    generation_id: str | None = None
-    reason: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class GenerationPublication:
-    generation_id: str
-    frame: pd.DataFrame
-    metadata: Mapping[str, Any]
-    manifest: AcquisitionManifest
-    warnings: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class CleanupResult:
-    removed_generation_ids: tuple[str, ...]
-    warnings: tuple[str, ...] = ()
 
 
 class DataStore:
@@ -295,7 +277,6 @@ class DataStore:
         return CleanupResult(tuple(sorted(removed)), tuple(warnings))
 
     def lookup_manifest(self, acquisition_id: str) -> dict[str, Any] | None:
-        """Look up the archive, falling back only to a pinned embedded report."""
         if self._manifest_repository is not None:
             archived = self._manifest_repository.lookup(acquisition_id)
             if archived is not None:
@@ -313,10 +294,15 @@ class DataStore:
                 return cast(dict[str, Any], json.loads(json.dumps(document)))
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 continue
+        current_manifests = self._current_embedded_manifests()
+        for namespace, generation_id, current_acquisition_id, document in current_manifests:
+            if (namespace / "pins" / f"{generation_id}.json").exists():
+                continue
+            if current_acquisition_id == acquisition_id:
+                return cast(dict[str, Any], json.loads(json.dumps(document)))
         return None
 
     def maintain_manifest_archive(self) -> tuple[str, ...]:
-        """Retry pinned post-commit archives and unpin successful reports."""
         if self._manifest_repository is None:
             return ("manifest maintenance skipped because no repository is configured",)
         warnings: list[str] = []
@@ -330,7 +316,26 @@ class DataStore:
             except Exception as error:
                 # Artifact exceptions are intentionally secondary during maintenance.
                 warnings.append(f"manifest archival retry failed: {type(error).__name__}")
+        current_manifests = self._current_embedded_manifests()
+        for namespace, generation_id, acquisition_id, document in current_manifests:
+            pin = namespace / "pins" / f"{generation_id}.json"
+            if pin.exists() or self._manifest_repository.lookup(acquisition_id) is not None:
+                continue
+            try:
+                self._manifest_repository.archive_document(acquisition_id, document)
+            except Exception as error:
+                warnings.append(f"manifest archival retry failed: {type(error).__name__}")
         return tuple(warnings)
+
+    def archive_committed_publication(
+        self,
+        request: AcquisitionRequest,
+        publication: GenerationPublication,
+        repository: ManifestRepository,
+    ) -> GenerationPublication:
+        if self._manifest_repository is not None:
+            return publication
+        return self._archive_after_commit(request, publication, repository)
 
     def _publish_locked(
         self,
@@ -416,11 +421,13 @@ class DataStore:
         self,
         request: AcquisitionRequest,
         publication: GenerationPublication,
+        repository: ManifestRepository | None = None,
     ) -> GenerationPublication:
-        if self._manifest_repository is None:
+        selected_repository = repository or self._manifest_repository
+        if selected_repository is None:
             return publication
         try:
-            self._manifest_repository.archive(publication.manifest)
+            selected_repository.archive(publication.manifest)
             return publication
         except Exception:
             warning = "cache committed but request report archival failed"
@@ -448,6 +455,29 @@ class DataStore:
         pattern = f"{CONTRACT_VERSION}/*/*/*/pins/*.json"
         for pin_path in self._cache_dir.glob(pattern):
             yield pin_path.parent.parent, pin_path
+
+    def _current_embedded_manifests(
+        self,
+    ) -> Iterator[tuple[Path, str, str, dict[str, Any]]]:
+        pattern = f"{CONTRACT_VERSION}/*/*/*/CURRENT.json"
+        for pointer_path in self._cache_dir.glob(pattern):
+            namespace = pointer_path.parent
+            try:
+                pointer = self._load_pointer(namespace, required=True)
+                assert pointer is not None
+                generation_id = cast(str, pointer["generation_id"])
+                document = self._pinned_embedded_manifest(
+                    namespace,
+                    generation_id,
+                    _validate_acquisition_id(
+                        _load_json(
+                            namespace / "generations" / generation_id / "acquisition-manifest.json"
+                        ).get("acquisition_id")
+                    ),
+                )
+                yield namespace, generation_id, cast(str, document["acquisition_id"]), document
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
 
     def _load_pin(self, namespace: Path, pin_path: Path) -> tuple[str, str]:
         if pin_path.is_symlink() or pin_path.parent.is_symlink():
