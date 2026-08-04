@@ -17,6 +17,7 @@ import pandas as pd
 
 from src.api.deps import create_acquisition_service
 from src.data.acquisition import AcquisitionService
+from src.data.benchmark import run_deterministic_benchmark
 from src.data.contracts import (
     AcquisitionRequest,
     ArtifactError,
@@ -55,7 +56,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = parser.parse_args(argv)
         if args.command == "benchmark":
-            return _benchmark_placeholder(args.command)
+            return _benchmark(args)
         service = create_acquisition_service(
             cache_dir=args.cache_dir,
             manifest_dir=args.manifest_dir,
@@ -157,9 +158,20 @@ def _inspect(args: argparse.Namespace, service: AcquisitionService) -> int:
     return EXIT_OK
 
 
-def _benchmark_placeholder(command: str) -> int:
-    _emit_error(command, "benchmark_unavailable", "Benchmark behavior is provided by Task 7.")
-    return EXIT_REQUEST
+def _benchmark(args: argparse.Namespace) -> int:
+    artifact = run_deterministic_benchmark()
+    _write_json(artifact, args.output)
+    deterministic = artifact.get("deterministic")
+    scenarios = deterministic.get("scenarios", []) if isinstance(deterministic, Mapping) else []
+    _emit(
+        {
+            "artifact": str(args.output),
+            "command": "benchmark",
+            "live_smoke": artifact.get("live_smoke") is not None,
+            "scenarios": len(scenarios) if isinstance(scenarios, list) else 0,
+        }
+    )
+    return EXIT_OK
 
 
 def _parse_date(value: str) -> date:

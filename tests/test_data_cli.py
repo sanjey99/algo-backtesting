@@ -208,3 +208,27 @@ def test_inspect_rejects_unsafe_identifier_as_request_error(
 
     assert code == 2
     assert json.loads(capsys.readouterr().err)["error"]["code"] == "invalid_request"
+
+
+def test_benchmark_writes_a_deterministic_artifact_without_live_smoke(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    artifact = {
+        "deterministic": {"scenarios": [{"name": "cold_cache"}]},
+        "live_smoke": None,
+    }
+    monkeypatch.setattr(cli, "run_deterministic_benchmark", lambda: artifact, raising=False)
+    output = tmp_path / "benchmark.json"
+
+    code = cli.main(["benchmark", "--output", str(output)])
+
+    assert code == 0
+    assert json.loads(output.read_text()) == artifact
+    assert json.loads(capsys.readouterr().out) == {
+        "artifact": str(output),
+        "command": "benchmark",
+        "live_smoke": False,
+        "scenarios": 1,
+    }
