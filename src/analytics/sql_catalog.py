@@ -11,7 +11,14 @@ from types import MappingProxyType
 from sqlalchemy import bindparam, text
 from sqlalchemy.sql.elements import TextClause
 
-from src.analytics.sql_contracts import COMPARISON_CONTRACT, QueryId, QuerySpec, ResultContract
+from src.analytics.sql_contracts import (
+    COHORT_SUMMARY_CONTRACT,
+    COMPARISON_CONTRACT,
+    EQUITY_DRAWDOWN_AUDIT_CONTRACT,
+    TRADE_SEQUENCE_CONTRACT,
+    QueryId,
+    QuerySpec,
+)
 
 
 @dataclass(frozen=True)
@@ -32,18 +39,18 @@ _DEFAULT_SPECS: Mapping[QueryId, QuerySpec] = MappingProxyType(
         ),
         QueryId.TRADE_SEQUENCE: QuerySpec(
             resource="trade_sequence.sql",
-            required_params=frozenset(),
-            contract=ResultContract(columns=()),
+            required_params=frozenset({"run_id"}),
+            contract=TRADE_SEQUENCE_CONTRACT,
         ),
         QueryId.EQUITY_DRAWDOWN_AUDIT: QuerySpec(
             resource="equity_drawdown_audit.sql",
-            required_params=frozenset(),
-            contract=ResultContract(columns=()),
+            required_params=frozenset({"run_id", "tolerance"}),
+            contract=EQUITY_DRAWDOWN_AUDIT_CONTRACT,
         ),
         QueryId.STRATEGY_COHORT_SUMMARY: QuerySpec(
             resource="strategy_cohort_summary.sql",
-            required_params=frozenset(),
-            contract=ResultContract(columns=()),
+            required_params=frozenset({"symbol", "start_date", "end_date", "minimum_run_count"}),
+            contract=COHORT_SUMMARY_CONTRACT,
         ),
     }
 )

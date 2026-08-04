@@ -73,6 +73,16 @@ class ComparisonFilters:
     strategy_name: str | None = None
 
 
+@dataclass(frozen=True)
+class CohortFilters:
+    """Optional selection bounds and a per-strategy completed-run threshold."""
+
+    symbol: str | None
+    start_date: datetime | None
+    end_date: datetime | None
+    minimum_run_count: int
+
+
 COMPARISON_CONTRACT = ResultContract(
     columns=(
         ColumnSpec("run_id", ColumnKind.STRING, False),
@@ -103,4 +113,65 @@ COMPARISON_CONTRACT = ResultContract(
         ColumnSpec("sharpe_rank", ColumnKind.INTEGER, True, exclusive_minimum=0.0),
     ),
     unique_by=("run_id",),
+)
+
+
+TRADE_SEQUENCE_CONTRACT = ResultContract(
+    columns=(
+        ColumnSpec("trade_id", ColumnKind.INTEGER, False, exclusive_minimum=0.0),
+        ColumnSpec("exit_date", ColumnKind.DATETIME, False),
+        ColumnSpec("pnl", ColumnKind.FLOAT, False),
+        ColumnSpec("trade_sequence", ColumnKind.INTEGER, False, exclusive_minimum=0.0),
+        ColumnSpec("cumulative_pnl", ColumnKind.FLOAT, False),
+        ColumnSpec("cumulative_wins", ColumnKind.INTEGER, False, minimum=0.0),
+        ColumnSpec("cumulative_win_rate", ColumnKind.FLOAT, False, minimum=0.0, maximum=1.0),
+        ColumnSpec("rolling_5_trade_avg_pnl", ColumnKind.FLOAT, False),
+    ),
+    unique_by=("trade_id",),
+)
+
+
+EQUITY_DRAWDOWN_AUDIT_CONTRACT = ResultContract(
+    columns=(
+        ColumnSpec("equity_point_id", ColumnKind.INTEGER, False, exclusive_minimum=0.0),
+        ColumnSpec("date", ColumnKind.DATETIME, False),
+        ColumnSpec("equity", ColumnKind.FLOAT, False),
+        ColumnSpec("stored_drawdown_pct", ColumnKind.FLOAT, False),
+        ColumnSpec("audit_sequence", ColumnKind.INTEGER, False, exclusive_minimum=0.0),
+        ColumnSpec("prior_equity", ColumnKind.FLOAT, True),
+        ColumnSpec("point_return", ColumnKind.FLOAT, True),
+        ColumnSpec("running_peak", ColumnKind.FLOAT, False),
+        ColumnSpec("derived_drawdown_pct", ColumnKind.FLOAT, False),
+        ColumnSpec("drawdown_delta_abs", ColumnKind.FLOAT, False, minimum=0.0),
+        ColumnSpec("is_mismatch", ColumnKind.BOOLEAN, False),
+    ),
+    unique_by=("equity_point_id",),
+)
+
+
+COHORT_SUMMARY_CONTRACT = ResultContract(
+    columns=(
+        ColumnSpec("strategy_name", ColumnKind.STRING, False),
+        ColumnSpec("symbol", ColumnKind.STRING, False),
+        ColumnSpec("start_date", ColumnKind.DATETIME, False),
+        ColumnSpec("end_date", ColumnKind.DATETIME, False),
+        ColumnSpec("initial_capital", ColumnKind.FLOAT, False, exclusive_minimum=0.0),
+        ColumnSpec("commission_pct", ColumnKind.FLOAT, False, minimum=0.0),
+        ColumnSpec("slippage_pct", ColumnKind.FLOAT, False, minimum=0.0),
+        ColumnSpec("run_count", ColumnKind.INTEGER, False, exclusive_minimum=0.0),
+        ColumnSpec("average_derived_return", ColumnKind.FLOAT, True),
+        ColumnSpec("average_sharpe_ratio", ColumnKind.FLOAT, True),
+        ColumnSpec("worst_drawdown", ColumnKind.FLOAT, True),
+        ColumnSpec("aggregate_closed_trade_count", ColumnKind.INTEGER, False, minimum=0.0),
+        ColumnSpec("return_rank", ColumnKind.INTEGER, False, exclusive_minimum=0.0),
+    ),
+    unique_by=(
+        "strategy_name",
+        "symbol",
+        "start_date",
+        "end_date",
+        "initial_capital",
+        "commission_pct",
+        "slippage_pct",
+    ),
 )
