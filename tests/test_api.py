@@ -4,17 +4,22 @@ Uses TestClient with an in-memory SQLite DB and patched data fetching.
 """
 from __future__ import annotations
 
+from collections.abc import Generator
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from src.api.deps import get_db
 from src.api.main import app
+from src.db import database
+from src.db.database import create_db_engine
+from src.db.migrate import SchemaNotCurrentError
 from src.db.tables import Base
 from src.models.candle import Candle
 
@@ -31,7 +36,7 @@ _engine = create_engine(
 _TestSession = sessionmaker(bind=_engine, autocommit=False, autoflush=False)
 
 
-def override_get_db():
+def override_get_db() -> Generator[Session, None, None]:
     db = _TestSession()
     try:
         yield db
@@ -75,9 +80,24 @@ FAKE_CANDLES = _make_candles(150)
 
 
 @pytest.fixture()
-def client():
-    with TestClient(app) as c:
-        yield c
+def client() -> Generator[TestClient, None, None]:
+    with patch("src.api.main.init_db"):
+        with TestClient(app) as c:
+            yield c
+
+
+def test_lifespan_rejects_unmigrated_real_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Application startup must verify, never silently migrate, a real database."""
+    engine = create_db_engine(f"sqlite:///{tmp_path / 'unmigrated.db'}")
+    monkeypatch.setattr(database, "get_engine", lambda: engine)
+
+    with pytest.raises(SchemaNotCurrentError):
+        with TestClient(app):
+            pass
+
+    engine.dispose()
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +105,7 @@ def client():
 # ---------------------------------------------------------------------------
 
 class TestHealth:
-    def test_health_ok(self, client: TestClient):
+    def test_health_ok(self, client: TestClient) -> None:
         r = client.get("/health")
         assert r.status_code == 200
         assert r.json()["status"] == "ok"
@@ -96,7 +116,7 @@ class TestHealth:
 # ---------------------------------------------------------------------------
 
 class TestStrategies:
-    def test_lists_strategies(self, client: TestClient):
+    def test_lists_strategies(self, client: TestClient) -> None:
         r = client.get("/api/strategies")
         assert r.status_code == 200
         keys = {s["key"] for s in r.json()}
@@ -104,7 +124,7 @@ class TestStrategies:
         assert "rsi_mean_reversion" in keys
         assert "breakout" in keys
 
-    def test_strategy_has_parameter_space(self, client: TestClient):
+    def test_strategy_has_parameter_space(self, client: TestClient) -> None:
         r = client.get("/api/strategies")
         for strat in r.json():
             assert "parameter_space" in strat
@@ -119,7 +139,7 @@ PATCH_TARGET = "src.api.routes.backtest._fetch_candles"
 
 
 class TestRunBacktest:
-    def test_returns_201_and_run_id(self, client: TestClient):
+    def test_returns_201_and_run_id(self, client: TestClient) -> None:
         with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
             r = client.post("/api/backtest", json={
                 "strategy": "ma_crossover",
@@ -133,7 +153,7 @@ class TestRunBacktest:
         assert "run_id" in body
         assert body["strategy_name"] == "ma_crossover"
 
-    def test_metrics_present(self, client: TestClient):
+    def test_metrics_present(self, client: TestClient) -> None:
         with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
             r = client.post("/api/backtest", json={
                 "strategy": "ma_crossover",
@@ -144,7 +164,7 @@ class TestRunBacktest:
         assert r.status_code == 201
         assert "sharpe_ratio" in r.json()["metrics"]
 
-    def test_invalid_strategy_returns_400(self, client: TestClient):
+    def test_invalid_strategy_returns_400(self, client: TestClient) -> None:
         with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
             r = client.post("/api/backtest", json={
                 "strategy": "does_not_exist",
@@ -154,7 +174,7 @@ class TestRunBacktest:
             })
         assert r.status_code == 400
 
-    def test_empty_candles_returns_422(self, client: TestClient):
+    def test_empty_candles_returns_422(self, client: TestClient) -> None:
         with patch(PATCH_TARGET, return_value=[]):
             r = client.post("/api/backtest", json={
                 "strategy": "ma_crossover",
@@ -170,7 +190,7 @@ class TestRunBacktest:
 # ---------------------------------------------------------------------------
 
 class TestGetBacktest:
-    def test_get_existing_run(self, client: TestClient):
+    def test_get_existing_run(self, client: TestClient) -> None:
         with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
             post = client.post("/api/backtest", json={
                 "strategy": "ma_crossover",
@@ -184,11 +204,11 @@ class TestGetBacktest:
         assert r.status_code == 200
         assert r.json()["run_id"] == run_id
 
-    def test_get_nonexistent_run_returns_404(self, client: TestClient):
+    def test_get_nonexistent_run_returns_404(self, client: TestClient) -> None:
         r = client.get("/api/backtest/nonexistent-id")
         assert r.status_code == 404
 
-    def test_get_trades_endpoint(self, client: TestClient):
+    def test_get_trades_endpoint(self, client: TestClient) -> None:
         with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
             post = client.post("/api/backtest", json={
                 "strategy": "ma_crossover",
@@ -203,7 +223,7 @@ class TestGetBacktest:
         assert r.status_code == 200
         assert isinstance(r.json(), list)
 
-    def test_get_equity_curve_endpoint(self, client: TestClient):
+    def test_get_equity_curve_endpoint(self, client: TestClient) -> None:
         with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
             post = client.post("/api/backtest", json={
                 "strategy": "ma_crossover",
@@ -228,7 +248,7 @@ class TestGetBacktest:
 # ---------------------------------------------------------------------------
 
 class TestListBacktests:
-    def test_list_returns_array(self, client: TestClient):
+    def test_list_returns_array(self, client: TestClient) -> None:
         r = client.get("/api/backtest")
         assert r.status_code == 200
         assert isinstance(r.json(), list)
@@ -239,7 +259,7 @@ class TestListBacktests:
 # ---------------------------------------------------------------------------
 
 class TestPermutationEndpoint:
-    def test_returns_202_and_job_id(self, client: TestClient):
+    def test_returns_202_and_job_id(self, client: TestClient) -> None:
         with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
             r = client.post("/api/backtest/permutation-test", json={
                 "strategy": "ma_crossover",
@@ -251,7 +271,7 @@ class TestPermutationEndpoint:
         assert r.status_code == 202
         assert "job_id" in r.json()
 
-    def test_poll_job(self, client: TestClient):
+    def test_poll_job(self, client: TestClient) -> None:
         with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
             r = client.post("/api/backtest/permutation-test", json={
                 "strategy": "ma_crossover",
@@ -265,7 +285,7 @@ class TestPermutationEndpoint:
         assert poll.status_code == 200
         assert poll.json()["job_id"] == job_id
 
-    def test_poll_missing_job_404(self, client: TestClient):
+    def test_poll_missing_job_404(self, client: TestClient) -> None:
         r = client.get("/api/backtest/permutation-test/no-such-job")
         assert r.status_code == 404
 
@@ -275,7 +295,7 @@ class TestPermutationEndpoint:
 # ---------------------------------------------------------------------------
 
 class TestDataFetch:
-    def test_fetch_returns_candle_count(self, client: TestClient):
+    def test_fetch_returns_candle_count(self, client: TestClient) -> None:
         # Patch df_to_candles so we don't need a real DataFrame
         with patch("src.data.fetcher.YFinanceFetcher"), \
              patch("src.api.routes.data.df_to_candles", return_value=FAKE_CANDLES):
@@ -288,7 +308,7 @@ class TestDataFetch:
         assert r.status_code == 200
         assert r.json()["n_candles"] == len(FAKE_CANDLES)
 
-    def test_fetch_empty_returns_422(self, client: TestClient):
+    def test_fetch_empty_returns_422(self, client: TestClient) -> None:
         with patch("src.data.fetcher.YFinanceFetcher"), \
              patch("src.api.routes.data.df_to_candles", return_value=[]):
             r = client.post("/api/data/fetch", json={

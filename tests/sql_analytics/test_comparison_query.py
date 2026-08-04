@@ -58,10 +58,12 @@ def test_comparison_preserves_microsecond_precision_in_date_filters(analytics_db
     assert frame["run_id"].tolist() == ["run-ma", "run-rsi"]
 
 
-def test_comparison_preaggregates_children_without_trade_fan_out(analytics_db: Engine) -> None:
+def test_comparison_preaggregates_children_without_trade_fan_out(
+    legacy_analytics_db: Engine,
+) -> None:
     """Extra child rows cannot multiply a run's independently aggregated trade facts."""
-    before = AnalyticsService(analytics_db).compare_runs(COMPARISON_FILTERS)
-    with Session(analytics_db) as session:
+    before = AnalyticsService(legacy_analytics_db).compare_runs(COMPARISON_FILTERS)
+    with Session(legacy_analytics_db) as session:
         session.add(MetricRecord(backtest_id="run-ma", metric_name="diagnostic", metric_value=99.0))
         session.add(
             EquityCurvePoint(
@@ -73,7 +75,7 @@ def test_comparison_preaggregates_children_without_trade_fan_out(analytics_db: E
         )
         session.commit()
 
-    after = AnalyticsService(analytics_db).compare_runs(COMPARISON_FILTERS)
+    after = AnalyticsService(legacy_analytics_db).compare_runs(COMPARISON_FILTERS)
 
     assert after.loc[0, "cumulative_trade_pnl"] == before.loc[0, "cumulative_trade_pnl"] == 150.0
     assert after.loc[0, "closed_trade_count"] == before.loc[0, "closed_trade_count"] == 2

@@ -7,13 +7,17 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+from alembic.config import Config
 from sqlalchemy import event
 from sqlalchemy.engine import Connection, Engine
 
+from alembic import command
 from src.analytics.sql_contracts import Severity, ValidationFinding, ValidationReport
 from src.analytics.sql_service import IntegrityFailureError, IntegrityService
 from src.db.database import create_db_engine
-from src.db.tables import Base
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+BASELINE_REVISION = "455406e2c7ac"
 
 
 def _find(report: ValidationReport, code: str) -> ValidationFinding:
@@ -24,8 +28,11 @@ def _find(report: ValidationReport, code: str) -> ValidationFinding:
 
 @pytest.fixture()
 def empty_integrity_db(tmp_path: Path) -> Iterator[Engine]:
-    engine = create_db_engine(f"sqlite:///{tmp_path / 'integrity.db'}")
-    Base.metadata.create_all(engine)
+    database_url = f"sqlite:///{tmp_path / 'integrity.db'}"
+    config = Config(str(PROJECT_ROOT / "alembic.ini"))
+    config.attributes["database_url"] = database_url
+    command.upgrade(config, BASELINE_REVISION)
+    engine = create_db_engine(database_url)
     try:
         yield engine
     finally:

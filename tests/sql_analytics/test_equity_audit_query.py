@@ -51,11 +51,15 @@ def _seed_audit_run(engine: Engine) -> list[int]:
     return point_ids
 
 
-def test_equity_audit_calculates_ordered_drawdown_reconciliation(analytics_db: Engine) -> None:
+def test_equity_audit_calculates_ordered_drawdown_reconciliation(
+    legacy_analytics_db: Engine,
+) -> None:
     """The audit derives each point from preceding equity and a running high-water mark."""
-    point_ids = _seed_audit_run(analytics_db)
+    point_ids = _seed_audit_run(legacy_analytics_db)
 
-    frame = AnalyticsService(analytics_db).equity_drawdown_audit(AUDIT_RUN_ID, tolerance=0.0)
+    frame = AnalyticsService(legacy_analytics_db).equity_drawdown_audit(
+        AUDIT_RUN_ID, tolerance=0.0
+    )
 
     assert tuple(frame.columns) == EQUITY_DRAWDOWN_AUDIT_CONTRACT.names
     assert frame["equity_point_id"].tolist() == point_ids
@@ -72,25 +76,33 @@ def test_equity_audit_calculates_ordered_drawdown_reconciliation(analytics_db: E
     assert frame["is_mismatch"].tolist() == [False, False, False, False, True]
 
 
-def test_equity_audit_honors_tolerance_and_rejects_negative_values(analytics_db: Engine) -> None:
+def test_equity_audit_honors_tolerance_and_rejects_negative_values(
+    legacy_analytics_db: Engine,
+) -> None:
     """Tolerance is a bound numeric policy, not SQL text interpolation."""
-    _seed_audit_run(analytics_db)
+    _seed_audit_run(legacy_analytics_db)
 
-    within_tolerance = AnalyticsService(analytics_db).equity_drawdown_audit(
+    within_tolerance = AnalyticsService(legacy_analytics_db).equity_drawdown_audit(
         AUDIT_RUN_ID, tolerance=0.05
     )
 
     assert within_tolerance["is_mismatch"].tolist() == [False, False, False, False, False]
     with pytest.raises(ValueError, match="tolerance"):
-        AnalyticsService(analytics_db).equity_drawdown_audit(AUDIT_RUN_ID, tolerance=-0.01)
+        AnalyticsService(legacy_analytics_db).equity_drawdown_audit(
+            AUDIT_RUN_ID, tolerance=-0.01
+        )
 
 
-def test_equity_audit_rejects_a_non_finite_tolerance(analytics_db: Engine) -> None:
+def test_equity_audit_rejects_a_non_finite_tolerance(
+    legacy_analytics_db: Engine,
+) -> None:
     """A comparison tolerance must be an ordinary non-negative finite number."""
-    _seed_audit_run(analytics_db)
+    _seed_audit_run(legacy_analytics_db)
 
     with pytest.raises(ValueError, match="tolerance"):
-        AnalyticsService(analytics_db).equity_drawdown_audit(AUDIT_RUN_ID, tolerance=float("nan"))
+        AnalyticsService(legacy_analytics_db).equity_drawdown_audit(
+            AUDIT_RUN_ID, tolerance=float("nan")
+        )
 
 
 def test_equity_audit_rejects_an_unknown_run(analytics_db: Engine) -> None:
