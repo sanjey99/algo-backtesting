@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import TypeAlias
 
 Scalar: TypeAlias = str | int | float | datetime | None
+BindValue: TypeAlias = Scalar | tuple[Scalar, ...]
 
 
 class QueryId(StrEnum):
@@ -16,6 +17,49 @@ class QueryId(StrEnum):
     TRADE_SEQUENCE = "trade_sequence"
     EQUITY_DRAWDOWN_AUDIT = "equity_drawdown_audit"
     STRATEGY_COHORT_SUMMARY = "strategy_cohort_summary"
+    INTEGRITY_TABLE_COUNTS = "integrity_table_counts"
+    INTEGRITY_PER_RUN_RECONCILIATION = "integrity_per_run_reconciliation"
+    INTEGRITY_DUPLICATE_METRICS = "integrity_duplicate_metrics"
+    INTEGRITY_DUPLICATE_EQUITY = "integrity_duplicate_equity"
+    INTEGRITY_ORPHAN_CHILDREN = "integrity_orphan_children"
+    INTEGRITY_INVALID_RECORDS = "integrity_invalid_records"
+    INTEGRITY_METRIC_RECONCILIATION = "integrity_metric_reconciliation"
+
+
+class Severity(StrEnum):
+    """Trust level assigned to one integrity invariant."""
+
+    PASS = "PASS"
+    WARN = "WARN"
+    FAIL = "FAIL"
+
+
+@dataclass(frozen=True)
+class ValidationFinding:
+    """Immutable outcome for one stable integrity finding code."""
+
+    code: str
+    severity: Severity
+    table: str | None
+    observed_count: int
+    sample_ids: tuple[str, ...]
+    message: str
+
+
+@dataclass(frozen=True)
+class ValidationReport:
+    """Versioned immutable integrity report for one database snapshot."""
+
+    schema_version: str
+    generated_at: datetime
+    database: str
+    tolerance: float
+    findings: tuple[ValidationFinding, ...]
+
+    @property
+    def has_failures(self) -> bool:
+        """Return whether any finding makes analytical output untrustworthy."""
+        return any(finding.severity is Severity.FAIL for finding in self.findings)
 
 
 class ColumnKind(StrEnum):
@@ -174,4 +218,49 @@ COHORT_SUMMARY_CONTRACT = ResultContract(
         "commission_pct",
         "slippage_pct",
     ),
+)
+
+
+TABLE_COUNTS_CONTRACT = ResultContract(
+    columns=(
+        ColumnSpec("table_name", ColumnKind.STRING, False),
+        ColumnSpec("row_count", ColumnKind.INTEGER, False, minimum=0.0),
+    ),
+    unique_by=("table_name",),
+)
+
+
+PER_RUN_RECONCILIATION_CONTRACT = ResultContract(
+    columns=(
+        ColumnSpec("run_id", ColumnKind.STRING, False),
+        ColumnSpec("trade_count", ColumnKind.INTEGER, False, minimum=0.0),
+        ColumnSpec("closed_trade_count", ColumnKind.INTEGER, False, minimum=0.0),
+        ColumnSpec("open_trade_count", ColumnKind.INTEGER, False, minimum=0.0),
+        ColumnSpec("equity_count", ColumnKind.INTEGER, False, minimum=0.0),
+        ColumnSpec("metric_count", ColumnKind.INTEGER, False, minimum=0.0),
+        ColumnSpec("distinct_metric_count", ColumnKind.INTEGER, False, minimum=0.0),
+        ColumnSpec("optional_metric_count", ColumnKind.INTEGER, False, minimum=0.0),
+    ),
+    unique_by=("run_id",),
+)
+
+
+DUPLICATE_CONTRACT = ResultContract(
+    columns=(
+        ColumnSpec("run_id", ColumnKind.STRING, False),
+        ColumnSpec("duplicate_key", ColumnKind.STRING, False),
+        ColumnSpec("duplicate_count", ColumnKind.INTEGER, False, exclusive_minimum=1.0),
+    ),
+    unique_by=("run_id", "duplicate_key"),
+)
+
+
+DEFECT_RECORD_CONTRACT = ResultContract(
+    columns=(
+        ColumnSpec("defect_code", ColumnKind.STRING, False),
+        ColumnSpec("table_name", ColumnKind.STRING, False),
+        ColumnSpec("record_id", ColumnKind.STRING, False),
+        ColumnSpec("run_id", ColumnKind.STRING, False),
+    ),
+    unique_by=("defect_code", "table_name", "record_id"),
 )

@@ -14,7 +14,11 @@ from sqlalchemy.sql.elements import TextClause
 from src.analytics.sql_contracts import (
     COHORT_SUMMARY_CONTRACT,
     COMPARISON_CONTRACT,
+    DEFECT_RECORD_CONTRACT,
+    DUPLICATE_CONTRACT,
     EQUITY_DRAWDOWN_AUDIT_CONTRACT,
+    PER_RUN_RECONCILIATION_CONTRACT,
+    TABLE_COUNTS_CONTRACT,
     TRADE_SEQUENCE_CONTRACT,
     QueryId,
     QuerySpec,
@@ -51,6 +55,47 @@ _DEFAULT_SPECS: Mapping[QueryId, QuerySpec] = MappingProxyType(
             resource="strategy_cohort_summary.sql",
             required_params=frozenset({"symbol", "start_date", "end_date", "minimum_run_count"}),
             contract=COHORT_SUMMARY_CONTRACT,
+        ),
+        QueryId.INTEGRITY_TABLE_COUNTS: QuerySpec(
+            resource="integrity/table_counts.sql",
+            required_params=frozenset(),
+            contract=TABLE_COUNTS_CONTRACT,
+        ),
+        QueryId.INTEGRITY_PER_RUN_RECONCILIATION: QuerySpec(
+            resource="integrity/per_run_reconciliation.sql",
+            required_params=frozenset({"scope_all", "run_ids"}),
+            expanding_params=frozenset({"run_ids"}),
+            contract=PER_RUN_RECONCILIATION_CONTRACT,
+        ),
+        QueryId.INTEGRITY_DUPLICATE_METRICS: QuerySpec(
+            resource="integrity/duplicate_metrics.sql",
+            required_params=frozenset({"scope_all", "run_ids"}),
+            expanding_params=frozenset({"run_ids"}),
+            contract=DUPLICATE_CONTRACT,
+        ),
+        QueryId.INTEGRITY_DUPLICATE_EQUITY: QuerySpec(
+            resource="integrity/duplicate_equity.sql",
+            required_params=frozenset({"scope_all", "run_ids"}),
+            expanding_params=frozenset({"run_ids"}),
+            contract=DUPLICATE_CONTRACT,
+        ),
+        QueryId.INTEGRITY_ORPHAN_CHILDREN: QuerySpec(
+            resource="integrity/orphan_children.sql",
+            required_params=frozenset({"scope_all", "run_ids"}),
+            expanding_params=frozenset({"run_ids"}),
+            contract=DEFECT_RECORD_CONTRACT,
+        ),
+        QueryId.INTEGRITY_INVALID_RECORDS: QuerySpec(
+            resource="integrity/invalid_records.sql",
+            required_params=frozenset({"scope_all", "run_ids"}),
+            expanding_params=frozenset({"run_ids"}),
+            contract=DEFECT_RECORD_CONTRACT,
+        ),
+        QueryId.INTEGRITY_METRIC_RECONCILIATION: QuerySpec(
+            resource="integrity/metric_reconciliation.sql",
+            required_params=frozenset({"scope_all", "run_ids", "tolerance"}),
+            expanding_params=frozenset({"run_ids"}),
+            contract=DEFECT_RECORD_CONTRACT,
         ),
     }
 )
