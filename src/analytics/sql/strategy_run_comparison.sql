@@ -26,6 +26,7 @@ metric_pivot AS (
 trade_stats AS (
     SELECT t.backtest_id,
            COUNT(CASE WHEN t.exit_date IS NOT NULL AND t.exit_price IS NOT NULL AND t.pnl IS NOT NULL THEN 1 END) AS closed_trade_count,
+           COUNT(CASE WHEN t.exit_date IS NOT NULL AND t.exit_price IS NOT NULL AND t.pnl > 0 THEN 1 END) AS winning_trade_count,
            COALESCE(SUM(CASE WHEN t.exit_date IS NOT NULL AND t.exit_price IS NOT NULL AND t.pnl IS NOT NULL THEN t.pnl ELSE 0 END), 0.0) AS cumulative_trade_pnl,
            COALESCE(SUM(CASE WHEN t.exit_date IS NOT NULL AND t.exit_price IS NOT NULL AND t.pnl IS NOT NULL THEN t.commission ELSE 0 END), 0.0) AS closed_trade_commission
     FROM trades AS t
@@ -45,6 +46,7 @@ run_facts AS (
            m.max_drawdown_duration, m.win_rate, m.profit_factor, m.calmar_ratio,
            m.metric_total_trades, m.reported_total_return,
            COALESCE(t.closed_trade_count, 0) AS closed_trade_count,
+           COALESCE(t.winning_trade_count, 0) AS winning_trade_count,
            COALESCE(t.cumulative_trade_pnl, 0.0) AS cumulative_trade_pnl,
            COALESCE(t.closed_trade_commission, 0.0) AS closed_trade_commission,
            e.equity AS latest_equity,
@@ -61,7 +63,7 @@ SELECT run_id, strategy_name, symbol, start_date, end_date, initial_capital,
        commission_pct, slippage_pct, sharpe_ratio, sortino_ratio, cagr,
        max_drawdown, max_drawdown_duration, win_rate, profit_factor, calmar_ratio,
        metric_total_trades, reported_total_return, closed_trade_count,
-       cumulative_trade_pnl, closed_trade_commission, latest_equity,
+       winning_trade_count, cumulative_trade_pnl, closed_trade_commission, latest_equity,
        derived_total_return, total_return_delta,
        CASE WHEN derived_total_return IS NULL THEN NULL ELSE RANK() OVER (
            PARTITION BY symbol, start_date, end_date, initial_capital, commission_pct, slippage_pct

@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from src.analytics.sql_contracts import COMPARISON_CONTRACT, ComparisonFilters
 from src.analytics.sql_service import AnalyticsService, ContractValidationError, validate_frame
-from src.db.tables import BacktestRun, EquityCurvePoint, MetricRecord
+from src.db.tables import BacktestRun, EquityCurvePoint, MetricRecord, TradeRecord
 from tests.sql_analytics.fixture_data import COMPARISON_END, COMPARISON_START, RUN_RSI_ID
 
 COMPARISON_FILTERS = ComparisonFilters(
@@ -27,8 +27,38 @@ def test_comparison_returns_one_row_per_run_with_correct_ranks(analytics_db: Eng
     """A comparison has hand-derived values and cohort ranks at the run grain."""
     frame = AnalyticsService(analytics_db).compare_runs(COMPARISON_FILTERS)
 
-    assert tuple(frame.columns) == COMPARISON_CONTRACT.names
+    expected_columns = (
+        "run_id",
+        "strategy_name",
+        "symbol",
+        "start_date",
+        "end_date",
+        "initial_capital",
+        "commission_pct",
+        "slippage_pct",
+        "sharpe_ratio",
+        "sortino_ratio",
+        "cagr",
+        "max_drawdown",
+        "max_drawdown_duration",
+        "win_rate",
+        "profit_factor",
+        "calmar_ratio",
+        "metric_total_trades",
+        "reported_total_return",
+        "closed_trade_count",
+        "winning_trade_count",
+        "cumulative_trade_pnl",
+        "closed_trade_commission",
+        "latest_equity",
+        "derived_total_return",
+        "total_return_delta",
+        "return_rank",
+        "sharpe_rank",
+    )
+    assert tuple(frame.columns) == expected_columns == COMPARISON_CONTRACT.names
     assert frame["run_id"].tolist() == ["run-ma", "run-rsi"]
+    assert frame["winning_trade_count"].tolist() == [2, 1]
     assert frame["return_rank"].tolist() == [1, 2]
     assert frame.loc[0, "cumulative_trade_pnl"] == pytest.approx(150.0)
     assert frame.loc[0, "derived_total_return"] == pytest.approx(0.02)
@@ -56,6 +86,61 @@ def test_comparison_preserves_microsecond_precision_in_date_filters(analytics_db
     frame = AnalyticsService(analytics_db).compare_runs(COMPARISON_FILTERS)
 
     assert frame["run_id"].tolist() == ["run-ma", "run-rsi"]
+
+
+def test_comparison_reports_zero_winning_trades_for_run_without_trades(
+    analytics_db: Engine,
+) -> None:
+    """A selected run without trades retains one row and reports zero counts."""
+    frame = AnalyticsService(analytics_db).compare_runs(
+        ComparisonFilters("QQQ", COMPARISON_START, COMPARISON_END)
+    )
+
+    assert frame["run_id"].tolist() == ["run-other"]
+    assert frame["closed_trade_count"].tolist() == [0]
+    assert frame["winning_trade_count"].tolist() == [0]
+
+
+def test_comparison_counts_only_positive_pnl_closed_trades_as_wins(
+    analytics_db: Engine,
+) -> None:
+    """Closed losing and breakeven trades contribute to closed count but not winning count."""
+    with Session(analytics_db) as session:
+        session.add_all(
+            [
+                TradeRecord(
+                    backtest_id=RUN_RSI_ID,
+                    entry_date=COMPARISON_START + timedelta(days=14),
+                    exit_date=COMPARISON_START + timedelta(days=15),
+                    direction="LONG",
+                    entry_price=100.0,
+                    exit_price=99.0,
+                    quantity=1,
+                    pnl=-1.0,
+                    pnl_pct=-0.01,
+                    commission=0.1,
+                ),
+                TradeRecord(
+                    backtest_id=RUN_RSI_ID,
+                    entry_date=COMPARISON_START + timedelta(days=16),
+                    exit_date=COMPARISON_START + timedelta(days=17),
+                    direction="LONG",
+                    entry_price=100.0,
+                    exit_price=100.0,
+                    quantity=1,
+                    pnl=0.0,
+                    pnl_pct=0.0,
+                    commission=0.1,
+                ),
+            ]
+        )
+        session.commit()
+
+    frame = AnalyticsService(analytics_db).compare_runs(COMPARISON_FILTERS)
+    rsi_row = frame.loc[frame["run_id"] == RUN_RSI_ID].iloc[0]
+
+    assert rsi_row["closed_trade_count"] == 3
+    assert rsi_row["winning_trade_count"] == 1
 
 
 def test_comparison_preaggregates_children_without_trade_fan_out(
@@ -143,6 +228,7 @@ def test_comparison_returns_empty_frame_with_exact_contract_dtypes(analytics_db:
         "metric_total_trades": "Float64",
         "reported_total_return": "Float64",
         "closed_trade_count": "Int64",
+        "winning_trade_count": "Int64",
         "cumulative_trade_pnl": "Float64",
         "closed_trade_commission": "Float64",
         "latest_equity": "Float64",
@@ -179,7 +265,12 @@ def test_validate_frame_returns_normalized_copy_without_mutating_input(
 
 @pytest.mark.parametrize(
     ("column", "invalid_value"),
-    (("initial_capital", 0.0), ("closed_trade_count", -1), ("closed_trade_commission", -0.01)),
+    (
+        ("initial_capital", 0.0),
+        ("closed_trade_count", -1),
+        ("winning_trade_count", -1),
+        ("closed_trade_commission", -0.01),
+    ),
 )
 def test_validate_frame_rejects_positive_and_nonnegative_constraint_violations(
     analytics_db: Engine, column: str, invalid_value: float

@@ -12,6 +12,7 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import inspect
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 from alembic import command
 from src.db.database import create_db_engine
@@ -475,6 +476,10 @@ def verify_schema_current(engine: Engine) -> None:
 
 def _database_argument_to_url(database: str) -> str:
     if "://" in database:
+        if not database.startswith("sqlite://"):
+            raise argparse.ArgumentTypeError(
+                "expected a filesystem path or sqlite:// URL"
+            )
         return database
     return f"sqlite:///{Path(database).expanduser().resolve()}"
 
@@ -482,14 +487,23 @@ def _database_argument_to_url(database: str) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run an explicit migration and print its classified state and applied actions."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", required=True, help="SQLite database path or SQLAlchemy URL")
+    parser.add_argument(
+        "--database",
+        required=True,
+        type=_database_argument_to_url,
+        help="SQLite database filesystem path or sqlite:// URL",
+    )
     arguments = parser.parse_args(argv)
-    database_url = _database_argument_to_url(arguments.database)
-    engine = create_db_engine(database_url)
+    database_url = str(arguments.database)
     try:
-        assessment = assess_schema(engine)
-    finally:
-        engine.dispose()
+        engine = create_db_engine(database_url)
+        try:
+            assessment = assess_schema(engine)
+        finally:
+            engine.dispose()
+    except (SQLAlchemyError, OSError):
+        print("Unable to open or assess the SQLite database.", file=sys.stderr)
+        return 1
     print(f"state={assessment.state.value}")
     print(f"current_revision={assessment.current_revision or 'unversioned'}")
     try:

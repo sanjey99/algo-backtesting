@@ -326,6 +326,28 @@ def test_existing_comparison_artifact_is_exit_2_without_partial_overwrite(
     assert not metadata_path.exists()
 
 
+@pytest.mark.parametrize("database_output", ["csv", "metadata"])
+def test_compare_rejects_database_as_output_even_with_force(
+    analytics_db: Engine,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    database_output: str,
+) -> None:
+    """Force must never let either comparison artifact replace the source database."""
+    database = _database_path(analytics_db)
+    original_database = database.read_bytes()
+    csv_path = database if database_output == "csv" else tmp_path / "comparison.csv"
+    metadata_path = database if database_output == "metadata" else tmp_path / "comparison.json"
+
+    assert sql_cli.main([*_compare_args(database, csv_path, metadata_path), "--force"]) == 2
+    assert database.read_bytes() == original_database
+    companion = metadata_path if database_output == "csv" else csv_path
+    assert not companion.exists()
+    stderr = capsys.readouterr().err
+    assert "artifact destination conflicts with database" in stderr
+    assert str(database) not in stderr
+
+
 @pytest.mark.parametrize("blocked_output", ["csv", "metadata"])
 def test_compare_prevalidates_invalid_output_parent_before_database_work(
     analytics_db: Engine,
@@ -412,6 +434,64 @@ def test_validate_writes_versioned_report_and_force_controls_overwrite(
     assert sql_cli.main(args) == 2
     assert out.read_bytes() == original
     assert sql_cli.main([*args, "--force"]) == 0
+
+
+def test_validate_rejects_database_as_output_even_with_force(
+    analytics_db: Engine, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Force must never let a validation report replace the source database."""
+    database = _database_path(analytics_db)
+    original_database = database.read_bytes()
+
+    code = sql_cli.main(
+        [
+            "validate",
+            "--database",
+            str(database),
+            "--out",
+            str(database),
+            "--force",
+        ]
+    )
+
+    assert code == 2
+    assert database.read_bytes() == original_database
+    stderr = capsys.readouterr().err
+    assert "artifact destination conflicts with database" in stderr
+    assert str(database) not in stderr
+
+
+def test_validate_rejects_case_variant_database_alias_even_with_force(
+    analytics_db: Engine, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Filesystem identity must protect case aliases that string resolution cannot detect."""
+    database = _database_path(analytics_db)
+    case_variant = database.with_name(database.name.upper())
+    try:
+        aliases_database = case_variant.samefile(database)
+    except OSError:
+        aliases_database = False
+    if not aliases_database:
+        pytest.skip("filesystem is case-sensitive")
+    original_database = database.read_bytes()
+
+    code = sql_cli.main(
+        [
+            "validate",
+            "--database",
+            str(database),
+            "--out",
+            str(case_variant),
+            "--force",
+        ]
+    )
+
+    assert code == 2
+    assert database.read_bytes() == original_database
+    stderr = capsys.readouterr().err
+    assert "artifact destination conflicts with database" in stderr
+    assert str(database) not in stderr
+    assert str(case_variant) not in stderr
 
 
 def test_validate_preflight_creates_missing_output_directories(

@@ -151,6 +151,9 @@ def _allow_subcommand_verbose(parser: argparse.ArgumentParser) -> None:
 def _run_compare(arguments: argparse.Namespace) -> int:
     if arguments.start >= arguments.end:
         raise _InvalidCliInputError("start date must be before end date")
+    _reject_database_destination_collisions(
+        arguments.database, (arguments.csv, arguments.metadata)
+    )
     preflight_artifact_destinations(
         (arguments.csv, arguments.metadata), bool(arguments.force)
     )
@@ -189,6 +192,7 @@ def _run_compare(arguments: argparse.Namespace) -> int:
 
 
 def _run_validate(arguments: argparse.Namespace) -> int:
+    _reject_database_destination_collisions(arguments.database, (arguments.out,))
     preflight_artifact_destinations((arguments.out,), bool(arguments.force))
     engine = create_db_engine(_sqlite_url(arguments.database))
     try:
@@ -281,6 +285,26 @@ def _output_path(value: str) -> Path:
     if path.exists() and not path.is_file():
         raise argparse.ArgumentTypeError("output path must not be a directory")
     return path
+
+
+def _reject_database_destination_collisions(
+    database: Path, destinations: tuple[Path, ...]
+) -> None:
+    if any(_paths_refer_to_same_file(database, destination) for destination in destinations):
+        raise _InvalidCliInputError("artifact destination conflicts with database")
+
+
+def _paths_refer_to_same_file(database: Path, destination: Path) -> bool:
+    try:
+        if database.resolve(strict=False) == destination.resolve(strict=False):
+            return True
+        if not destination.exists():
+            return False
+        return destination.samefile(database)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise ArtifactPathError("Artifact destination identity could not be verified") from error
 
 
 def _nonempty_text(value: str) -> str:

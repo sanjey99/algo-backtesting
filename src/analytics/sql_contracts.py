@@ -182,6 +182,7 @@ COMPARISON_CONTRACT = ResultContract(
         ColumnSpec("metric_total_trades", ColumnKind.FLOAT, True, minimum=0.0),
         ColumnSpec("reported_total_return", ColumnKind.FLOAT, True),
         ColumnSpec("closed_trade_count", ColumnKind.INTEGER, False, minimum=0.0),
+        ColumnSpec("winning_trade_count", ColumnKind.INTEGER, False, minimum=0.0),
         ColumnSpec("cumulative_trade_pnl", ColumnKind.FLOAT, False),
         ColumnSpec("closed_trade_commission", ColumnKind.FLOAT, False, minimum=0.0),
         ColumnSpec("latest_equity", ColumnKind.FLOAT, True),

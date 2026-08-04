@@ -41,15 +41,20 @@ pip install -e ".[dev]"
 # 2. Run tests
 pytest --tb=short
 
-# 3. Run the API server
+# 3. Migrate the default SQLite database before application startup
+python -m src.db.migrate --database data/backtester.db
+
+# 4. Run the API server
 uvicorn src.api.main:app --reload
 
-# 4. Run the dashboard
+# 5. Run the dashboard
 streamlit run src/dashboard/app.py
-
-# 5. Apply DB migrations
-alembic upgrade head
 ```
+
+The migration command above classifies existing SQLite schemas and safely handles fresh,
+unversioned-baseline, and versioned databases. Use plain `alembic upgrade head` only when Alembic
+is already configured to target the intended fresh or correctly versioned database; it does not
+provide the classifier's safeguards for an unversioned legacy schema.
 
 ## Tech Stack
 

@@ -237,6 +237,46 @@ def test_cli_cleanly_refuses_malformed_version_metadata(tmp_path: Path) -> None:
     assert _schema_snapshot(path) == before
 
 
+def test_cli_rejects_non_sqlite_url_without_disclosing_credentials() -> None:
+    """Operator input validation must not reflect credentials from unsupported URLs."""
+    redaction_marker = "do-not-echo-marker-42"
+    database_url = f"postgresql://operator:{redaction_marker}@localhost/backtests"
+
+    result = subprocess.run(
+        [sys.executable, "-m", "src.db.migrate", "--database", database_url],
+        cwd=PROJECT_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "filesystem path or sqlite:// URL" in result.stderr
+    assert redaction_marker not in result.stdout
+    assert redaction_marker not in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_cli_sanitizes_initial_sqlite_open_failure(tmp_path: Path) -> None:
+    """An initial connection failure must not expose driver details or local paths."""
+    path = tmp_path / "missing-parent" / "private-database-name.db"
+
+    result = subprocess.run(
+        [sys.executable, "-m", "src.db.migrate", "--database", str(path)],
+        cwd=PROJECT_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr.strip() == "Unable to open or assess the SQLite database."
+    assert str(path) not in result.stderr
+    assert "OperationalError" not in result.stderr
+    assert "Traceback" not in result.stderr
+
+
 def test_versioned_baseline_and_current_have_closed_states(tmp_path: Path) -> None:
     """Conflating baseline and head would skip required hardening."""
     baseline_path = tmp_path / "baseline.db"

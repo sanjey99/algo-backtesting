@@ -145,7 +145,7 @@ do not support a blanket performance claim.
 Validation of the preserved hardened database wrote schema `1.0` with `26` findings, all `PASS`,
 and independently observed the same four table counts. Comparison metadata wrote schema `1.0`,
 contract `1.0`, `contract_valid: true`, and `row_count: 150`; the CSV header is the declared
-26-column comparison contract and the data grain remains one row per run.
+27-column comparison contract and the data grain remains one row per run.
 
 ## Evidence audit
 
@@ -183,8 +183,30 @@ jq '{schema_version, contract_version, contract_valid, row_count, ordered_column
 Migration state behavior is exercised by
 `pytest -q tests/sql_analytics/test_legacy_migration.py tests/sql_analytics/test_migrations.py`.
 Installed migration and query execution is exercised by
-`pytest -q tests/sql_analytics/test_packaging.py`. The complete repository gate is `pytest -q`,
-`ruff check src tests`, `mypy src --strict --python-version 3.12`, and `uv build`.
+`pytest -q tests/sql_analytics/test_packaging.py`. The feature-scoped static checks are:
+
+```bash
+.venv/bin/ruff check \
+  alembic/env.py alembic/versions \
+  src/analytics/sql_artifacts.py src/analytics/sql_benchmark.py \
+  src/analytics/sql_catalog.py src/analytics/sql_cli.py \
+  src/analytics/sql_contracts.py src/analytics/sql_service.py \
+  src/api/main.py src/db/database.py src/db/migrate.py src/db/tables.py \
+  tests/sql_analytics tests/test_api.py
+
+.venv/bin/mypy \
+  src/analytics/sql_artifacts.py src/analytics/sql_benchmark.py \
+  src/analytics/sql_catalog.py src/analytics/sql_cli.py \
+  src/analytics/sql_contracts.py src/analytics/sql_service.py \
+  src/api/main.py src/db/database.py src/db/migrate.py src/db/tables.py \
+  --strict --python-version 3.12
+```
+
+Both scoped commands are clean. The broader repository commands are not clean and are not claimed
+as passing gates for this feature: `ruff check src tests` reports the pre-existing baseline of 50
+findings in legacy non-feature modules and tests, including the API, dashboard, and data surfaces;
+`mypy src --strict --python-version 3.12` reports 34 errors in four legacy API, dashboard, and data
+files. These counts document existing repository debt separately from the SQL analytics layer.
 
 ## Limitations
 
