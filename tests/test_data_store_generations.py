@@ -165,6 +165,26 @@ def test_unreferenced_generation_is_never_read(tmp_path: Path) -> None:
     assert result.frame is None
 
 
+def test_reader_rejects_a_symbolic_generation_container(tmp_path: Path) -> None:
+    store = DataStore(
+        tmp_path,
+        calendar_versions={"calendar_version": "test-1"},
+        generation_id_factory=lambda: "generation-1",
+    )
+    request = _request()
+    store.publish_generation(request, _frame(), {}, _manifest(request))
+    namespace = store.generation_namespace(request)
+    generations = namespace / "generations"
+    external_generations = tmp_path / "external-generations"
+    generations.rename(external_generations)
+    generations.symlink_to(external_generations, target_is_directory=True)
+
+    result = store.read_generation(request)
+
+    assert result.status is CacheStatus.INVALIDATED
+    assert result.frame is None
+
+
 def test_failure_before_pointer_replace_preserves_previous_generation(tmp_path: Path) -> None:
     request = _request()
     first = DataStore(
@@ -381,3 +401,55 @@ def test_archive_failure_pins_falls_back_and_maintenance_unpins(tmp_path: Path) 
     assert store.maintain_manifest_archive() == ()
     assert repository.lookup("request-1") == first.manifest.to_dict()
     assert not (store.generation_namespace(request) / "pins" / "generation-1.json").exists()
+
+
+def test_pinned_manifest_lookup_rejects_a_tampered_redirect_path(tmp_path: Path) -> None:
+    repository = _SelectiveFailureRepository(tmp_path / "reports", {"request-1"})
+    store = DataStore(
+        tmp_path / "cache",
+        calendar_versions={"calendar_version": "test-1"},
+        generation_id_factory=lambda: "generation-1",
+        manifest_repository=repository,
+    )
+    request = _request()
+    publication = store.publish_generation(request, _frame(), {}, _manifest(request))
+    namespace = store.generation_namespace(request)
+    pin_path = namespace / "pins" / "generation-1.json"
+    redirected_manifest = tmp_path / "redirected-manifest.json"
+    redirected_manifest.write_text(json.dumps(publication.manifest.to_dict()))
+    pin = json.loads(pin_path.read_text())
+    pin["manifest_path"] = str(redirected_manifest)
+    pin_path.write_text(json.dumps(pin))
+
+    assert store.lookup_manifest("request-1") is None
+
+
+@pytest.mark.parametrize("identity", ("acquisition", "generation"))
+def test_manifest_maintenance_keeps_pin_for_embedded_identity_mismatch(
+    tmp_path: Path,
+    identity: str,
+) -> None:
+    repository = _SelectiveFailureRepository(tmp_path / "reports", {"request-1"})
+    store = DataStore(
+        tmp_path / "cache",
+        calendar_versions={"calendar_version": "test-1"},
+        generation_id_factory=lambda: "generation-1",
+        manifest_repository=repository,
+    )
+    request = _request()
+    store.publish_generation(request, _frame(), {}, _manifest(request))
+    namespace = store.generation_namespace(request)
+    embedded_manifest = namespace / "generations" / "generation-1" / "acquisition-manifest.json"
+    document = json.loads(embedded_manifest.read_text())
+    if identity == "acquisition":
+        document["acquisition_id"] = "different-request"
+    else:
+        document["cache"]["generation_id"] = "different-generation"
+    embedded_manifest.write_text(json.dumps(document))
+    repository.failed_ids.clear()
+
+    warnings = store.maintain_manifest_archive()
+
+    assert warnings == ("manifest archival retry failed: ValueError",)
+    assert repository.lookup("request-1") is None
+    assert (namespace / "pins" / "generation-1.json").is_file()

@@ -9,7 +9,7 @@ import os
 import re
 import shutil
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
@@ -286,15 +286,17 @@ class DataStore:
             archived = self._manifest_repository.lookup(acquisition_id)
             if archived is not None:
                 return archived
-        for pin in self._cache_dir.glob(f"{CONTRACT_VERSION}/*/*/*/pins/*.json"):
+        for namespace, pin_path in self._pin_paths():
             try:
-                pin_document = _load_json(pin)
-                if pin_document.get("acquisition_id") != acquisition_id:
+                generation_id, pinned_acquisition_id = self._load_pin(namespace, pin_path)
+                if pinned_acquisition_id != acquisition_id:
                     continue
-                embedded = Path(str(pin_document["manifest_path"]))
-                document = _load_json(embedded)
-                if document.get("acquisition_id") == acquisition_id:
-                    return cast(dict[str, Any], json.loads(json.dumps(document)))
+                document = self._pinned_embedded_manifest(
+                    namespace,
+                    generation_id,
+                    pinned_acquisition_id,
+                )
+                return cast(dict[str, Any], json.loads(json.dumps(document)))
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 continue
         return None
@@ -304,15 +306,13 @@ class DataStore:
         if self._manifest_repository is None:
             return ("manifest maintenance skipped because no repository is configured",)
         warnings: list[str] = []
-        for pin in self._cache_dir.glob(f"{CONTRACT_VERSION}/*/*/*/pins/*.json"):
+        for namespace, pin_path in self._pin_paths():
             try:
-                pin_document = _load_json(pin)
-                manifest_path = Path(str(pin_document["manifest_path"]))
-                document = _load_json(manifest_path)
-                acquisition_id = str(pin_document["acquisition_id"])
+                generation_id, acquisition_id = self._load_pin(namespace, pin_path)
+                document = self._pinned_embedded_manifest(namespace, generation_id, acquisition_id)
                 self._manifest_repository.archive_document(acquisition_id, document)
-                pin.unlink()
-                _fsync_directory(pin.parent)
+                pin_path.unlink()
+                _fsync_directory(pin_path.parent)
             except Exception as error:
                 # Artifact exceptions are intentionally secondary during maintenance.
                 warnings.append(f"manifest archival retry failed: {type(error).__name__}")
@@ -420,16 +420,57 @@ class DataStore:
     def _pin(self, namespace: Path, generation_id: str, acquisition_id: str) -> None:
         pins = namespace / "pins"
         pins.mkdir(parents=True, exist_ok=True)
-        manifest_path = namespace / "generations" / generation_id / "acquisition-manifest.json"
         _write_json(
             pins / f"{generation_id}.json",
             {
+                "schema_version": _POINTER_SCHEMA_VERSION,
                 "generation_id": generation_id,
                 "acquisition_id": acquisition_id,
-                "manifest_path": str(manifest_path),
             },
         )
         _fsync_directory(pins)
+
+    def _pin_paths(self) -> Iterator[tuple[Path, Path]]:
+        pattern = f"{CONTRACT_VERSION}/*/*/*/pins/*.json"
+        for pin_path in self._cache_dir.glob(pattern):
+            yield pin_path.parent.parent, pin_path
+
+    def _load_pin(self, namespace: Path, pin_path: Path) -> tuple[str, str]:
+        if pin_path.is_symlink() or pin_path.parent.is_symlink():
+            raise ValueError("generation pin must not be symbolic")
+        if pin_path.parent.name != "pins":
+            raise ValueError("generation pin has an invalid namespace")
+        self._validate_namespace_path(namespace)
+        document = _load_json(pin_path)
+        if set(document) != {"schema_version", "generation_id", "acquisition_id"}:
+            raise ValueError("generation pin has an invalid schema")
+        if document["schema_version"] != _POINTER_SCHEMA_VERSION:
+            raise ValueError("generation pin schema version is incompatible")
+        generation_id = _validate_generation_id(document["generation_id"])
+        acquisition_id = _validate_acquisition_id(document["acquisition_id"])
+        if pin_path.stem != generation_id:
+            raise ValueError("generation pin identity does not match its filename")
+        return generation_id, acquisition_id
+
+    def _pinned_embedded_manifest(
+        self,
+        namespace: Path,
+        generation_id: str,
+        acquisition_id: str,
+    ) -> dict[str, Any]:
+        generation = self._referenced_generation_path(namespace, generation_id)
+        manifest_path = generation / "acquisition-manifest.json"
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise ValueError("pinned embedded manifest is unavailable")
+        document = _load_json(manifest_path)
+        cache = document.get("cache")
+        if (
+            document.get("acquisition_id") != acquisition_id
+            or not isinstance(cache, Mapping)
+            or cache.get("generation_id") != generation_id
+        ):
+            raise ValueError("pinned embedded manifest identities are incompatible")
+        return document
 
     def _pinned_generation_ids(self, namespace: Path) -> set[str]:
         pins = namespace / "pins"
@@ -438,6 +479,35 @@ class DataStore:
         return {
             path.stem for path in pins.glob("*.json") if _SAFE_GENERATION_ID.fullmatch(path.stem)
         }
+
+    def _validate_namespace_path(self, namespace: Path) -> None:
+        try:
+            relative = namespace.relative_to(self._cache_dir)
+        except ValueError as error:
+            raise ValueError("cache namespace escapes the configured cache root") from error
+        if len(relative.parts) != 4 or relative.parts[0] != CONTRACT_VERSION:
+            raise ValueError("cache namespace has an invalid layout")
+        current = self._cache_dir
+        for component in relative.parts:
+            current /= component
+            if current.is_symlink():
+                raise ValueError("cache namespace must not contain symbolic components")
+
+    def _referenced_generation_path(self, namespace: Path, generation_id: str) -> Path:
+        self._validate_namespace_path(namespace)
+        generations = namespace / "generations"
+        if generations.is_symlink() or not generations.is_dir():
+            raise ValueError("generation container is missing or symbolic")
+        generation = generations / generation_id
+        if generation.is_symlink() or not generation.is_dir():
+            raise ValueError("referenced generation is missing or symbolic")
+        try:
+            resolved_generation = generation.resolve(strict=True)
+            resolved_namespace = namespace.resolve(strict=True)
+            resolved_generation.relative_to(resolved_namespace)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ValueError("referenced generation escapes its cache namespace") from error
+        return generation
 
     def _load_pointer(self, namespace: Path, *, required: bool = False) -> dict[str, Any] | None:
         path = namespace / "CURRENT.json"
@@ -489,9 +559,7 @@ class DataStore:
         pointer: Mapping[str, Any],
     ) -> CacheReadResult:
         generation_id = cast(str, pointer["generation_id"])
-        generation = namespace / "generations" / generation_id
-        if not generation.is_dir() or generation.is_symlink():
-            raise ValueError("referenced generation is missing")
+        generation = self._referenced_generation_path(namespace, generation_id)
         artifacts = cast(Mapping[str, Mapping[str, str]], pointer["artifacts"])
         for name in _ARTIFACT_NAMES:
             path = namespace / artifacts[name]["path"]
@@ -572,6 +640,12 @@ class DataStore:
 def _validate_generation_id(value: object) -> str:
     if not isinstance(value, str) or not _SAFE_GENERATION_ID.fullmatch(value):
         raise ValueError("generation identifier uses an unsafe path grammar")
+    return value
+
+
+def _validate_acquisition_id(value: object) -> str:
+    if not isinstance(value, str) or not _SAFE_GENERATION_ID.fullmatch(value):
+        raise ValueError("acquisition identifier uses an unsafe path grammar")
     return value
 
 
