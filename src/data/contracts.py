@@ -407,6 +407,7 @@ class AcquisitionManifest:
     environment_versions: Mapping[str, str] = field(default_factory=dict)
     cache: CacheEvidence = field(default_factory=lambda: CacheEvidence(CacheStatus.MISS))
     attempts: tuple[AttemptEvidence, ...] = ()
+    provider_skips: Mapping[str, str] = field(default_factory=dict)
     findings: tuple[QualityFinding, ...] = ()
     rejected_rows: tuple[RejectedRow, ...] = ()
     lineage: tuple[LineageSegment, ...] = ()
@@ -424,6 +425,7 @@ class AcquisitionManifest:
             _freeze_metadata(self.environment_versions),
         )
         object.__setattr__(self, "counters", _freeze_metadata(self.counters))
+        object.__setattr__(self, "provider_skips", _freeze_metadata(self.provider_skips))
 
     def to_dict(self) -> dict[str, Any]:
         return cast(dict[str, Any], json_safe(self))

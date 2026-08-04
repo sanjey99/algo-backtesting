@@ -37,6 +37,7 @@ from src.data.contracts import (
 from src.data.fetcher import DataFetcher
 from src.data.manifest import ManifestRepository
 from src.data.normalization import CANONICAL_COLUMNS, NUMERIC_COLUMNS
+from src.data.quality import action_signature
 
 _ARTIFACT_NAMES = (
     "bars.parquet",
@@ -104,6 +105,11 @@ class DataStore:
         self._replace_file = replace_file or os.replace
         self._manifest_repository = manifest_repository
         self._conflict_probe = conflict_probe
+
+    @property
+    def archives_publications(self) -> bool:
+        """Whether successful publications are archived as part of store commit handling."""
+        return self._manifest_repository is not None
 
     # Legacy exact-range API retained until the route migration is complete.
     def _cache_path(self, symbol: str, start: datetime, end: datetime) -> Path:
@@ -183,6 +189,7 @@ class DataStore:
         *,
         base_generation_id: str | None = None,
         revalidate: Callable[[pd.DataFrame], bool | pd.DataFrame] | None = None,
+        replace_ranges: tuple[tuple[date, date], ...] = (),
     ) -> GenerationPublication:
         """Compare/rebase/validate/publish under a bounded cross-process lock."""
         if manifest.request != request:
@@ -207,12 +214,24 @@ class DataStore:
                 assembled = candidate.copy(deep=True)
                 publication_manifest = manifest
                 if expected_base != latest_id and latest.frame is not None:
-                    assembled = _merge_canonical(latest.frame, assembled)
+                    incoming = (
+                        _rows_in_ranges(assembled, replace_ranges) if replace_ranges else assembled
+                    )
+                    assembled = _merge_canonical(latest.frame, incoming)
                     if latest.manifest is None:
                         raise CachePublicationError("current cache generation has no manifest")
                     publication_manifest = replace(
                         manifest,
-                        lineage=_merge_lineage(latest.manifest, manifest.lineage),
+                        lineage=(
+                            _rebase_lineage(
+                                latest.manifest,
+                                manifest.lineage,
+                                assembled,
+                                replace_ranges,
+                            )
+                            if replace_ranges
+                            else _merge_lineage(latest.manifest, manifest.lineage)
+                        ),
                     )
                 _validate_canonical(assembled, request)
                 if revalidate is not None:
@@ -576,7 +595,7 @@ class DataStore:
         if (
             manifest.get("schema_version") != CONTRACT_VERSION
             or manifest.get("status") not in {"success", "partial_success"}
-            or manifest.get("request") != request.to_dict()
+            or not _manifest_namespace_compatible(manifest.get("request"), request)
             or not isinstance(cache_document, dict)
             or cache_document.get("generation_id") != generation_id
             or cache_document.get("cache_key") != str(namespace.relative_to(self._cache_dir))
@@ -620,7 +639,7 @@ class DataStore:
             manifest = _load_json(generation / "acquisition-manifest.json")
             if (
                 manifest.get("schema_version") != CONTRACT_VERSION
-                or manifest.get("request") != request.to_dict()
+                or not _manifest_namespace_compatible(manifest.get("request"), request)
                 or manifest.get("output_hash") != _sha256_file(generation / "bars.parquet")
             ):
                 return False
@@ -668,8 +687,6 @@ def _validate_canonical(frame: pd.DataFrame, request: AcquisitionRequest) -> Non
         raise ContractViolationError("canonical cache symbol is incompatible")
     if not set(frame["source"].astype(str)) <= {provider.value for provider in Provider}:
         raise ContractViolationError("canonical cache source is incompatible")
-    if timestamps[0].date() < request.start or timestamps[-1].date() > request.end:
-        raise ContractViolationError("canonical cache timestamps are out of range")
     for _, row in frame.iterrows():
         values = {column: float(row[column]) for column in NUMERIC_COLUMNS}
         if not all(math.isfinite(value) for value in values.values()):
@@ -690,6 +707,28 @@ def _merge_canonical(current: pd.DataFrame, candidate: pd.DataFrame) -> pd.DataF
     merged = pd.concat([current.copy(deep=True), candidate.copy(deep=True)], ignore_index=True)
     merged = merged.drop_duplicates("timestamp", keep="last")
     return merged.sort_values("timestamp", kind="mergesort").reset_index(drop=True)
+
+
+def _rows_in_ranges(
+    frame: pd.DataFrame,
+    ranges: tuple[tuple[date, date], ...],
+) -> pd.DataFrame:
+    timestamps = pd.DatetimeIndex(frame["timestamp"])
+    selected = pd.Series(False, index=frame.index)
+    for start, end in ranges:
+        selected |= (timestamps >= pd.Timestamp(start)) & (timestamps <= pd.Timestamp(end))
+    return frame.loc[selected].copy(deep=True).reset_index(drop=True)
+
+
+def _manifest_namespace_compatible(value: object, request: AcquisitionRequest) -> bool:
+    """Check only fields that form the symbol-level generation namespace."""
+    if not isinstance(value, Mapping):
+        return False
+    return (
+        value.get("symbol") == request.symbol
+        and value.get("interval") == request.interval
+        and value.get("calendar") == request.calendar
+    )
 
 
 def _merge_lineage(
@@ -723,6 +762,63 @@ def _merge_lineage(
             ),
         )
     )
+
+
+def _rebase_lineage(
+    existing_manifest: Mapping[str, Any],
+    incoming: tuple[LineageSegment, ...],
+    assembled: pd.DataFrame,
+    replace_ranges: tuple[tuple[date, date], ...],
+) -> tuple[LineageSegment, ...]:
+    existing = _lineage_from_document(existing_manifest.get("lineage", []))
+    provenance: list[tuple[Provider, datetime, ActionCoverage, date, date, str]] = []
+    for timestamp_value in assembled["timestamp"]:
+        timestamp = pd.Timestamp(timestamp_value).date()
+        refreshed = any(start <= timestamp <= end for start, end in replace_ranges)
+        candidates = incoming if refreshed else existing
+        segment = next(
+            (item for item in candidates if item.start <= timestamp <= item.end),
+            None,
+        )
+        if segment is None:
+            raise CachePublicationError("rebased cache lineage does not cover every row")
+        provenance.append(
+            (
+                segment.provider,
+                segment.acquired_at,
+                segment.action_coverage,
+                segment.start,
+                segment.end,
+                segment.content_hash,
+            )
+        )
+
+    result: list[LineageSegment] = []
+    first = 0
+    for index in range(1, len(assembled) + 1):
+        if index < len(assembled) and provenance[index] == provenance[first]:
+            continue
+        frame = assembled.iloc[first:index].copy(deep=True).reset_index(drop=True)
+        provider, acquired_at, action_coverage, _, _, _ = provenance[first]
+        result.append(
+            LineageSegment(
+                pd.Timestamp(frame.iloc[0]["timestamp"]).date(),
+                pd.Timestamp(frame.iloc[-1]["timestamp"]).date(),
+                provider,
+                acquired_at,
+                action_coverage,
+                hashlib.sha256(
+                    frame.to_json(
+                        orient="records",
+                        date_format="iso",
+                        double_precision=15,
+                    ).encode()
+                ).hexdigest(),
+                action_signature(frame),
+            )
+        )
+        first = index
+    return tuple(result)
 
 
 def _lineage_from_document(value: object) -> tuple[LineageSegment, ...]:

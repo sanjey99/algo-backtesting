@@ -69,6 +69,23 @@ class RetryExecutor:
 
     def execute(self, provider: Provider, operation: Callable[[], T]) -> RetryResult[T]:
         """Run an operation and return immutable evidence when it succeeds."""
+        return self._execute(provider, operation, lambda _attempt: None)
+
+    def execute_observed(
+        self,
+        provider: Provider,
+        operation: Callable[[], T],
+        observer: Callable[[AttemptEvidence], None],
+    ) -> RetryResult[T]:
+        """Run with an injected immutable-attempt observer, including terminal failures."""
+        return self._execute(provider, operation, observer)
+
+    def _execute(
+        self,
+        provider: Provider,
+        operation: Callable[[], T],
+        observer: Callable[[AttemptEvidence], None],
+    ) -> RetryResult[T]:
         attempts: list[AttemptEvidence] = []
         for number in range(1, self._policy.max_attempts + 1):
             started_at = self._clock()
@@ -81,32 +98,43 @@ class RetryExecutor:
                     classification is not FailureClassification.RETRYABLE
                     or number == self._policy.max_attempts
                 ):
+                    observer(
+                        AttemptEvidence(
+                            provider=provider,
+                            attempt_number=number,
+                            started_at=started_at,
+                            duration_seconds=duration,
+                            outcome="failed",
+                            error_type=type(error).__name__,
+                            error_message=str(error),
+                        )
+                    )
                     raise
                 delay = self._delay_seconds(number, error)
-                attempts.append(
-                    AttemptEvidence(
-                        provider=provider,
-                        attempt_number=number,
-                        started_at=started_at,
-                        duration_seconds=duration,
-                        outcome="retry",
-                        retry_delay_seconds=delay,
-                        error_type=type(error).__name__,
-                        error_message=str(error),
-                    )
-                )
-                self._sleeper(delay)
-                continue
-            duration = max(0.0, (self._clock() - started_at).total_seconds())
-            attempts.append(
-                AttemptEvidence(
+                attempt = AttemptEvidence(
                     provider=provider,
                     attempt_number=number,
                     started_at=started_at,
                     duration_seconds=duration,
-                    outcome="success",
+                    outcome="retry",
+                    retry_delay_seconds=delay,
+                    error_type=type(error).__name__,
+                    error_message=str(error),
                 )
+                attempts.append(attempt)
+                observer(attempt)
+                self._sleeper(delay)
+                continue
+            duration = max(0.0, (self._clock() - started_at).total_seconds())
+            attempt = AttemptEvidence(
+                provider=provider,
+                attempt_number=number,
+                started_at=started_at,
+                duration_seconds=duration,
+                outcome="success",
             )
+            attempts.append(attempt)
+            observer(attempt)
             return RetryResult(value=value, attempts=tuple(attempts))
         raise DataAcquisitionError("retry loop terminated unexpectedly")
 

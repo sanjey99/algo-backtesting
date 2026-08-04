@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from importlib.metadata import version
 from types import MappingProxyType
 from typing import Protocol
@@ -25,6 +25,12 @@ class MarketCalendar(Protocol):
     ) -> pd.DatetimeIndex: ...
 
     def version_evidence(self) -> Mapping[str, str]: ...
+
+    def session_closes(
+        self,
+        start: date | datetime,
+        end: date | datetime,
+    ) -> Mapping[pd.Timestamp, datetime]: ...
 
 
 def _as_date(value: date | datetime) -> date:
@@ -56,6 +62,25 @@ class XNYSCalendar:
                 "calendar": self.calendar_id,
                 "calendar_version": version("pandas_market_calendars"),
                 "pandas_market_calendars": version("pandas_market_calendars"),
+            }
+        )
+
+    def session_closes(
+        self,
+        start: date | datetime,
+        end: date | datetime,
+    ) -> Mapping[pd.Timestamp, datetime]:
+        """Return normalized session labels mapped to scheduled UTC closes."""
+        schedule = self._calendar.schedule(
+            start_date=_as_date(start),
+            end_date=_as_date(end),
+        )
+        return MappingProxyType(
+            {
+                pd.Timestamp(label).tz_localize(None).normalize(): pd.Timestamp(close)
+                .tz_convert(UTC)
+                .to_pydatetime()
+                for label, close in schedule["market_close"].items()
             }
         )
 
