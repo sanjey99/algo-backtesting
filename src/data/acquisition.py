@@ -39,7 +39,7 @@ from src.data.manifest import ManifestRepository
 from src.data.normalization import CANONICAL_COLUMNS, normalize_provider_batch
 from src.data.providers.base import ProviderEligibility
 from src.data.quality import action_signature, evaluate_complete_request, evaluate_range_candidate
-from src.data.retry import RetryExecutor
+from src.data.retry import FailureClassification, RetryExecutor
 from src.data.store import CacheReadResult, DataStore, GenerationPublication
 
 
@@ -148,7 +148,7 @@ class AcquisitionService:
             cache_status, planned = self._plan_ranges(
                 request, expected, cache, requested_cached, now
             )
-        except DataAcquisitionError as error:
+        except Exception as error:
             self._archive_failure(
                 admission.acquisition_id,
                 request,
@@ -259,13 +259,15 @@ class AcquisitionService:
             self._archive_publication_if_needed(publication)
             result_frame = self._requested_frame(publication.frame, expected)
             return AcquisitionResult(result_frame, publication.manifest)
-        except DataAcquisitionError as error:
+        except Exception as error:
             self._archive_failure(
                 admission.acquisition_id, request, started_at, cache_status, cache, evidence, error
             )
             if isinstance(error, (InvalidRequestError, ContractViolationError, CacheError)):
                 raise
             if isinstance(error, NoUsableDataError):
+                raise
+            if self._retry.classify(error) is FailureClassification.TERMINAL:
                 raise
             raise NoUsableDataError("no provider supplied a complete usable result") from error
 
@@ -399,11 +401,12 @@ class AcquisitionService:
             except (InvalidRequestError, ContractViolationError):
                 raise
             except Exception as error:
+                if self._retry.classify(error) is FailureClassification.TERMINAL:
+                    raise
                 errors.append(error)
                 continue
             if batch.provider is not provider_id or batch.request != request:
-                errors.append(ContractViolationError("provider batch identity is incompatible"))
-                continue
+                raise ContractViolationError("provider batch identity is incompatible")
             quality = evaluate_range_candidate(
                 normalize_provider_batch(batch), expected, self._quality_policy
             )

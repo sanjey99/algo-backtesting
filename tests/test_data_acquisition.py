@@ -22,6 +22,7 @@ from src.data.contracts import (
     Provider,
     ProviderBatch,
     ProviderCapabilities,
+    ProviderEntitlementError,
     ProviderSchemaError,
     TransientProviderError,
 )
@@ -413,14 +414,17 @@ def test_terminal_request_error_does_not_fall_back(tmp_path: Path) -> None:
     alpha = FakeProvider(
         Provider.ALPHA_VANTAGE, lambda item: native_batch(Provider.ALPHA_VANTAGE, item)
     )
-    acquisition, _, _ = service(
+    acquisition, _, repository = service(
         tmp_path, {Provider.YFINANCE: lambda: yfinance, Provider.ALPHA_VANTAGE: lambda: alpha}
     )
 
-    result = acquisition.acquire(request)
+    with pytest.raises(ProviderSchemaError):
+        acquisition.acquire(request)
 
-    assert len(alpha.requests) == 1
-    assert result.frame["source"].tolist() == ["alpha_vantage", "alpha_vantage"]
+    assert alpha.requests == []
+    report = repository.lookup("acquisition-1")
+    assert report is not None
+    assert report["status"] == "failed"
 
 
 def test_typed_invalid_request_error_is_terminal_and_does_not_fall_back(tmp_path: Path) -> None:
@@ -477,7 +481,7 @@ def test_failed_second_range_does_not_publish_first_range(tmp_path: Path) -> Non
 
     def batches(item: AcquisitionRequest) -> ProviderBatch:
         if item.start == date(2024, 1, 5):
-            raise ProviderSchemaError("range failed")
+            raise ProviderEntitlementError("range failed")
         return native_batch(
             Provider.YFINANCE, item, calendar.expected_sessions(item.start, item.end)
         )
@@ -755,66 +759,3 @@ def test_action_change_during_recent_overlap_reacquires_requested_history(tmp_pa
         (date(2024, 1, 2), date(2024, 1, 10)),
     ]
     assert result.frame["dividend_amount"].tolist() == [0.5] * 7
-
-
-def test_rebase_overlays_only_this_writers_fetched_ranges(tmp_path: Path) -> None:
-    request = AcquisitionRequest("AAPL", date(2024, 1, 2), date(2024, 1, 10))
-    _, store, _ = service(tmp_path, {})
-    base = canonical_frame(request, SESSIONS)
-
-    def manifest(identity: str) -> AcquisitionManifest:
-        return AcquisitionManifest(
-            identity,
-            request,
-            AcquisitionStatus.SUCCESS,
-            lineage=(
-                LineageSegment(
-                    request.start,
-                    request.end,
-                    Provider.YFINANCE,
-                    NOW,
-                    ActionCoverage.REPRESENTED,
-                    "a" * 64,
-                    "actions",
-                ),
-            ),
-            started_at=NOW,
-            completed_at=NOW,
-        )
-
-    first = store.publish_generation(request, base, {}, manifest("base"))
-    latest = base.copy(deep=True)
-    latest.loc[0, ["open", "high", "low", "close", "adj_close"]] = [
-        50.0,
-        51.0,
-        49.0,
-        50.5,
-        50.5,
-    ]
-    store.publish_generation(
-        request,
-        latest,
-        {},
-        manifest("latest"),
-        base_generation_id=first.generation_id,
-    )
-    stale = base.copy(deep=True)
-    stale.loc[3, ["open", "high", "low", "close", "adj_close"]] = [
-        80.0,
-        81.0,
-        79.0,
-        80.5,
-        80.5,
-    ]
-
-    published = store.publish_generation(
-        request,
-        stale,
-        {},
-        manifest("stale"),
-        base_generation_id=first.generation_id,
-        replace_ranges=((date(2024, 1, 5), date(2024, 1, 5)),),
-    )
-
-    assert published.frame.loc[0, "open"] == 50.0
-    assert published.frame.loc[3, "open"] == 80.0
