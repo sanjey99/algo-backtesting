@@ -20,7 +20,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 app = FastAPI(
     title="Algo Backtester API",
-    description="Event-driven backtesting engine with Walk-Forward Analysis and Permutation Testing.",
+    description=(
+        "Event-driven backtesting engine with Walk-Forward Analysis and Permutation Testing."
+    ),
     version="1.0.0",
     lifespan=lifespan,
 )

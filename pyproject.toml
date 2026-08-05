@@ -39,6 +39,14 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
+artifacts = ["src/analytics/sql/**/*.sql"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"alembic.ini" = "alembic.ini"
+"alembic/env.py" = "alembic/env.py"
+"alembic/script.py.mako" = "alembic/script.py.mako"
+"alembic/versions/455406e2c7ac_initial_schema.py" = "alembic/versions/455406e2c7ac_initial_schema.py"
+"alembic/versions/20260804_01_harden_analytics_integrity.py" = "alembic/versions/20260804_01_harden_analytics_integrity.py"
 
 [tool.mypy]
 strict = true
