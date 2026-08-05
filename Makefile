@@ -10,8 +10,10 @@ SQL_COMPARISON_CSV ?= /private/tmp/algo-sql-comparison.csv
 SQL_COMPARISON_METADATA ?= /private/tmp/algo-sql-comparison.json
 SQL_BENCHMARK_DATABASE ?= /private/tmp/algo-sql-smoke.db
 SQL_BENCHMARK_REPORT ?= /private/tmp/algo-sql-smoke.json
+DATA_ARTIFACT_DIR ?= artifacts/data-demo
+DATA_ACQUISITION_ID ?=
 
-.PHONY: test lint serve dashboard report install sql-validate sql-compare sql-benchmark-smoke
+.PHONY: test lint serve dashboard report install sql-validate sql-compare sql-benchmark-smoke data-acquire-demo data-inspect-demo
 
 install:
 	$(PYTHON) -m pip install -e ".[dev]" -q
@@ -49,3 +51,9 @@ sql-compare:
 
 sql-benchmark-smoke:
 	$(PYTHON) -m src.analytics.sql_cli benchmark --runs 6 --equity-points-per-run 20 --trades-per-run 4 --warmups 1 --repetitions 3 --database-out "$(SQL_BENCHMARK_DATABASE)" --out "$(SQL_BENCHMARK_REPORT)"
+
+data-acquire-demo:
+	$(PYTHON) -m src.data.cli acquire --symbol SPY --start 2024-01-02 --end 2024-01-10 --source auto --calendar XNYS --canonical $(DATA_ARTIFACT_DIR)/spy-bars.parquet --report $(DATA_ARTIFACT_DIR)/spy-acquisition.json --cache-dir $(DATA_ARTIFACT_DIR)/cache --manifest-dir $(DATA_ARTIFACT_DIR)/reports
+
+data-inspect-demo:
+	$(PYTHON) -m src.data.cli inspect --acquisition-id $(DATA_ACQUISITION_ID) --cache-dir $(DATA_ARTIFACT_DIR)/cache --manifest-dir $(DATA_ARTIFACT_DIR)/reports

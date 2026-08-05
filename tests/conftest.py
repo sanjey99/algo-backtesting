@@ -4,7 +4,6 @@ from datetime import datetime, timedelta
 import pytest
 
 from src.models.candle import Candle
-from src.models.order import Direction
 from src.models.portfolio import Portfolio
 
 

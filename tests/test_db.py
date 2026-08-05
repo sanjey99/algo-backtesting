@@ -21,8 +21,8 @@ def db_session():
     """In-memory SQLite session for tests."""
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
-    Session = sessionmaker(bind=engine)
-    session = Session()
+    session_factory = sessionmaker(bind=engine)
+    session = session_factory()
     yield session
     session.close()
 
@@ -122,15 +122,15 @@ class TestCRUD:
         """Data saved in one session is visible in a fresh session (R-17)."""
         engine = create_engine("sqlite:///:memory:")
         Base.metadata.create_all(engine)
-        SessionFactory = sessionmaker(bind=engine)
+        session_factory = sessionmaker(bind=engine)
 
         # Write session
-        session1 = SessionFactory()
+        session1 = session_factory()
         run_id = save_backtest_run(session1, **SAMPLE_RUN)
         session1.close()
 
         # Read session — completely fresh
-        session2 = SessionFactory()
+        session2 = session_factory()
         session2.expire_all()  # force real DB round-trip
         run = get_backtest_run(session2, run_id)
         assert run is not None

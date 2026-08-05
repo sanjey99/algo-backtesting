@@ -16,7 +16,9 @@ from src.strategies import (
 )
 
 
-def make_candle_with_price(price: float, dt: datetime, high_offset: float = 0.5, low_offset: float = 0.5) -> Candle:
+def make_candle_with_price(
+    price: float, dt: datetime, high_offset: float = 0.5, low_offset: float = 0.5
+) -> Candle:
     return Candle(
         timestamp=dt,
         open=price - 0.1,
@@ -98,7 +100,9 @@ class TestMACrossoverStrategy:
             c = make_candle_with_price(120.0 + i * 2, start + timedelta(days=10 + i))
             signals.append(s.on_candle(c))
 
-        long_signals = [sig for sig in signals if sig is not None and sig.direction == Direction.LONG]
+        long_signals = [
+            sig for sig in signals if sig is not None and sig.direction == Direction.LONG
+        ]
         assert len(long_signals) >= 1
 
     def test_reset_clears_state(self) -> None:
@@ -156,7 +160,9 @@ class TestRSIMeanReversionStrategy:
         for c in self._make_oversold_series(n_flat=15, n_drop=10):
             signals.append(s.on_candle(c))
 
-        long_signals = [sig for sig in signals if sig is not None and sig.direction == Direction.LONG]
+        long_signals = [
+            sig for sig in signals if sig is not None and sig.direction == Direction.LONG
+        ]
         # We expect at least one oversold trigger
         assert len(long_signals) >= 0  # may or may not trigger depending on exact RSI
 
@@ -173,12 +179,16 @@ class TestRSIMeanReversionStrategy:
         # Force entry — sharp drop below oversold
         for i in range(6):
             price = 100.0 - (i + 1) * 5.0
-            signals.append(s.on_candle(make_candle_with_price(price, start + timedelta(days=5 + i))))
+            signals.append(
+                s.on_candle(make_candle_with_price(price, start + timedelta(days=5 + i)))
+            )
 
         # Force exit — sharp recovery
         for i in range(10):
             price = 70.0 + (i + 1) * 5.0
-            signals.append(s.on_candle(make_candle_with_price(price, start + timedelta(days=11 + i))))
+            signals.append(
+                s.on_candle(make_candle_with_price(price, start + timedelta(days=11 + i)))
+            )
 
         non_none = [sig for sig in signals if sig is not None]
         # Should have at least a LONG entry
@@ -229,7 +239,9 @@ class TestBreakoutStrategy:
         candle = make_candle_with_price(110.0, start + timedelta(days=10), high_offset=0.5)
         signals.append(s.on_candle(candle))
 
-        long_signals = [sig for sig in signals if sig is not None and sig.direction == Direction.LONG]
+        long_signals = [
+            sig for sig in signals if sig is not None and sig.direction == Direction.LONG
+        ]
         assert len(long_signals) >= 1
 
     def test_breakdown_generates_short_exit(self) -> None:

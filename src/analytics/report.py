@@ -64,8 +64,10 @@ def generate_html_report(result: BacktestResult, metrics: dict[str, Any] | None 
     def fmt_f(v: float) -> str:
         return f"{v:.4f}"
 
+    percentage_metrics = ("rate", "drawdown", "cagr", "return")
     rows_html = "".join(
-        f"<tr><td>{k.replace('_', ' ').title()}</td><td>{fmt_pct(v) if 'rate' in k or 'drawdown' in k or 'cagr' in k or 'return' in k else fmt_f(v)}</td></tr>"
+        f"<tr><td>{k.replace('_', ' ').title()}</td><td>"
+        f"{fmt_pct(v) if any(term in k for term in percentage_metrics) else fmt_f(v)}</td></tr>"
         for k, v in metrics.items()
         if isinstance(v, (int, float))
     )

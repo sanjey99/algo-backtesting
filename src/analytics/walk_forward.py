@@ -94,7 +94,9 @@ class WalkForwardAnalyzer:
 
             from src.engine.backtest import BacktestResult
             return BacktestResult(
-                strategy_name=self.strategy_cls.name if hasattr(self.strategy_cls, 'name') else "unknown",
+                strategy_name=(
+                    self.strategy_cls.name if hasattr(self.strategy_cls, "name") else "unknown"
+                ),
                 symbol="",
                 start_date=candles[0].timestamp if candles else datetime.utcnow(),
                 end_date=candles[-1].timestamp if candles else datetime.utcnow(),
@@ -155,7 +157,11 @@ class WalkForwardAnalyzer:
                 scale = last_equity / first_oos if first_oos > 0 else 1.0
                 for pt in oos_result.equity_curve:
                     combined_equity.append(
-                        EquityPoint(date=pt.date, equity=pt.equity * scale, drawdown_pct=pt.drawdown_pct)
+                        EquityPoint(
+                            date=pt.date,
+                            equity=pt.equity * scale,
+                            drawdown_pct=pt.drawdown_pct,
+                        )
                     )
             else:
                 combined_equity.extend(oos_result.equity_curve)
@@ -202,7 +208,9 @@ class WalkForwardAnalyzer:
             parameters={},
             trades=all_trades,
             equity_curve=combined_equity,
-            final_equity=combined_equity[-1].equity if combined_equity else self.config.initial_capital,
+            final_equity=(
+                combined_equity[-1].equity if combined_equity else self.config.initial_capital
+            ),
             initial_capital=self.config.initial_capital,
         )
         combined_metrics = compute_all_metrics(combined_result)

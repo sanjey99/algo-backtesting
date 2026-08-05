@@ -1,5 +1,5 @@
 """Tests for domain models — Step 1 exit criteria."""
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import pytest
 
@@ -7,8 +7,7 @@ from src.models.candle import Candle
 from src.models.order import Direction, Order, OrderType
 from src.models.portfolio import Portfolio
 from src.models.trade import Trade
-from tests.conftest import make_candle, make_candle_series
-
+from tests.conftest import make_candle
 
 # ── Candle ──────────────────────────────────────────────────────────────────
 

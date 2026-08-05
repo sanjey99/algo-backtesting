@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
 
 from src.models.order import Direction
 from src.models.trade import Trade
@@ -31,11 +30,11 @@ class Portfolio:
         self.initial_capital = initial_capital
         self._cash: float = initial_capital
         # symbol -> (direction, quantity, entry_price, entry_date, trade_id, commission)
-        self._open_positions: Dict[str, Tuple[Direction, int, float, datetime, str, float]] = {}
-        self._trades: List[Trade] = []
-        self._equity_curve: List[EquityPoint] = []
+        self._open_positions: dict[str, tuple[Direction, int, float, datetime, str, float]] = {}
+        self._trades: list[Trade] = []
+        self._equity_curve: list[EquityPoint] = []
         self._peak_equity: float = initial_capital
-        self._current_prices: Dict[str, float] = {}
+        self._current_prices: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Core state
@@ -59,15 +58,15 @@ class Portfolio:
         return self._cash + pos_value
 
     @property
-    def equity_curve(self) -> List[EquityPoint]:
+    def equity_curve(self) -> list[EquityPoint]:
         return list(self._equity_curve)
 
     @property
-    def trades(self) -> List[Trade]:
+    def trades(self) -> list[Trade]:
         return list(self._trades)
 
     @property
-    def open_positions(self) -> Dict[str, Tuple[Direction, int, float, datetime, str, float]]:
+    def open_positions(self) -> dict[str, tuple[Direction, int, float, datetime, str, float]]:
         return dict(self._open_positions)
 
     def has_position(self, symbol: str) -> bool:
@@ -85,7 +84,7 @@ class Portfolio:
         fill_price: float,
         fill_date: datetime,
         commission: float = 0.0,
-    ) -> Optional[Trade]:
+    ) -> Trade | None:
         """Open or close a position; returns closed Trade or None for open."""
         if symbol in self._open_positions:
             existing_dir, qty, entry_price, entry_date, trade_id, entry_comm = (
@@ -139,7 +138,7 @@ class Portfolio:
     # Mark-to-market
     # ------------------------------------------------------------------
 
-    def update(self, prices: Dict[str, float], timestamp: datetime) -> None:
+    def update(self, prices: dict[str, float], timestamp: datetime) -> None:
         """Update current prices and append equity curve point."""
         self._current_prices.update(prices)
         current_equity = self.equity

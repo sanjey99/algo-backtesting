@@ -5,10 +5,11 @@ Uses TestClient with an in-memory SQLite DB and patched data fetching.
 from __future__ import annotations
 
 from collections.abc import Generator
-from datetime import datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -17,6 +18,12 @@ from sqlalchemy.pool import StaticPool
 
 from src.api.deps import get_db
 from src.api.main import app
+from src.data.contracts import (
+    AcquisitionManifest,
+    AcquisitionRequest,
+    AcquisitionResult,
+    AcquisitionStatus,
+)
 from src.db import database
 from src.db.database import create_db_engine
 from src.db.migrate import SchemaNotCurrentError
@@ -77,6 +84,27 @@ def _make_candles(n: int = 150) -> list[Candle]:
 
 
 FAKE_CANDLES = _make_candles(150)
+
+
+def _fake_acquisition_result() -> AcquisitionResult:
+    now = datetime(2024, 1, 1, tzinfo=UTC)
+    request = AcquisitionRequest("SPY", date(2020, 1, 1), date(2022, 12, 31))
+    return AcquisitionResult(
+        pd.DataFrame(),
+        AcquisitionManifest(
+            "legacy-api-test",
+            request,
+            AcquisitionStatus.SUCCESS,
+            counters={
+                "expected_sessions": len(FAKE_CANDLES),
+                "accepted_expected_sessions": len(FAKE_CANDLES),
+                "missing_sessions": 0,
+            },
+            coverage=1.0,
+            started_at=now,
+            completed_at=now,
+        ),
+    )
 
 
 @pytest.fixture()
@@ -297,8 +325,9 @@ class TestPermutationEndpoint:
 class TestDataFetch:
     def test_fetch_returns_candle_count(self, client: TestClient) -> None:
         # Patch df_to_candles so we don't need a real DataFrame
-        with patch("src.data.fetcher.YFinanceFetcher"), \
-             patch("src.api.routes.data.df_to_candles", return_value=FAKE_CANDLES):
+        with patch(
+            "src.api.routes.data.acquire_result", return_value=_fake_acquisition_result()
+        ), patch("src.api.routes.data.df_to_candles", return_value=FAKE_CANDLES):
             r = client.post("/api/data/fetch", json={
                 "symbol": "SPY",
                 "start": "2020-01-01",
@@ -309,8 +338,9 @@ class TestDataFetch:
         assert r.json()["n_candles"] == len(FAKE_CANDLES)
 
     def test_fetch_empty_returns_422(self, client: TestClient) -> None:
-        with patch("src.data.fetcher.YFinanceFetcher"), \
-             patch("src.api.routes.data.df_to_candles", return_value=[]):
+        with patch(
+            "src.api.routes.data.acquire_result", return_value=_fake_acquisition_result()
+        ), patch("src.api.routes.data.df_to_candles", return_value=[]):
             r = client.post("/api/data/fetch", json={
                 "symbol": "FAKE",
                 "start": "2020-01-01",

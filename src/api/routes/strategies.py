@@ -10,8 +10,8 @@ router = APIRouter(prefix="/api/strategies", tags=["strategies"])
 
 
 @router.get("", response_model=list[StrategyInfo])
-def list_strategies():
-    result = []
+def list_strategies() -> list[StrategyInfo]:
+    result: list[StrategyInfo] = []
     for key, cls in STRATEGY_REGISTRY.items():
         instance = cls()
         result.append(

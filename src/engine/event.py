@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from abc import ABC
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from src.models.candle import Candle
 from src.models.order import Direction, Order, OrderType
@@ -28,7 +28,7 @@ class SignalEvent(Event):
     symbol: str
     direction: Direction
     strength: float = 1.0  # 0.0-1.0, used by position sizer
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
     order_type: OrderType = OrderType.MARKET   # NEW
     limit_price: float | None = None            # NEW
     stop_price: float | None = None             # NEW

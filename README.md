@@ -56,6 +56,28 @@ unversioned-baseline, and versioned databases. Use plain `alembic upgrade head` 
 is already configured to target the intended fresh or correctly versioned database; it does not
 provide the classifier's safeguards for an unversioned legacy schema.
 
+## Market data acquisition quality
+
+The daily acquisition boundary normalizes provider data, applies XNYS-session-aware quality rules,
+uses immutable cache generations, and produces redacted manifests for both successes and admitted
+failures. The API and CLI share that service.
+
+```bash
+# Write canonical Parquet plus a redacted request report.
+python -m src.data.cli acquire --symbol SPY --start 2020-01-01 --end 2024-12-31 \
+  --canonical artifacts/spy.parquet --report artifacts/spy-report.json
+
+# Inspect an archived report or run the fully offline verification benchmark.
+python -m src.data.cli inspect --acquisition-id <acquisition-id>
+python -m src.data.cli benchmark --output artifacts/data-quality-benchmark.json
+```
+
+The benchmark uses generated provider-shaped payloads, fresh fixtures per sample, and no network
+requests. Treat its output as reproducible local evidence only; do not commit generated artifacts
+or use deterministic timings as claims about live providers. See
+[the data acquisition quality guide](docs/data-acquisition-quality.md) for provider limitations,
+contracts, manifests, benchmark methodology, and claim discipline.
+
 ## Tech Stack
 
 | Layer | Technology |
