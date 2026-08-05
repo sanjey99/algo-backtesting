@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -13,6 +13,9 @@ class Base(DeclarativeBase):
 
 class BacktestRun(Base):
     __tablename__ = "backtest_runs"
+    __table_args__ = (
+        Index("ix_backtest_runs_symbol_dates", "symbol", "start_date", "end_date"),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     strategy_name: Mapped[str] = mapped_column(String, nullable=False)
@@ -38,6 +41,9 @@ class BacktestRun(Base):
 
 class TradeRecord(Base):
     __tablename__ = "trades"
+    __table_args__ = (
+        Index("ix_trades_backtest_exit_id", "backtest_id", "exit_date", "id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     backtest_id: Mapped[str] = mapped_column(String, ForeignKey("backtest_runs.id"), nullable=False)
@@ -56,6 +62,11 @@ class TradeRecord(Base):
 
 class EquityCurvePoint(Base):
     __tablename__ = "equity_curve"
+    __table_args__ = (
+        UniqueConstraint(
+            "backtest_id", "date", name="uq_equity_curve_backtest_date"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     backtest_id: Mapped[str] = mapped_column(String, ForeignKey("backtest_runs.id"), nullable=False)
@@ -68,6 +79,11 @@ class EquityCurvePoint(Base):
 
 class MetricRecord(Base):
     __tablename__ = "metrics"
+    __table_args__ = (
+        UniqueConstraint(
+            "backtest_id", "metric_name", name="uq_metrics_backtest_metric"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     backtest_id: Mapped[str] = mapped_column(String, ForeignKey("backtest_runs.id"), nullable=False)
