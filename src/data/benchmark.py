@@ -114,14 +114,41 @@ class BenchmarkConfig:
                 raise ValueError(f"benchmark {name} must use the approved fixed value")
 
 
+@dataclass(frozen=True, slots=True)
+class _ProviderCall:
+    sequence: int
+    provider: Provider
+
+
+@dataclass(slots=True)
+class _ProviderCallLog:
+    """Shared provider-fetch evidence, ordered at the actual fetch boundary."""
+
+    calls: list[_ProviderCall]
+
+    def __init__(self) -> None:
+        self.calls = []
+
+    def record(self, provider: Provider) -> None:
+        self.calls.append(_ProviderCall(len(self.calls) + 1, provider))
+
+    def trace(self) -> tuple[str, ...]:
+        expected = list(range(1, len(self.calls) + 1))
+        if [call.sequence for call in self.calls] != expected:
+            raise AssertionError("benchmark provider call log is not monotonic")
+        return tuple(call.provider.value for call in self.calls)
+
+
 class _DeterministicProvider:
     def __init__(
         self,
         provider: Provider,
         fetch: Callable[[AcquisitionRequest, int], ProviderBatch],
+        call_log: _ProviderCallLog,
     ) -> None:
         self._provider = provider
         self._fetch = fetch
+        self._call_log = call_log
         self.requests: list[AcquisitionRequest] = []
 
     @property
@@ -133,6 +160,7 @@ class _DeterministicProvider:
         return ProviderEligibility(True)
 
     def fetch(self, request: AcquisitionRequest) -> ProviderBatch:
+        self._call_log.record(self._provider)
         self.requests.append(request)
         return self._fetch(request, len(self.requests))
 
@@ -147,6 +175,7 @@ class _ScenarioFixture:
     store: DataStore
     repository: ManifestRepository
     providers: Mapping[Provider, _DeterministicProvider]
+    provider_call_log: _ProviderCallLog
     expected_status: str
     expected_trace: tuple[str, ...]
     expected_counters: Mapping[str, int]
@@ -292,7 +321,8 @@ def _prepare_scenario_sample(
         manifest_repository=repository,
     )
     frame = _canonical_frame(request, sessions, config.seed)
-    providers = _scenario_providers(scenario, frame, sessions, config.seed)
+    provider_call_log = _ProviderCallLog()
+    providers = _scenario_providers(scenario, frame, sessions, config.seed, provider_call_log)
     service = AcquisitionService(
         store=store,
         manifest_repository=repository,
@@ -316,6 +346,7 @@ def _prepare_scenario_sample(
         store,
         repository,
         providers,
+        provider_call_log,
         _expected_status(scenario),
         _expected_trace(scenario),
         _expected_counters(scenario, len(sessions)),
@@ -330,6 +361,7 @@ def _scenario_providers(
     frame: pd.DataFrame,
     sessions: pd.DatetimeIndex,
     seed: int,
+    call_log: _ProviderCallLog,
 ) -> dict[Provider, _DeterministicProvider]:
     def batch(
         provider: Provider,
@@ -352,6 +384,7 @@ def _scenario_providers(
     yfinance = _DeterministicProvider(
         Provider.YFINANCE,
         lambda request, call: normal(Provider.YFINANCE, request, call),
+        call_log,
     )
     if scenario == "duplicate_removal":
         def duplicate(request: AcquisitionRequest, _: int) -> ProviderBatch:
@@ -359,20 +392,20 @@ def _scenario_providers(
             native = _native_frame(Provider.YFINANCE, selected)
             return batch(Provider.YFINANCE, request, pd.concat([native, native.iloc[:1]]))
 
-        yfinance = _DeterministicProvider(Provider.YFINANCE, duplicate)
+        yfinance = _DeterministicProvider(Provider.YFINANCE, duplicate, call_log)
     elif scenario == "limited_gaps":
         def gap(request: AcquisitionRequest, _: int) -> ProviderBatch:
             selected = _requested_canonical(frame, request).iloc[1:].copy(deep=True)
             return batch(Provider.YFINANCE, request, _native_frame(Provider.YFINANCE, selected))
 
-        yfinance = _DeterministicProvider(Provider.YFINANCE, gap)
+        yfinance = _DeterministicProvider(Provider.YFINANCE, gap, call_log)
     elif scenario == "retry_success":
         def retry(request: AcquisitionRequest, call: int) -> ProviderBatch:
             if call == 1:
                 raise TransientProviderError("generated transient benchmark failure")
             return normal(Provider.YFINANCE, request, call)
 
-        yfinance = _DeterministicProvider(Provider.YFINANCE, retry)
+        yfinance = _DeterministicProvider(Provider.YFINANCE, retry, call_log)
     elif scenario == "yfinance_alpha_fallback":
         def invalid(request: AcquisitionRequest, _: int) -> ProviderBatch:
             selected = _requested_canonical(frame, request)
@@ -380,14 +413,14 @@ def _scenario_providers(
             native["High"] = native["Open"] - 1.0
             return batch(Provider.YFINANCE, request, native)
 
-        yfinance = _DeterministicProvider(Provider.YFINANCE, invalid)
+        yfinance = _DeterministicProvider(Provider.YFINANCE, invalid, call_log)
     elif scenario == "corporate_action_invalidation":
         def changed_actions(request: AcquisitionRequest, _: int) -> ProviderBatch:
             selected = _requested_canonical(frame, request)
             native = _native_frame(Provider.YFINANCE, selected, dividend=1.0)
             return batch(Provider.YFINANCE, request, native)
 
-        yfinance = _DeterministicProvider(Provider.YFINANCE, changed_actions)
+        yfinance = _DeterministicProvider(Provider.YFINANCE, changed_actions, call_log)
     elif scenario == "fatal_rejection":
         def reject(request: AcquisitionRequest, _: int) -> ProviderBatch:
             selected = _requested_canonical(frame, request)
@@ -395,13 +428,14 @@ def _scenario_providers(
             native["High"] = native["Open"] - 1.0
             return batch(Provider.YFINANCE, request, native)
 
-        yfinance = _DeterministicProvider(Provider.YFINANCE, reject)
+        yfinance = _DeterministicProvider(Provider.YFINANCE, reject, call_log)
 
     providers = {Provider.YFINANCE: yfinance}
     if scenario == "yfinance_alpha_fallback":
         providers[Provider.ALPHA_VANTAGE] = _DeterministicProvider(
             Provider.ALPHA_VANTAGE,
             lambda request, call: normal(Provider.ALPHA_VANTAGE, request, call),
+            call_log,
         )
     del sessions, seed
     return providers
@@ -487,20 +521,10 @@ def _run_scenario_sample(fixture: _ScenarioFixture) -> dict[str, Any]:
     cache = report.get("cache")
     if not isinstance(cache, Mapping) or cache.get("status") != fixture.expected_status:
         raise AssertionError("benchmark scenario produced an unexpected cache status")
-    trace = _provider_trace(fixture.providers)
+    trace = fixture.provider_call_log.trace()
     if trace != fixture.expected_trace:
         raise AssertionError(f"benchmark provider trace mismatch: {trace!r}")
-    counters = report.get("counters", {})
-    if not isinstance(counters, Mapping):
-        raise AssertionError("benchmark report counters are invalid")
-    for name, expected in fixture.expected_counters.items():
-        if counters.get(name, expected) != expected:
-            raise AssertionError(f"benchmark counter {name} did not reconcile")
-    if counters:
-        if counters.get("expected_sessions") != (
-            counters.get("accepted_expected_sessions", 0) + counters.get("missing_sessions", 0)
-        ):
-            raise AssertionError("benchmark counters did not reconcile")
+    counters = _validated_counters(report.get("counters"), fixture.expected_counters)
     scenario_counters = _scenario_counters(fixture.scenario, report)
     for name, expected in _expected_scenario_counters(fixture.scenario).items():
         if scenario_counters.get(name) != expected:
@@ -522,20 +546,34 @@ def _run_scenario_sample(fixture: _ScenarioFixture) -> dict[str, Any]:
     }
 
 
-def _provider_trace(providers: Mapping[Provider, _DeterministicProvider]) -> tuple[str, ...]:
-    trace: list[tuple[int, str]] = []
-    for provider, instance in providers.items():
-        trace.extend((index, provider.value) for index, _ in enumerate(instance.requests))
-    # A call order is observable only within one provider.  The approved fallback has one call to
-    # each provider, so retain the known provider preference for cross-provider ordering.
-    if Provider.YFINANCE in providers and Provider.ALPHA_VANTAGE in providers:
-        return tuple(
-            [Provider.YFINANCE.value] * len(providers[Provider.YFINANCE].requests)
-            + [Provider.ALPHA_VANTAGE.value] * len(providers[Provider.ALPHA_VANTAGE].requests)
+def _validated_counters(
+    observed: object,
+    expected: Mapping[str, int],
+) -> dict[str, Any]:
+    """Require and reconcile the manifest counters used by one benchmark scenario."""
+    if not isinstance(observed, Mapping):
+        raise AssertionError("benchmark report counters are missing or invalid")
+    counters = {str(name): value for name, value in observed.items()}
+    required = set(expected)
+    if required:
+        required.update(
+            {"expected_sessions", "accepted_expected_sessions", "missing_sessions"}
         )
-    return tuple(
-        provider.value for provider, instance in providers.items() for _ in instance.requests
-    )
+    missing = sorted(name for name in required if name not in counters)
+    if missing:
+        raise AssertionError(f"benchmark report counters are missing: {', '.join(missing)}")
+    for name in required:
+        value = counters[name]
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise AssertionError(f"benchmark counter {name} is not an integer")
+    for name, value in expected.items():
+        if counters[name] != value:
+            raise AssertionError(f"benchmark counter {name} did not reconcile")
+    if required and counters["expected_sessions"] != (
+        counters["accepted_expected_sessions"] + counters["missing_sessions"]
+    ):
+        raise AssertionError("benchmark counters did not reconcile")
+    return counters
 
 
 def _scenario_summary(scenario: str, warmups: int, samples: list[dict[str, Any]]) -> dict[str, Any]:

@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 
 from src.data.benchmark import (
     APPROVED_SCENARIOS,
     BenchmarkConfig,
+    _DeterministicProvider,
     _prepare_scenario_sample,
+    _ProviderCallLog,
     _run_scenario_sample,
+    _validated_counters,
     deterministic_payload_hashes,
     percentile_95,
     run_deterministic_benchmark,
 )
+from src.data.contracts import AcquisitionRequest, Provider
 
 
 def test_benchmark_configuration_is_the_approved_fixed_matrix() -> None:
@@ -56,6 +62,31 @@ def test_scenario_order_and_percentile_are_stable() -> None:
         "fatal_rejection",
     )
     assert percentile_95(tuple(float(value) for value in range(1, 16))) == 15.0
+
+
+@pytest.mark.parametrize("counters", (None, {}, {"expected_sessions": 3}))
+def test_required_reconciliation_counters_fail_closed(counters: object) -> None:
+    with pytest.raises(AssertionError, match="counters"):
+        _validated_counters(
+            counters,
+            {
+                "expected_sessions": 3,
+                "accepted_expected_sessions": 3,
+                "missing_sessions": 0,
+            },
+        )
+
+
+def test_provider_trace_is_the_shared_fetch_entry_order() -> None:
+    calls = _ProviderCallLog()
+    request = AcquisitionRequest("SPY", date(2024, 1, 2), date(2024, 1, 2))
+    yfinance = _DeterministicProvider(Provider.YFINANCE, lambda *_: None, calls)
+    alpha = _DeterministicProvider(Provider.ALPHA_VANTAGE, lambda *_: None, calls)
+
+    alpha.fetch(request)
+    yfinance.fetch(request)
+
+    assert calls.trace() == ("alpha_vantage", "yfinance")
 
 
 @pytest.mark.parametrize("scenario", APPROVED_SCENARIOS)
