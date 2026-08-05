@@ -88,7 +88,7 @@ class WalkForwardAnalyzer:
             strategy = self.strategy_cls(**params)
             engine = BacktestEngine()
             return engine.run(strategy, candles, self.config)
-        except Exception:
+        except ValueError:
             # Invalid param combo (e.g., fast >= slow) — return empty result
             from src.engine.backtest import BacktestResult
             return BacktestResult(

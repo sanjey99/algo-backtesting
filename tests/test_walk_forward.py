@@ -3,7 +3,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from src.analytics.walk_forward import WalkForwardAnalyzer
+from src.engine.backtest import BacktestEngine
 from src.models.candle import Candle
 from src.strategies.ma_crossover import MACrossoverStrategy
 
@@ -140,3 +143,17 @@ class TestWalkForwardAnalyzer:
 
         assert result.start_date.tzinfo is UTC
         assert result.end_date.tzinfo is UTC
+
+    def test_unexpected_backtest_failure_is_propagated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Engine failures must not become plausible zero-trade results."""
+        analyzer = WalkForwardAnalyzer(MACrossoverStrategy)
+
+        def fail_run(*_: object, **__: object) -> None:
+            raise RuntimeError("engine invariant violated")
+
+        monkeypatch.setattr(BacktestEngine, "run", fail_run)
+
+        with pytest.raises(RuntimeError, match="engine invariant violated"):
+            analyzer._run_backtest(make_trending_candles(2), {})
