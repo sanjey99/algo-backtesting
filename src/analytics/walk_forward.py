@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from src.analytics.metrics import compute_all_metrics, equity_curve_to_returns, sharpe_ratio
@@ -90,16 +90,14 @@ class WalkForwardAnalyzer:
             return engine.run(strategy, candles, self.config)
         except Exception:
             # Invalid param combo (e.g., fast >= slow) — return empty result
-            from datetime import datetime
-
             from src.engine.backtest import BacktestResult
             return BacktestResult(
                 strategy_name=(
                     self.strategy_cls.name if hasattr(self.strategy_cls, "name") else "unknown"
                 ),
                 symbol="",
-                start_date=candles[0].timestamp if candles else datetime.utcnow(),
-                end_date=candles[-1].timestamp if candles else datetime.utcnow(),
+                start_date=candles[0].timestamp if candles else datetime.now(UTC),
+                end_date=candles[-1].timestamp if candles else datetime.now(UTC),
                 parameters=params,
                 trades=[],
                 equity_curve=[],
@@ -196,15 +194,13 @@ class WalkForwardAnalyzer:
         combined_sharpe = sharpe_ratio(combined_returns)
 
         # Build a minimal BacktestResult for combined metrics
-        from datetime import datetime
-
         from src.engine.backtest import BacktestResult
         all_trades = [t for w in windows for t in w.oos_result.trades]
         combined_result = BacktestResult(
             strategy_name=getattr(self.strategy_cls, 'name', 'unknown'),
             symbol="combined",
-            start_date=combined_equity[0].date if combined_equity else datetime.utcnow(),
-            end_date=combined_equity[-1].date if combined_equity else datetime.utcnow(),
+            start_date=combined_equity[0].date if combined_equity else datetime.now(UTC),
+            end_date=combined_equity[-1].date if combined_equity else datetime.now(UTC),
             parameters={},
             trades=all_trades,
             equity_curve=combined_equity,

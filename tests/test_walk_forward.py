@@ -1,7 +1,7 @@
 """Tests for Walk-Forward Analysis — Step 7."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from src.analytics.walk_forward import WalkForwardAnalyzer
 from src.models.candle import Candle
@@ -130,3 +130,13 @@ class TestWalkForwardAnalyzer:
         )
         result = analyzer.run(candles)
         assert len(result.windows) == 0
+        assert result.combined_equity_curve == []
+        assert result.combined_metrics["total_return"] == 0.0
+
+    def test_empty_backtest_fallback_uses_utc_timestamps(self) -> None:
+        analyzer = WalkForwardAnalyzer(MACrossoverStrategy)
+
+        result = analyzer._run_backtest([], {})
+
+        assert result.start_date.tzinfo is UTC
+        assert result.end_date.tzinfo is UTC
