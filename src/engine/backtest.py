@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any, Protocol
 
 from src.engine.broker import SimulatedBroker
+from src.engine.context import StrategyContext
 from src.engine.event import FillEvent, OrderEvent, SignalEvent
 from src.models.candle import Candle
 from src.models.order import Order, OrderType
@@ -23,7 +24,9 @@ class Strategy(Protocol):
     name: str
     parameters: dict[str, Any]
 
-    def on_candle(self, candle: Candle) -> SignalEvent | None:
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
         ...
 
 
@@ -61,7 +64,7 @@ class BacktestEngine:
 
     Wiring per bar
     --------------
-    1. strategy.on_candle(candle)   -> Optional[SignalEvent]
+    1. strategy.on_candle(candle, context) -> Optional[SignalEvent]
     2. If signal and no open position    -> create MARKET OrderEvent (open)
        If signal is opposite open position -> create MARKET OrderEvent (close)
     3. broker.execute(order, candle) -> Optional[FillEvent]
@@ -93,7 +96,7 @@ class BacktestEngine:
         symbol: str = "UNKNOWN"
 
         for candle in candles:
-            signal: SignalEvent | None = strategy.on_candle(candle)
+            signal: SignalEvent | None = strategy.on_candle(candle, StrategyContext())
 
             if signal is not None:
                 symbol = signal.symbol

@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import deque
 from typing import Any
 
+from src.engine.context import StrategyContext
 from src.engine.event import SignalEvent
 from src.models.candle import Candle
 from src.models.order import Direction
@@ -42,9 +43,10 @@ class MACrossoverStrategy(BaseStrategy):
         self._slow_window: deque[float] = deque(maxlen=slow_period)
         self._prev_fast_sma: float | None = None
         self._prev_slow_sma: float | None = None
-        self._in_position: bool = False
 
-    def on_candle(self, candle: Candle) -> SignalEvent | None:
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
         price = candle.adj_close
         self._fast_window.append(price)
         self._slow_window.append(price)
@@ -62,7 +64,12 @@ class MACrossoverStrategy(BaseStrategy):
             was_above = self._prev_fast_sma > self._prev_slow_sma
             is_above = fast_sma > slow_sma
 
-            if not was_above and is_above and not self._in_position:
+            if (
+                not was_above
+                and is_above
+                and context.position_direction is None
+                and context.pending_direction is None
+            ):
                 # Golden cross — go LONG
                 signal = SignalEvent(
                     symbol=candle.timestamp.strftime("%Y-%m-%d"),
@@ -70,8 +77,12 @@ class MACrossoverStrategy(BaseStrategy):
                     strength=1.0,
                     timestamp=candle.timestamp,
                 )
-                self._in_position = True
-            elif was_above and not is_above and self._in_position:
+            elif (
+                was_above
+                and not is_above
+                and context.position_direction is Direction.LONG
+                and not context.forced_cover_pending
+            ):
                 # Death cross — exit LONG (SHORT signal closes position)
                 signal = SignalEvent(
                     symbol=candle.timestamp.strftime("%Y-%m-%d"),
@@ -79,7 +90,6 @@ class MACrossoverStrategy(BaseStrategy):
                     strength=1.0,
                     timestamp=candle.timestamp,
                 )
-                self._in_position = False
 
         self._prev_fast_sma = fast_sma
         self._prev_slow_sma = slow_sma
@@ -90,4 +100,3 @@ class MACrossoverStrategy(BaseStrategy):
         self._slow_window.clear()
         self._prev_fast_sma = None
         self._prev_slow_sma = None
-        self._in_position = False

@@ -7,6 +7,7 @@ import pytest
 
 from src.engine.backtest import BacktestConfig, BacktestEngine
 from src.engine.broker import SimulatedBroker
+from src.engine.context import StrategyContext
 from src.engine.event import FillEvent, MarketEvent, OrderEvent, SignalEvent
 from src.models.candle import Candle
 from src.models.order import Direction, Order, OrderType
@@ -303,7 +304,9 @@ class _BuyDay0SellDay49Strategy:
         self._symbol = symbol
         self._bar_count = 0
 
-    def on_candle(self, candle: Candle) -> SignalEvent | None:
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
         idx = self._bar_count
         self._bar_count += 1
 
@@ -409,7 +412,9 @@ class TestBacktestEngine:
             name = "Null"
             parameters: dict = {}
 
-            def on_candle(self, candle: Candle) -> SignalEvent | None:
+            def on_candle(
+                self, candle: Candle, context: StrategyContext
+            ) -> SignalEvent | None:
                 return None
 
         candles = make_candle_series(n=10, base=100.0)
@@ -423,7 +428,9 @@ class TestBacktestEngine:
             name = "Null"
             parameters: dict = {}
 
-            def on_candle(self, candle: Candle) -> SignalEvent | None:
+            def on_candle(
+                self, candle: Candle, context: StrategyContext
+            ) -> SignalEvent | None:
                 return None
 
         with pytest.raises(ValueError, match="candles list must not be empty"):
