@@ -88,21 +88,19 @@ class TestSimulatedBrokerMarket:
         self.broker = SimulatedBroker(
             slippage_pct=self.SLIPPAGE, commission_pct=self.COMMISSION
         )
-        self.candle = make_candle(close=100.0, high=101.0, low=98.0)
+        self.candle = make_candle(open_=90.0, close=100.0, high=101.0, low=89.0)
 
-    def test_market_long_fill_price(self) -> None:
+    def test_market_long_fills_at_open(self) -> None:
         order = Order(symbol="X", direction=Direction.LONG, quantity=1)
         fill = self.broker.execute(order, self.candle)
         assert fill is not None
-        expected = 100.0 * (1 + self.SLIPPAGE)
-        assert abs(fill.fill_price - expected) < 1e-9
+        assert fill.fill_price == pytest.approx(90.0 * (1 + self.SLIPPAGE))
 
     def test_market_short_fill_price(self) -> None:
         order = Order(symbol="X", direction=Direction.SHORT, quantity=1)
         fill = self.broker.execute(order, self.candle)
         assert fill is not None
-        expected = 100.0 * (1 - self.SLIPPAGE)
-        assert abs(fill.fill_price - expected) < 1e-9
+        assert fill.fill_price == pytest.approx(90.0 * (1 - self.SLIPPAGE))
 
     def test_market_commission_is_percentage_of_notional(self) -> None:
         order = Order(symbol="X", direction=Direction.LONG, quantity=10)
@@ -165,6 +163,14 @@ class TestSimulatedBrokerLimit:
         fill = self.broker.execute(order, self.candle)
         assert fill is None
 
+    def test_buy_limit_gap_gets_protected_slipped_open(self) -> None:
+        broker = SimulatedBroker(slippage_pct=0.01, commission_pct=0.0)
+        candle = make_candle(open_=90.0, high=96.0, low=89.0, close=95.0)
+        order = Order("X", Direction.LONG, 1, OrderType.LIMIT, limit_price=95.0)
+        fill = broker.execute(order, candle)
+        assert fill is not None
+        assert fill.fill_price == pytest.approx(90.9)
+
     # -- SELL LIMIT ----------------------------------------------------------
 
     def test_limit_sell_fills_when_high_at_limit(self) -> None:
@@ -190,6 +196,14 @@ class TestSimulatedBrokerLimit:
         fill = self.broker.execute(order, self.candle)
         assert fill is None
 
+    def test_sell_limit_gap_gets_protected_slipped_open(self) -> None:
+        broker = SimulatedBroker(slippage_pct=0.01, commission_pct=0.0)
+        candle = make_candle(open_=110.0, high=111.0, low=104.0, close=105.0)
+        order = Order("X", Direction.SHORT, 1, OrderType.LIMIT, limit_price=105.0)
+        fill = broker.execute(order, candle)
+        assert fill is not None
+        assert fill.fill_price == pytest.approx(108.9)
+
 
 class TestSimulatedBrokerStop:
     """STOP order conditional fill tests."""
@@ -208,7 +222,7 @@ class TestSimulatedBrokerStop:
         )
         fill = self.broker.execute(order, self.candle)
         assert fill is not None
-        assert fill.fill_price == 101.0
+        assert fill.fill_price == pytest.approx(101.0 * (1 + self.broker.slippage_pct))
 
     def test_stop_buy_fills_when_high_above_stop(self) -> None:
         order = Order(
@@ -232,6 +246,14 @@ class TestSimulatedBrokerStop:
         fill = self.broker.execute(order, self.candle)
         assert fill is None
 
+    def test_buy_stop_gap_pays_open_plus_slippage(self) -> None:
+        broker = SimulatedBroker(slippage_pct=0.01, commission_pct=0.0)
+        candle = make_candle(open_=110.0, high=112.0, low=109.0, close=111.0)
+        order = Order("X", Direction.LONG, 1, OrderType.STOP, stop_price=105.0)
+        fill = broker.execute(order, candle)
+        assert fill is not None
+        assert fill.fill_price == pytest.approx(111.1)
+
     def test_stop_sell_fills_when_low_at_stop(self) -> None:
         order = Order(
             symbol="X",
@@ -253,6 +275,14 @@ class TestSimulatedBrokerStop:
         )
         fill = self.broker.execute(order, self.candle)
         assert fill is None
+
+    def test_sell_stop_gap_pays_open_minus_slippage(self) -> None:
+        broker = SimulatedBroker(slippage_pct=0.01, commission_pct=0.0)
+        candle = make_candle(open_=90.0, high=91.0, low=88.0, close=89.0)
+        order = Order("X", Direction.SHORT, 1, OrderType.STOP, stop_price=95.0)
+        fill = broker.execute(order, candle)
+        assert fill is not None
+        assert fill.fill_price == pytest.approx(89.1)
 
 
 # ---------------------------------------------------------------------------
@@ -323,12 +353,12 @@ class TestBacktestEngine:
         result = engine.run(strategy, candles, self._config())
 
         # Manual calculation matching broker logic
-        buy_close = candles[0].close   # 100.0
-        sell_close = candles[49].close  # 100 + 49*0.5 = 124.5
+        buy_open = candles[0].open  # 99.7
+        sell_open = candles[49].open  # 100 + 49*0.5 - 0.3 = 124.2
         qty = 1
 
-        entry_price = buy_close * (1 + self.SLIPPAGE)
-        exit_price = sell_close * (1 - self.SLIPPAGE)
+        entry_price = buy_open * (1 + self.SLIPPAGE)
+        exit_price = sell_open * (1 - self.SLIPPAGE)
         entry_comm = entry_price * qty * self.COMMISSION
         exit_comm = exit_price * qty * self.COMMISSION
 
