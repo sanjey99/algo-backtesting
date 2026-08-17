@@ -22,7 +22,6 @@ dependencies = [
     "plotly>=5.18",
     "matplotlib>=3.8",
     "python-dotenv>=1.0",
-    "httpx>=0.27",
     "pyarrow>=14.0",
     "pandas_market_calendars>=4.4",
     "filelock>=3.13",
@@ -37,6 +36,7 @@ dev = [
     "mypy>=1.8",
     "ruff>=0.3",
     "pandas-stubs>=2.0",
+    "httpx2>=2.10.0",
 ]
 
 [tool.hatch.build.targets.wheel]
