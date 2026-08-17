@@ -1,6 +1,7 @@
 """BacktestEngine — bar-by-bar event-driven backtest runner."""
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -15,6 +16,9 @@ from src.models.candle import Candle
 from src.models.order import Direction, Order, OrderType
 from src.models.portfolio import EquityPoint, FillOutcome, Portfolio
 from src.models.trade import Trade
+from src.observability import log_event
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Strategy protocol — any object with these attributes is accepted
@@ -114,6 +118,34 @@ class BacktestEngine:
         candles: list[Candle],
         config: BacktestConfig,
     ) -> BacktestResult:
+        run_id = str(uuid.uuid4())
+        try:
+            log_event(
+                logger,
+                logging.INFO,
+                "backtest.started",
+                run_id=run_id,
+                strategy=strategy.name,
+                bar_count=len(candles),
+            )
+            return self._run(strategy, candles, config, run_id)
+        except Exception as error:
+            log_event(
+                logger,
+                logging.ERROR,
+                "backtest.failed",
+                run_id=run_id,
+                error_type=type(error).__name__,
+            )
+            raise
+
+    def _run(
+        self,
+        strategy: Strategy,
+        candles: list[Candle],
+        config: BacktestConfig,
+        run_id: str,
+    ) -> BacktestResult:
         if not candles:
             raise ValueError("candles list must not be empty")
         if any(
@@ -145,6 +177,12 @@ class BacktestEngine:
             if pending is not None:
                 fill: FillEvent | None = broker.execute(pending.order, candle)
                 if fill is None:
+                    log_event(
+                        logger,
+                        logging.DEBUG,
+                        "order.untriggered",
+                        **self._order_fields(run_id, pending.order),
+                    )
                     if pending.order.order_type not in (
                         OrderType.LIMIT,
                         OrderType.STOP,
@@ -160,9 +198,24 @@ class BacktestEngine:
                         commission=fill.commission,
                     )
                     if not fill_outcome.accepted:
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "order.rejected",
+                            **self._order_fields(run_id, pending.order),
+                            reason=fill_outcome.rejection_reason,
+                        )
                         # A typed rejection terminates the attempted order.
                         pending = None
                     else:
+                        log_event(
+                            logger,
+                            logging.DEBUG,
+                            "order.filled",
+                            **self._order_fields(run_id, pending.order),
+                            fill_price=fill.fill_price,
+                            commission=fill.commission,
+                        )
                         symbol = fill.symbol
                         pending = None
 
@@ -179,15 +232,39 @@ class BacktestEngine:
                         and maintenance_ratio is not None
                         and maintenance_ratio < config.short_maintenance_margin
                     ):
-                        pending = _PendingOrder(
-                            order=Order(
-                                symbol=position_symbol,
-                                direction=Direction.LONG,
-                                quantity=position_quantity,
-                                order_type=OrderType.MARKET,
-                                created_at=candle.timestamp,
-                            ),
-                            forced_cover=True,
+                        forced_order = Order(
+                            symbol=position_symbol,
+                            direction=Direction.LONG,
+                            quantity=position_quantity,
+                            order_type=OrderType.MARKET,
+                            created_at=candle.timestamp,
+                        )
+                        if pending is not None:
+                            log_event(
+                                logger,
+                                logging.DEBUG,
+                                "order.replaced",
+                                **self._order_fields(run_id, pending.order),
+                                replacement_order_type=forced_order.order_type,
+                                replacement_direction=forced_order.direction,
+                                replacement_quantity=forced_order.quantity,
+                            )
+                        pending = _PendingOrder(order=forced_order, forced_cover=True)
+                        log_event(
+                            logger,
+                            logging.DEBUG,
+                            "order.queued",
+                            **self._order_fields(run_id, forced_order),
+                        )
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "margin.call_queued",
+                            run_id=run_id,
+                            symbol=position_symbol,
+                            quantity=position_quantity,
+                            maintenance_ratio=maintenance_ratio,
+                            maintenance_requirement=config.short_maintenance_margin,
                         )
 
             context = self._build_context(portfolio, pending)
@@ -200,10 +277,43 @@ class BacktestEngine:
                     signal, portfolio, candle
                 )
                 if order is not None:
+                    if pending is not None:
+                        log_event(
+                            logger,
+                            logging.DEBUG,
+                            "order.replaced",
+                            **self._order_fields(run_id, pending.order),
+                            replacement_order_type=order.order_type,
+                            replacement_direction=order.direction,
+                            replacement_quantity=order.quantity,
+                        )
                     symbol = order.symbol
                     pending = _PendingOrder(order=order)
+                    log_event(
+                        logger,
+                        logging.DEBUG,
+                        "order.queued",
+                        **self._order_fields(run_id, order),
+                    )
 
-        return BacktestResult(
+        if pending is not None:
+            log_event(
+                logger,
+                logging.DEBUG,
+                "order.cancelled_end_of_data",
+                **self._order_fields(run_id, pending.order),
+            )
+            if pending.forced_cover:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "margin.call_unresolved",
+                    run_id=run_id,
+                    symbol=pending.order.symbol,
+                    quantity=pending.order.quantity,
+                )
+
+        result = BacktestResult(
             strategy_name=strategy.name,
             symbol=symbol,
             start_date=candles[0].timestamp,
@@ -213,11 +323,37 @@ class BacktestEngine:
             equity_curve=portfolio.equity_curve,
             final_equity=portfolio.equity,
             initial_capital=config.initial_capital,
+            run_id=run_id,
         )
+        log_event(
+            logger,
+            logging.INFO,
+            "backtest.completed",
+            run_id=run_id,
+            strategy=strategy.name,
+            symbol=symbol,
+            trade_count=len(result.trades),
+            final_equity=result.final_equity,
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _order_fields(run_id: str, order: Order) -> dict[str, object]:
+        """Return the safe, stable order identity fields for lifecycle logs."""
+        fields: dict[str, object] = {
+            "run_id": run_id,
+            "symbol": order.symbol,
+            "order_type": order.order_type,
+            "direction": order.direction,
+            "quantity": order.quantity,
+        }
+        if order.order_id:
+            fields["order_id"] = order.order_id
+        return fields
 
     @staticmethod
     def _build_order(

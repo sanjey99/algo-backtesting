@@ -1,6 +1,7 @@
 """Tests for the event system and backtest engine (Step 3)."""
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 
 import pytest
@@ -54,6 +55,137 @@ def _bar(index: int, open_: float, high: float, low: float, close: float) -> Can
         volume=1_000.0,
         adj_close=close,
     )
+
+
+def test_backtest_emits_start_fill_and_completion(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The run lifecycle exposes its authoritative order transitions."""
+    with caplog.at_level(logging.DEBUG):
+        BacktestEngine().run(
+            _BuyOnZeroSellOnOne(),
+            [
+                _bar(0, 100, 101, 99, 100),
+                _bar(1, 101, 102, 100, 101),
+                _bar(2, 102, 103, 101, 102),
+            ],
+            BacktestConfig(),
+        )
+
+    events = [getattr(record, "event", None) for record in caplog.records]
+    assert events[0] == "backtest.started"
+    assert "order.queued" in events
+    assert "order.filled" in events
+    assert events[-1] == "backtest.completed"
+    records_by_event = {getattr(record, "event", None): record for record in caplog.records}
+    assert records_by_event["backtest.started"].levelno == logging.INFO
+    assert records_by_event["order.queued"].levelno == logging.DEBUG
+    assert records_by_event["order.filled"].levelno == logging.DEBUG
+    assert records_by_event["backtest.completed"].levelno == logging.INFO
+
+
+def test_rejected_order_logs_reason_not_payload(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Expected rejection is observable through its stable typed reason."""
+    with caplog.at_level(logging.WARNING):
+        BacktestEngine().run(
+            _BuyOnZeroSellOnOne(),
+            [_bar(0, 100, 101, 99, 100), _bar(1, 101, 102, 100, 101)],
+            BacktestConfig(initial_capital=1.0),
+        )
+
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "order.rejected"
+    )
+    fields = getattr(record, "event_fields")
+    assert isinstance(fields, dict)
+    assert fields["reason"] == "insufficient_buying_power"
+    assert record.levelno == logging.WARNING
+
+
+def test_pending_order_transitions_are_logged(caplog: pytest.LogCaptureFixture) -> None:
+    """Conditional execution records retry, replacement, and final cancellation."""
+    strategy = _ScheduledSignals(
+        {
+            0: (Direction.LONG, OrderType.LIMIT, 90.0),
+            1: (Direction.LONG, OrderType.LIMIT, 95.0),
+        }
+    )
+    candles = [_bar(0, 100, 101, 99, 100), _bar(1, 100, 101, 98, 100)]
+
+    with caplog.at_level(logging.DEBUG):
+        BacktestEngine().run(strategy, candles, BacktestConfig())
+
+    events = [getattr(record, "event", None) for record in caplog.records]
+    assert "order.untriggered" in events
+    assert "order.replaced" in events
+    assert "order.cancelled_end_of_data" in events
+    records_by_event = {getattr(record, "event", None): record for record in caplog.records}
+    assert records_by_event["order.untriggered"].levelno == logging.DEBUG
+    assert records_by_event["order.replaced"].levelno == logging.DEBUG
+    assert records_by_event["order.cancelled_end_of_data"].levelno == logging.DEBUG
+
+
+def test_margin_lifecycle_transitions_are_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Borrow and margin calls remain visible without INFO-level bar noise."""
+    with caplog.at_level(logging.DEBUG):
+        BacktestEngine().run(_OpenShortOnce(), _margin_breach_candles(), _margin_config())
+
+    events = [getattr(record, "event", None) for record in caplog.records]
+    assert "margin.borrow_accrued" in events
+    assert "margin.call_queued" in events
+    records_by_event = {getattr(record, "event", None): record for record in caplog.records}
+    assert records_by_event["margin.borrow_accrued"].levelno == logging.DEBUG
+    assert records_by_event["margin.call_queued"].levelno == logging.WARNING
+
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        BacktestEngine().run(
+            _OpenShortOnce(), _margin_breach_candles(False), _margin_config()
+        )
+
+    events = [getattr(record, "event", None) for record in caplog.records]
+    assert "order.cancelled_end_of_data" in events
+    assert "margin.call_unresolved" in events
+    records_by_event = {getattr(record, "event", None): record for record in caplog.records}
+    assert records_by_event["margin.call_unresolved"].levelno == logging.WARNING
+
+
+def test_backtest_failure_logs_safe_type_and_reraises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unexpected strategy errors retain failure propagation without raw diagnostics."""
+
+    class _FailingStrategy:
+        name = "failing"
+        parameters: dict[str, object] = {}
+
+        def on_candle(
+            self, candle: Candle, context: StrategyContext
+        ) -> SignalEvent | None:
+            del candle, context
+            raise RuntimeError("fixture-sensitive-error")
+
+    with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match="sensitive"):
+        BacktestEngine().run(
+            _FailingStrategy(), [_bar(0, 100, 101, 99, 100)], BacktestConfig()
+        )
+
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "backtest.failed"
+    )
+    fields = getattr(record, "event_fields")
+    assert isinstance(fields, dict)
+    assert fields["error_type"] == "RuntimeError"
+    assert record.levelno == logging.ERROR
+    assert "fixture-sensitive-error" not in record.getMessage()
 
 # ---------------------------------------------------------------------------
 # Event dataclass instantiation

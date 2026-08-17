@@ -1,6 +1,7 @@
 """Portfolio — cash + open positions, equity curve recorder."""
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -9,6 +10,9 @@ from math import isfinite
 
 from src.models.order import Direction
 from src.models.trade import Trade
+from src.observability import log_event
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -209,21 +213,35 @@ class Portfolio:
                 raise ValueError("Short borrow accrual timestamp must be strictly later")
 
         charge = 0.0
+        borrow_charges: list[tuple[str, float, float]] = []
         for symbol, (_, quantity, entry_price, _, _, _) in short_positions:
             elapsed_days = (
                 timestamp - self._last_short_borrow_timestamp[symbol]
             ).total_seconds() / 86_400.0
             previous_marked_short_value = quantity * self._current_prices.get(symbol, entry_price)
-            charge += (
+            symbol_charge = (
                 previous_marked_short_value
                 * self.annual_short_borrow_rate
                 * elapsed_days
                 / self.borrow_day_count
             )
+            charge += symbol_charge
+            borrow_charges.append((symbol, symbol_charge, elapsed_days))
 
         self._cash -= charge
         for symbol, _ in short_positions:
             self._last_short_borrow_timestamp[symbol] = timestamp
+        if charge > 0.0:
+            for symbol, symbol_charge, elapsed_days in borrow_charges:
+                if symbol_charge > 0.0:
+                    log_event(
+                        logger,
+                        logging.DEBUG,
+                        "margin.borrow_accrued",
+                        symbol=symbol,
+                        charge=symbol_charge,
+                        elapsed_days=elapsed_days,
+                    )
         return charge
 
     def maintenance_ratio(self, symbol: str) -> float | None:
