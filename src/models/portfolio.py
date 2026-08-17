@@ -4,6 +4,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 
 from src.models.order import Direction
 from src.models.trade import Trade
@@ -14,6 +15,19 @@ class EquityPoint:
     date: datetime
     equity: float
     drawdown_pct: float = 0.0
+
+
+class FillRejectionReason(StrEnum):
+    INSUFFICIENT_BUYING_POWER = "insufficient_buying_power"
+
+
+@dataclass(frozen=True, slots=True)
+class FillOutcome:
+    accepted: bool
+    trade: Trade | None
+    rejection_reason: FillRejectionReason | None
+    available_cash: float
+    restricted_collateral: float
 
 
 class Portfolio:
@@ -29,6 +43,7 @@ class Portfolio:
             raise ValueError("Initial capital must be positive")
         self.initial_capital = initial_capital
         self._cash: float = initial_capital
+        self._restricted_collateral: float = 0.0
         # symbol -> (direction, quantity, entry_price, entry_date, trade_id, commission)
         self._open_positions: dict[str, tuple[Direction, int, float, datetime, str, float]] = {}
         self._trades: list[Trade] = []
@@ -43,6 +58,10 @@ class Portfolio:
     @property
     def cash(self) -> float:
         return self._cash
+
+    @property
+    def restricted_collateral(self) -> float:
+        return self._restricted_collateral
 
     @property
     def equity(self) -> float:
@@ -84,12 +103,14 @@ class Portfolio:
         fill_price: float,
         fill_date: datetime,
         commission: float = 0.0,
-    ) -> Trade | None:
-        """Open or close a position; returns closed Trade or None for open."""
+    ) -> FillOutcome:
+        """Open or close a position and report whether the fill was accepted."""
         if symbol in self._open_positions:
             existing_dir, qty, entry_price, entry_date, trade_id, entry_comm = (
                 self._open_positions[symbol]
             )
+            if direction != existing_dir.opposite():
+                raise ValueError("Closing fill direction must be opposite the open position")
             # Closing trade (direction is opposite of position)
             trade = Trade(
                 symbol=symbol,
@@ -109,14 +130,20 @@ class Portfolio:
             else:
                 self._cash += qty * (2 * entry_price - fill_price) - commission
             del self._open_positions[symbol]
-            return trade
+            return FillOutcome(True, trade, None, self._cash, self._restricted_collateral)
         else:
             # Opening new position
             trade_id = str(uuid.uuid4())[:8]
             if direction == Direction.LONG:
                 cost = quantity * fill_price + commission
                 if cost > self._cash:
-                    return None  # Insufficient funds — reject fill
+                    return FillOutcome(
+                        False,
+                        None,
+                        FillRejectionReason.INSUFFICIENT_BUYING_POWER,
+                        self._cash,
+                        self._restricted_collateral,
+                    )
                 self._cash -= cost
             else:
                 # NOTE: Simplified short model — cash increases on open (proceeds received).
@@ -132,7 +159,7 @@ class Portfolio:
                 trade_id,
                 commission,
             )
-            return None
+            return FillOutcome(True, None, None, self._cash, self._restricted_collateral)
 
     # ------------------------------------------------------------------
     # Mark-to-market
@@ -156,6 +183,7 @@ class Portfolio:
     def reset(self) -> None:
         """Reset to initial state for a new backtest run."""
         self._cash = self.initial_capital
+        self._restricted_collateral = 0.0
         self._open_positions.clear()
         self._trades.clear()
         self._equity_curve.clear()

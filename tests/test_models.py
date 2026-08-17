@@ -5,7 +5,7 @@ import pytest
 
 from src.models.candle import Candle
 from src.models.order import Direction, Order, OrderType
-from src.models.portfolio import Portfolio
+from src.models.portfolio import FillOutcome, FillRejectionReason, Portfolio
 from src.models.trade import Trade
 from tests.conftest import make_candle
 
@@ -197,10 +197,11 @@ class TestPortfolio:
         dt1 = datetime(2023, 1, 2)
         dt2 = datetime(2023, 2, 1)
         portfolio.record_fill("SPY", Direction.LONG, 100, 100.0, dt1, commission=10.0)
-        trade = portfolio.record_fill("SPY", Direction.SHORT, 100, 110.0, dt2, commission=10.0)
-        assert trade is not None
-        assert trade.is_closed
-        assert trade.pnl == pytest.approx(100 * 10 - 20)  # 1000 - 20 comm
+        outcome = portfolio.record_fill("SPY", Direction.SHORT, 100, 110.0, dt2, commission=10.0)
+        assert outcome.accepted is True
+        assert outcome.trade is not None
+        assert outcome.trade.is_closed
+        assert outcome.trade.pnl == pytest.approx(100 * 10 - 20)  # 1000 - 20 comm
         assert not portfolio.has_position("SPY")
 
     def test_equity_curve_recorded(self, portfolio: Portfolio) -> None:
@@ -231,18 +232,21 @@ class TestPortfolio:
         portfolio.update({"SPY": 110.0}, dt)
         assert portfolio.equity == pytest.approx(portfolio.cash + 100 * 110)
 
-    def test_record_fill_rejects_long_when_insufficient_cash(self) -> None:
-        """Portfolio should reject a LONG fill that exceeds available cash."""
-        portfolio = Portfolio(initial_capital=1000.0)
-        # Try to buy 100 shares at $100 = $10,000 + commission > $1,000
-        result = portfolio.record_fill(
-            symbol="X",
-            direction=Direction.LONG,
-            quantity=100,
-            fill_price=100.0,
-            fill_date=datetime(2023, 1, 1),
-            commission=10.0,
-        )
-        assert result is None
-        assert portfolio.cash == 1000.0  # cash unchanged
-        assert not portfolio.has_position("X")
+    def test_open_long_returns_accepted_outcome(self) -> None:
+        portfolio = Portfolio(1_000.0)
+        outcome = portfolio.record_fill("X", Direction.LONG, 1, 100.0, datetime(2023, 1, 2))
+        assert outcome == FillOutcome(True, None, None, 900.0, 0.0)
+
+    def test_insufficient_cash_returns_rejection_without_mutation(self) -> None:
+        portfolio = Portfolio(1_000.0)
+        outcome = portfolio.record_fill("X", Direction.LONG, 100, 100.0, datetime(2023, 1, 2))
+        assert outcome.accepted is False
+        assert outcome.rejection_reason is FillRejectionReason.INSUFFICIENT_BUYING_POWER
+        assert portfolio.cash == 1_000.0
+        assert portfolio.open_positions == {}
+
+    def test_same_direction_fill_against_open_position_is_invalid(self) -> None:
+        portfolio = Portfolio(1_000.0)
+        portfolio.record_fill("X", Direction.LONG, 1, 100.0, datetime(2023, 1, 2))
+        with pytest.raises(ValueError, match="opposite"):
+            portfolio.record_fill("X", Direction.LONG, 1, 101.0, datetime(2023, 1, 3))
