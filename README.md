@@ -56,6 +56,17 @@ unversioned-baseline, and versioned databases. Use plain `alembic upgrade head` 
 is already configured to target the intended fresh or correctly versioned database; it does not
 provide the classifier's safeguards for an unversioned legacy schema.
 
+## Verification
+
+```bash
+make test
+make lint
+make verify-warnings
+```
+
+`make verify-warnings` is a compatibility release gate: it treats Starlette transport deprecations
+and naive-UTC persistence deprecations as errors in their affected test scopes.
+
 ## Structured operational logs
 
 The API lifespan, data CLI, and Streamlit dashboard each configure one process-wide JSON logging

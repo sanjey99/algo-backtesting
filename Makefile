@@ -13,7 +13,7 @@ SQL_BENCHMARK_REPORT ?= /private/tmp/algo-sql-smoke.json
 DATA_ARTIFACT_DIR ?= artifacts/data-demo
 DATA_ACQUISITION_ID ?=
 
-.PHONY: test lint serve dashboard report install sql-validate sql-compare sql-benchmark-smoke data-acquire-demo data-inspect-demo
+.PHONY: test lint verify-warnings serve dashboard report install sql-validate sql-compare sql-benchmark-smoke data-acquire-demo data-inspect-demo
 
 install:
 	$(PYTHON) -m pip install -e ".[dev]" -q
@@ -27,6 +27,12 @@ test-verbose:
 lint:
 	$(RUFF) check src/ tests/
 	$(MYPY) src/ --strict
+
+verify-warnings:
+	uv run --extra dev pytest tests/test_api.py tests/test_api_data_acquisition.py \
+		-W error::starlette.exceptions.StarletteDeprecationWarning
+	uv run --extra dev pytest tests/test_db.py tests/sql_analytics \
+		-W error::DeprecationWarning
 
 serve:
 	$(PYTHON) -m uvicorn src.api.main:app --reload --port 8000
