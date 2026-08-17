@@ -250,3 +250,77 @@ class TestPortfolio:
         portfolio.record_fill("X", Direction.LONG, 1, 100.0, datetime(2023, 1, 2))
         with pytest.raises(ValueError, match="opposite"):
             portfolio.record_fill("X", Direction.LONG, 1, 101.0, datetime(2023, 1, 3))
+
+    def test_short_entry_reserves_collateral_without_creating_equity(self) -> None:
+        portfolio = Portfolio(10_000.0, short_initial_margin=1.5)
+
+        outcome = portfolio.record_fill(
+            "X", Direction.SHORT, 10, 100.0, datetime(2023, 1, 2), 1.0
+        )
+
+        assert outcome.accepted
+        assert portfolio.cash == pytest.approx(9_499.0)
+        assert portfolio.restricted_collateral == pytest.approx(1_500.0)
+        assert portfolio.equity == pytest.approx(9_999.0)
+
+    def test_short_entry_rejects_insufficient_margin_without_mutation(self) -> None:
+        portfolio = Portfolio(100.0, short_initial_margin=1.5)
+
+        outcome = portfolio.record_fill(
+            "X", Direction.SHORT, 10, 100.0, datetime(2023, 1, 2), 1.0
+        )
+
+        assert outcome.rejection_reason is FillRejectionReason.INSUFFICIENT_BUYING_POWER
+        assert portfolio.cash == pytest.approx(100.0)
+        assert portfolio.restricted_collateral == pytest.approx(0.0)
+        assert portfolio.open_positions == {}
+
+    def test_short_cover_releases_its_collateral_and_reconciles_cash(self) -> None:
+        portfolio = Portfolio(10_000.0, short_initial_margin=1.5)
+        portfolio.record_fill("X", Direction.SHORT, 10, 100.0, datetime(2023, 1, 2), 1.0)
+
+        outcome = portfolio.record_fill("X", Direction.LONG, 10, 90.0, datetime(2023, 1, 3), 1.0)
+
+        assert outcome.accepted
+        assert outcome.trade is not None
+        assert outcome.trade.pnl == pytest.approx(98.0)
+        assert portfolio.cash == pytest.approx(10_098.0)
+        assert portfolio.restricted_collateral == pytest.approx(0.0)
+        assert portfolio.equity == pytest.approx(10_098.0)
+
+    def test_short_borrow_uses_previous_mark_and_elapsed_calendar_days(self) -> None:
+        portfolio = Portfolio(
+            10_000.0, annual_short_borrow_rate=0.365, borrow_day_count=365.0
+        )
+        portfolio.record_fill("X", Direction.SHORT, 10, 100.0, datetime(2023, 1, 2))
+        portfolio.update({"X": 100.0}, datetime(2023, 1, 2))
+
+        charged = portfolio.accrue_short_borrow(datetime(2023, 1, 5))
+
+        assert charged == pytest.approx(3.0)
+        assert portfolio.cash == pytest.approx(9_497.0)
+
+    def test_short_borrow_requires_a_later_timestamp(self) -> None:
+        opened_at = datetime(2023, 1, 2)
+        portfolio = Portfolio(10_000.0)
+        portfolio.record_fill("X", Direction.SHORT, 10, 100.0, opened_at)
+
+        with pytest.raises(ValueError, match="strictly later"):
+            portfolio.accrue_short_borrow(opened_at)
+
+    def test_maintenance_ratio_uses_equity_over_current_short_value(self) -> None:
+        portfolio = Portfolio(10_000.0, short_initial_margin=1.5)
+        portfolio.record_fill("X", Direction.SHORT, 10, 100.0, datetime(2023, 1, 2))
+        portfolio.update({"X": 125.0}, datetime(2023, 1, 2))
+
+        assert portfolio.maintenance_ratio("X") == pytest.approx(7.8)
+        assert portfolio.maintenance_ratio("MISSING") is None
+
+    def test_reset_clears_short_collateral_and_borrow_state(self) -> None:
+        opened_at = datetime(2023, 1, 2)
+        portfolio = Portfolio(10_000.0)
+        portfolio.record_fill("X", Direction.SHORT, 10, 100.0, opened_at)
+        portfolio.reset()
+
+        assert portfolio.restricted_collateral == pytest.approx(0.0)
+        assert portfolio.accrue_short_borrow(opened_at) == pytest.approx(0.0)

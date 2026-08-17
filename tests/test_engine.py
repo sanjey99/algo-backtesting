@@ -16,6 +16,34 @@ from src.models.order import Direction, Order, OrderType
 from tests.conftest import make_candle, make_candle_series
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("short_initial_margin", 0.99),
+        ("short_maintenance_margin", -0.01),
+        ("annual_short_borrow_rate", -0.01),
+        ("borrow_day_count", 0.0),
+    ],
+)
+def test_backtest_config_rejects_invalid_margin_values(field: str, value: float) -> None:
+    with pytest.raises(ValueError):
+        BacktestConfig(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("short_initial_margin", float("inf")),
+        ("short_maintenance_margin", float("nan")),
+        ("annual_short_borrow_rate", float("inf")),
+        ("borrow_day_count", float("nan")),
+    ],
+)
+def test_backtest_config_rejects_non_finite_margin_values(field: str, value: float) -> None:
+    with pytest.raises(ValueError):
+        BacktestConfig(**{field: value})
+
+
 def _bar(index: int, open_: float, high: float, low: float, close: float) -> Candle:
     return Candle(
         timestamp=datetime(2023, 1, index + 1),
@@ -310,7 +338,7 @@ class _BuyDay0SellDay49Strategy:
     """
 
     name: str = "BuyDay0SellDay49"
-    parameters: dict = {}
+    parameters: dict[str, object] = {}
 
     def __init__(self, symbol: str = "TEST") -> None:
         self._symbol = symbol
@@ -422,7 +450,7 @@ class TestBacktestEngine:
 
         class _NullStrategy:
             name = "Null"
-            parameters: dict = {}
+            parameters: dict[str, object] = {}
 
             def on_candle(
                 self, candle: Candle, context: StrategyContext
@@ -438,7 +466,7 @@ class TestBacktestEngine:
     def test_empty_candles_raises(self) -> None:
         class _NullStrategy:
             name = "Null"
-            parameters: dict = {}
+            parameters: dict[str, object] = {}
 
             def on_candle(
                 self, candle: Candle, context: StrategyContext
@@ -590,6 +618,28 @@ class _CaptureRejectedOrderContext:
 
 
 class TestBacktestEnginePendingOrders:
+    def test_engine_accrues_short_borrow_from_previous_close_before_next_fill_phase(self) -> None:
+        candles = [
+            _bar(0, 100.0, 101.0, 99.0, 100.0),
+            _bar(1, 100.0, 201.0, 99.0, 200.0),
+            _bar(2, 50.0, 51.0, 49.0, 50.0),
+        ]
+        strategy = _ScheduledSignals({0: (Direction.SHORT, OrderType.MARKET, None)})
+
+        result = BacktestEngine().run(
+            strategy,
+            candles,
+            BacktestConfig(
+                initial_capital=1_000.0,
+                commission_pct=0.0,
+                slippage_pct=0.0,
+                annual_short_borrow_rate=0.365,
+                borrow_day_count=365.0,
+            ),
+        )
+
+        assert result.final_equity == pytest.approx(1_049.8)
+
     def test_signal_on_bar_n_fills_at_next_bar_open(self) -> None:
         candles = [
             _bar(0, 100.0, 101.0, 99.0, 100.0),

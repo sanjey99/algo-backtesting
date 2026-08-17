@@ -5,6 +5,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from math import isfinite
 
 from src.models.order import Direction
 from src.models.trade import Trade
@@ -38,12 +39,31 @@ class Portfolio:
     update() marks-to-market at the close of each bar.
     """
 
-    def __init__(self, initial_capital: float = 100_000.0) -> None:
-        if initial_capital <= 0:
+    def __init__(
+        self,
+        initial_capital: float = 100_000.0,
+        short_initial_margin: float = 1.50,
+        short_maintenance_margin: float = 0.30,
+        annual_short_borrow_rate: float = 0.03,
+        borrow_day_count: float = 365.0,
+    ) -> None:
+        if not isfinite(initial_capital) or initial_capital <= 0:
             raise ValueError("Initial capital must be positive")
+        self._validate_short_settings(
+            short_initial_margin,
+            short_maintenance_margin,
+            annual_short_borrow_rate,
+            borrow_day_count,
+        )
         self.initial_capital = initial_capital
+        self.short_initial_margin = short_initial_margin
+        self.short_maintenance_margin = short_maintenance_margin
+        self.annual_short_borrow_rate = annual_short_borrow_rate
+        self.borrow_day_count = borrow_day_count
         self._cash: float = initial_capital
         self._restricted_collateral: float = 0.0
+        self._short_collateral: dict[str, float] = {}
+        self._last_short_borrow_timestamp: dict[str, datetime] = {}
         # symbol -> (direction, quantity, entry_price, entry_date, trade_id, commission)
         self._open_positions: dict[str, tuple[Direction, int, float, datetime, str, float]] = {}
         self._trades: list[Trade] = []
@@ -72,9 +92,8 @@ class Portfolio:
             if direction == Direction.LONG:
                 pos_value += qty * price
             else:
-                # Short: profit when price falls
-                pos_value += qty * (2 * entry_price - price)
-        return self._cash + pos_value
+                pos_value -= qty * price
+        return self._cash + self._restricted_collateral + pos_value
 
     @property
     def equity_curve(self) -> list[EquityPoint]:
@@ -128,7 +147,10 @@ class Portfolio:
             if existing_dir == Direction.LONG:
                 self._cash += qty * fill_price - commission
             else:
-                self._cash += qty * (2 * entry_price - fill_price) - commission
+                released_collateral = self._short_collateral.pop(symbol)
+                self._restricted_collateral -= released_collateral
+                self._cash += released_collateral - qty * fill_price - commission
+                del self._last_short_borrow_timestamp[symbol]
             del self._open_positions[symbol]
             return FillOutcome(True, trade, None, self._cash, self._restricted_collateral)
         else:
@@ -146,11 +168,22 @@ class Portfolio:
                     )
                 self._cash -= cost
             else:
-                # NOTE: Simplified short model — cash increases on open (proceeds received).
-                # Not modeled: margin reserve (typically 150% of position value), borrowing
-                # costs, or margin calls. Add margin_requirement to BacktestConfig for
-                # production use.
-                self._cash += quantity * fill_price - commission
+                notional = quantity * fill_price
+                additional_margin = notional * (self.short_initial_margin - 1.0)
+                required_cash = additional_margin + commission
+                if required_cash > self._cash:
+                    return FillOutcome(
+                        False,
+                        None,
+                        FillRejectionReason.INSUFFICIENT_BUYING_POWER,
+                        self._cash,
+                        self._restricted_collateral,
+                    )
+                collateral = notional * self.short_initial_margin
+                self._cash -= required_cash
+                self._restricted_collateral += collateral
+                self._short_collateral[symbol] = collateral
+                self._last_short_borrow_timestamp[symbol] = fill_date
             self._open_positions[symbol] = (
                 direction,
                 quantity,
@@ -160,6 +193,47 @@ class Portfolio:
                 commission,
             )
             return FillOutcome(True, None, None, self._cash, self._restricted_collateral)
+
+    def accrue_short_borrow(self, timestamp: datetime) -> float:
+        """Deduct borrow fees for open shorts using their previously marked prices."""
+        short_positions = [
+            (symbol, position)
+            for symbol, position in self._open_positions.items()
+            if position[0] == Direction.SHORT
+        ]
+        if not short_positions:
+            return 0.0
+
+        for symbol, _ in short_positions:
+            if timestamp <= self._last_short_borrow_timestamp[symbol]:
+                raise ValueError("Short borrow accrual timestamp must be strictly later")
+
+        charge = 0.0
+        for symbol, (_, quantity, entry_price, _, _, _) in short_positions:
+            elapsed_days = (
+                timestamp - self._last_short_borrow_timestamp[symbol]
+            ).total_seconds() / 86_400.0
+            previous_marked_short_value = quantity * self._current_prices.get(symbol, entry_price)
+            charge += (
+                previous_marked_short_value
+                * self.annual_short_borrow_rate
+                * elapsed_days
+                / self.borrow_day_count
+            )
+
+        self._cash -= charge
+        for symbol, _ in short_positions:
+            self._last_short_borrow_timestamp[symbol] = timestamp
+        return charge
+
+    def maintenance_ratio(self, symbol: str) -> float | None:
+        """Return equity over marked short value, or None when *symbol* is not short."""
+        position = self._open_positions.get(symbol)
+        if position is None or position[0] != Direction.SHORT:
+            return None
+        _, quantity, entry_price, _, _, _ = position
+        current_price = self._current_prices.get(symbol, entry_price)
+        return self.equity / (quantity * current_price)
 
     # ------------------------------------------------------------------
     # Mark-to-market
@@ -184,8 +258,34 @@ class Portfolio:
         """Reset to initial state for a new backtest run."""
         self._cash = self.initial_capital
         self._restricted_collateral = 0.0
+        self._short_collateral.clear()
+        self._last_short_borrow_timestamp.clear()
         self._open_positions.clear()
         self._trades.clear()
         self._equity_curve.clear()
         self._peak_equity = self.initial_capital
         self._current_prices.clear()
+
+    @staticmethod
+    def _validate_short_settings(
+        short_initial_margin: float,
+        short_maintenance_margin: float,
+        annual_short_borrow_rate: float,
+        borrow_day_count: float,
+    ) -> None:
+        settings = (
+            short_initial_margin,
+            short_maintenance_margin,
+            annual_short_borrow_rate,
+            borrow_day_count,
+        )
+        if not all(isfinite(value) for value in settings):
+            raise ValueError("Short margin settings must be finite")
+        if short_initial_margin < 1.0:
+            raise ValueError("Short initial margin must be at least 1.0")
+        if short_maintenance_margin < 0.0:
+            raise ValueError("Short maintenance margin must be nonnegative")
+        if annual_short_borrow_rate < 0.0:
+            raise ValueError("Annual short borrow rate must be nonnegative")
+        if borrow_day_count <= 0.0:
+            raise ValueError("Borrow day count must be positive")

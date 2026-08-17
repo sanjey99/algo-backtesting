@@ -5,6 +5,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import pairwise
+from math import isfinite
 from typing import Any, Protocol
 
 from src.engine.broker import SimulatedBroker
@@ -40,6 +41,28 @@ class BacktestConfig:
     initial_capital: float = 100_000.0
     commission_pct: float = 0.001
     slippage_pct: float = 0.0005
+    short_initial_margin: float = 1.50
+    short_maintenance_margin: float = 0.30
+    annual_short_borrow_rate: float = 0.03
+    borrow_day_count: float = 365.0
+
+    def __post_init__(self) -> None:
+        margin_settings = (
+            self.short_initial_margin,
+            self.short_maintenance_margin,
+            self.annual_short_borrow_rate,
+            self.borrow_day_count,
+        )
+        if not all(isfinite(value) for value in margin_settings):
+            raise ValueError("Short margin settings must be finite")
+        if self.short_initial_margin < 1.0:
+            raise ValueError("Short initial margin must be at least 1.0")
+        if self.short_maintenance_margin < 0.0:
+            raise ValueError("Short maintenance margin must be nonnegative")
+        if self.annual_short_borrow_rate < 0.0:
+            raise ValueError("Annual short borrow rate must be nonnegative")
+        if self.borrow_day_count <= 0.0:
+            raise ValueError("Borrow day count must be positive")
 
 
 @dataclass
@@ -98,7 +121,13 @@ class BacktestEngine:
         ):
             raise ValueError("candles must have strictly increasing timestamps")
 
-        portfolio = Portfolio(initial_capital=config.initial_capital)
+        portfolio = Portfolio(
+            initial_capital=config.initial_capital,
+            short_initial_margin=config.short_initial_margin,
+            short_maintenance_margin=config.short_maintenance_margin,
+            annual_short_borrow_rate=config.annual_short_borrow_rate,
+            borrow_day_count=config.borrow_day_count,
+        )
         broker = SimulatedBroker(
             slippage_pct=config.slippage_pct,
             commission_pct=config.commission_pct,
@@ -109,7 +138,9 @@ class BacktestEngine:
         symbol: str = "UNKNOWN"
         pending: _PendingOrder | None = None
 
-        for candle in candles:
+        for candle_index, candle in enumerate(candles):
+            if candle_index > 0:
+                portfolio.accrue_short_borrow(candle.timestamp)
             if pending is not None:
                 fill: FillEvent | None = broker.execute(pending.order, candle)
                 if fill is None:
