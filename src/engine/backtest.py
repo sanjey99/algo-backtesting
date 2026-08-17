@@ -4,11 +4,12 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+from itertools import pairwise
 from typing import Any, Protocol
 
 from src.engine.broker import SimulatedBroker
 from src.engine.context import StrategyContext
-from src.engine.event import FillEvent, OrderEvent, SignalEvent
+from src.engine.event import FillEvent, SignalEvent
 from src.models.candle import Candle
 from src.models.order import Order, OrderType
 from src.models.portfolio import EquityPoint, Portfolio
@@ -55,6 +56,14 @@ class BacktestResult:
     run_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingOrder:
+    """Run-local order awaiting execution on a later candle."""
+
+    order: Order
+    forced_cover: bool = False
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -64,12 +73,12 @@ class BacktestEngine:
 
     Wiring per bar
     --------------
-    1. strategy.on_candle(candle, context) -> Optional[SignalEvent]
-    2. If signal and no open position    -> create MARKET OrderEvent (open)
-       If signal is opposite open position -> create MARKET OrderEvent (close)
-    3. broker.execute(order, candle) -> Optional[FillEvent]
-    4. portfolio.record_fill(...)
-    5. portfolio.update({symbol: close}, timestamp)
+    1. Execute an order queued by an earlier candle, retaining an untriggered
+       conditional order.
+    2. Mark the filled portfolio to the current close.
+    3. Build immutable strategy context from filled and pending state.
+    4. Queue a valid strategy order for execution on a later candle, replacing
+       any stale strategy order.
 
     The engine is stateless between runs: a fresh Portfolio and
     SimulatedBroker are constructed from *config* on every call to run().
@@ -83,6 +92,11 @@ class BacktestEngine:
     ) -> BacktestResult:
         if not candles:
             raise ValueError("candles list must not be empty")
+        if any(
+            current.timestamp <= previous.timestamp
+            for previous, current in pairwise(candles)
+        ):
+            raise ValueError("candles must have strictly increasing timestamps")
 
         portfolio = Portfolio(initial_capital=config.initial_capital)
         broker = SimulatedBroker(
@@ -90,35 +104,43 @@ class BacktestEngine:
             commission_pct=config.commission_pct,
         )
 
-        # Infer symbol from candles (engine is single-symbol per run)
-        # Strategies emit signals that carry their own symbol; we capture it
-        # from the first signal seen, defaulting to "UNKNOWN" if none fires.
+        # The engine is single-symbol per run. Capture the symbol from the
+        # first actionable order, defaulting to "UNKNOWN" if none is queued.
         symbol: str = "UNKNOWN"
+        pending: _PendingOrder | None = None
 
         for candle in candles:
-            signal: SignalEvent | None = strategy.on_candle(candle, StrategyContext())
+            if pending is not None:
+                fill: FillEvent | None = broker.execute(pending.order, candle)
+                if fill is None:
+                    if pending.order.order_type not in (
+                        OrderType.LIMIT,
+                        OrderType.STOP,
+                    ):
+                        pending = None
+                else:
+                    portfolio.record_fill(
+                        symbol=fill.symbol,
+                        direction=fill.direction,
+                        quantity=fill.quantity,
+                        fill_price=fill.fill_price,
+                        fill_date=fill.fill_date,
+                        commission=fill.commission,
+                    )
+                    pending = None
+
+            portfolio.update({symbol: candle.close}, candle.timestamp)
+
+            context = self._build_context(portfolio, pending)
+            signal: SignalEvent | None = strategy.on_candle(candle, context)
 
             if signal is not None:
-                symbol = signal.symbol
                 order: Order | None = self._build_order(
                     signal, portfolio, candle
                 )
                 if order is not None:
-                    order_event = OrderEvent(order=order)
-                    fill: FillEvent | None = broker.execute(
-                        order_event.order, candle
-                    )
-                    if fill is not None:
-                        portfolio.record_fill(
-                            symbol=fill.symbol,
-                            direction=fill.direction,
-                            quantity=fill.quantity,
-                            fill_price=fill.fill_price,
-                            fill_date=fill.fill_date,
-                            commission=fill.commission,
-                        )
-
-            portfolio.update({symbol: candle.close}, candle.timestamp)
+                    symbol = order.symbol
+                    pending = _PendingOrder(order=order)
 
         return BacktestResult(
             strategy_name=strategy.name,
@@ -142,33 +164,47 @@ class BacktestEngine:
         portfolio: Portfolio,
         candle: Candle,
     ) -> Order | None:
-        """Translate a SignalEvent into a MARKET Order, or None if nothing to do."""
-        symbol = signal.symbol
-        has_position = portfolio.has_position(symbol)
+        """Translate a signal into an opening or exact-position closing order."""
+        del candle
+        execution_symbol = signal.symbol
+        quantity = 1
+        open_positions = portfolio.open_positions
 
-        if not has_position:
-            # No position open — enter in the signal direction
-            return Order(
-                symbol=symbol,
-                direction=signal.direction,
-                quantity=1,
-                order_type=OrderType.MARKET,
+        if open_positions:
+            execution_symbol, position = next(iter(open_positions.items()))
+            existing_direction, quantity, *_ = position
+            if signal.direction is not existing_direction.opposite():
+                return None
+
+        return Order(
+            symbol=execution_symbol,
+            direction=signal.direction,
+            quantity=quantity,
+            order_type=signal.order_type,
+            limit_price=signal.limit_price,
+            stop_price=signal.stop_price,
+            created_at=signal.timestamp,
+        )
+
+    @staticmethod
+    def _build_context(
+        portfolio: Portfolio,
+        pending: _PendingOrder | None,
+    ) -> StrategyContext:
+        """Expose the sole filled position and pending strategy order."""
+        open_positions = portfolio.open_positions
+        if open_positions:
+            position_direction, position_quantity, *_ = next(
+                iter(open_positions.values())
             )
+        else:
+            position_direction = None
+            position_quantity = 0
 
-        # Position already open — only act if signal is a reversal / close
-        existing_dir = portfolio.open_positions[symbol][0]
-        if signal.direction == existing_dir.opposite():
-            # Close (and potentially reverse) by submitting a closing order
-            # in the *opposite* direction of the signal so record_fill sees it
-            # as closing the existing leg.  We use the existing position's
-            # quantity so we close exactly what we have.
-            existing_qty = portfolio.open_positions[symbol][1]
-            return Order(
-                symbol=symbol,
-                direction=signal.direction,
-                quantity=existing_qty,
-                order_type=OrderType.MARKET,
-            )
-
-        # Signal is in the same direction as existing position — ignore
-        return None
+        return StrategyContext(
+            position_direction=position_direction,
+            position_quantity=position_quantity,
+            pending_direction=pending.order.direction if pending is not None else None,
+            pending_order_type=pending.order.order_type if pending is not None else None,
+            forced_cover_pending=pending.forced_cover if pending is not None else False,
+        )

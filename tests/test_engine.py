@@ -15,6 +15,18 @@ from src.models.order import Direction, Order, OrderType
 # Re-use conftest helpers directly (not as fixtures) for unit-level tests
 from tests.conftest import make_candle, make_candle_series
 
+
+def _bar(index: int, open_: float, high: float, low: float, close: float) -> Candle:
+    return Candle(
+        timestamp=datetime(2023, 1, index + 1),
+        open=open_,
+        high=high,
+        low=low,
+        close=close,
+        volume=1_000.0,
+        adj_close=close,
+    )
+
 # ---------------------------------------------------------------------------
 # Event dataclass instantiation
 # ---------------------------------------------------------------------------
@@ -292,7 +304,7 @@ class TestSimulatedBrokerStop:
 
 
 class _BuyDay0SellDay49Strategy:
-    """Signals LONG on the first candle, SHORT on the 50th candle (index 49).
+    """Signals LONG on the first candle, SHORT before the 50th candle.
 
     Uses a bar counter so it is self-contained and repeatable.
     """
@@ -316,7 +328,7 @@ class _BuyDay0SellDay49Strategy:
                 direction=Direction.LONG,
                 timestamp=candle.timestamp,
             )
-        if idx == 49:
+        if idx == 48:
             return SignalEvent(
                 symbol=self._symbol,
                 direction=Direction.SHORT,
@@ -356,7 +368,7 @@ class TestBacktestEngine:
         result = engine.run(strategy, candles, self._config())
 
         # Manual calculation matching broker logic
-        buy_open = candles[0].open  # 99.7
+        buy_open = candles[1].open  # 100.2
         sell_open = candles[49].open  # 100 + 49*0.5 - 0.3 = 124.2
         qty = 1
 
@@ -435,3 +447,251 @@ class TestBacktestEngine:
 
         with pytest.raises(ValueError, match="candles list must not be empty"):
             BacktestEngine().run(_NullStrategy(), [], self._config())
+
+
+class _BuyOnZeroSellOnOne:
+    name = "timing"
+    parameters: dict[str, object] = {}
+
+    def __init__(self) -> None:
+        self.index = 0
+
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
+        index = self.index
+        self.index += 1
+        if index == 0:
+            return SignalEvent("X", Direction.LONG, timestamp=candle.timestamp)
+        if index == 1 and context.position_direction is Direction.LONG:
+            return SignalEvent("X", Direction.SHORT, timestamp=candle.timestamp)
+        return None
+
+
+class _BuyLimitThenCloseAfterFill:
+    name = "limit-timing"
+    parameters: dict[str, object] = {}
+
+    def __init__(self, limit: float) -> None:
+        self.limit = limit
+        self.submitted = False
+
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
+        if not self.submitted:
+            self.submitted = True
+            return SignalEvent(
+                "X",
+                Direction.LONG,
+                timestamp=candle.timestamp,
+                order_type=OrderType.LIMIT,
+                limit_price=self.limit,
+            )
+        if context.position_direction is Direction.LONG:
+            return SignalEvent("X", Direction.SHORT, timestamp=candle.timestamp)
+        return None
+
+
+class _SignalOnlyOnLastBar:
+    name = "last-bar"
+    parameters: dict[str, object] = {}
+
+    def __init__(self, last_index: int = 2) -> None:
+        self.index = 0
+        self.last_index = last_index
+
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
+        index = self.index
+        self.index += 1
+        if index == self.last_index:
+            return SignalEvent("X", Direction.LONG, timestamp=candle.timestamp)
+        return None
+
+
+class _ScheduledSignals:
+    name = "scheduled"
+    parameters: dict[str, object] = {}
+
+    def __init__(
+        self,
+        schedule: dict[int, tuple[Direction, OrderType, float | None]],
+    ) -> None:
+        self.index = 0
+        self.schedule = schedule
+
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
+        index = self.index
+        self.index += 1
+        instruction = self.schedule.get(index)
+        if instruction is None:
+            return None
+        direction, order_type, price = instruction
+        return SignalEvent(
+            "X",
+            direction,
+            timestamp=candle.timestamp,
+            order_type=order_type,
+            limit_price=price if order_type is OrderType.LIMIT else None,
+            stop_price=price if order_type is OrderType.STOP else None,
+        )
+
+
+class _CaptureContexts:
+    name = "contexts"
+    parameters: dict[str, object] = {}
+
+    def __init__(self) -> None:
+        self.index = 0
+        self.contexts: list[StrategyContext] = []
+
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
+        index = self.index
+        self.index += 1
+        self.contexts.append(context)
+        if index == 0:
+            return SignalEvent(
+                "X",
+                Direction.LONG,
+                timestamp=candle.timestamp,
+                order_type=OrderType.LIMIT,
+                limit_price=90.0,
+            )
+        if index == 1:
+            return SignalEvent("X", Direction.LONG, timestamp=candle.timestamp)
+        if index == 2:
+            return SignalEvent("WRONG", Direction.SHORT, timestamp=candle.timestamp)
+        return None
+
+
+class TestBacktestEnginePendingOrders:
+    def test_signal_on_bar_n_fills_at_next_bar_open(self) -> None:
+        candles = [
+            _bar(0, 100.0, 101.0, 99.0, 100.0),
+            _bar(1, 110.0, 111.0, 109.0, 110.0),
+            _bar(2, 120.0, 121.0, 119.0, 120.0),
+        ]
+
+        result = BacktestEngine().run(
+            _BuyOnZeroSellOnOne(), candles, BacktestConfig()
+        )
+
+        trade = result.trades[0]
+        assert trade.entry_date == candles[1].timestamp
+        assert trade.entry_price == pytest.approx(candles[1].open * 1.0005)
+        assert trade.exit_date == candles[2].timestamp
+
+    def test_limit_order_persists_until_later_bar_crosses(self) -> None:
+        candles = [
+            _bar(0, 100, 105, 99, 103),
+            _bar(1, 103, 104, 101, 102),
+            _bar(2, 98, 100, 95, 99),
+            _bar(3, 100, 102, 99, 101),
+        ]
+
+        result = BacktestEngine().run(
+            _BuyLimitThenCloseAfterFill(limit=99.0), candles, BacktestConfig()
+        )
+
+        assert result.trades[0].entry_date == candles[2].timestamp
+        assert result.trades[0].exit_date == candles[3].timestamp
+
+    def test_final_bar_signal_is_not_filled(self) -> None:
+        result = BacktestEngine().run(
+            _SignalOnlyOnLastBar(), make_candle_series(3), BacktestConfig()
+        )
+
+        assert result.trades == []
+        assert result.final_equity == result.initial_capital
+
+    def test_newer_same_direction_limit_replaces_stale_pending_order(self) -> None:
+        strategy = _ScheduledSignals(
+            {
+                0: (Direction.LONG, OrderType.LIMIT, 90.0),
+                1: (Direction.LONG, OrderType.LIMIT, 95.0),
+                2: (Direction.SHORT, OrderType.MARKET, None),
+            }
+        )
+        candles = [
+            _bar(0, 100, 101, 99, 100),
+            _bar(1, 100, 101, 98, 100),
+            _bar(2, 94, 96, 93, 95),
+            _bar(3, 96, 97, 95, 96),
+        ]
+
+        result = BacktestEngine().run(strategy, candles, BacktestConfig())
+
+        assert result.trades[0].entry_date == candles[2].timestamp
+
+    def test_opposite_signal_replaces_unfilled_entry(self) -> None:
+        strategy = _ScheduledSignals(
+            {
+                0: (Direction.LONG, OrderType.LIMIT, 90.0),
+                1: (Direction.SHORT, OrderType.MARKET, None),
+                2: (Direction.LONG, OrderType.MARKET, None),
+            }
+        )
+        candles = [
+            _bar(0, 100, 101, 99, 100),
+            _bar(1, 100, 101, 98, 100),
+            _bar(2, 99, 100, 98, 99),
+            _bar(3, 98, 99, 97, 98),
+        ]
+
+        result = BacktestEngine().run(strategy, candles, BacktestConfig())
+
+        assert result.trades[0].direction is Direction.SHORT
+        assert result.trades[0].entry_date == candles[2].timestamp
+
+    def test_context_reflects_pending_and_filled_execution_state(self) -> None:
+        strategy = _CaptureContexts()
+        candles = [
+            _bar(0, 100, 101, 99, 100),
+            _bar(1, 100, 101, 99, 100),
+            _bar(2, 101, 102, 100, 101),
+            _bar(3, 102, 103, 101, 102),
+        ]
+
+        result = BacktestEngine().run(strategy, candles, BacktestConfig())
+
+        assert strategy.contexts[1] == StrategyContext(
+            pending_direction=Direction.LONG,
+            pending_order_type=OrderType.LIMIT,
+        )
+        assert strategy.contexts[2] == StrategyContext(
+            position_direction=Direction.LONG,
+            position_quantity=1,
+        )
+        assert strategy.contexts[2].forced_cover_pending is False
+        assert result.trades[0].symbol == "X"
+
+    def test_conditional_signal_requires_a_price(self) -> None:
+        strategy = _ScheduledSignals(
+            {0: (Direction.LONG, OrderType.LIMIT, None)}
+        )
+
+        with pytest.raises(ValueError, match="LIMIT order requires limit_price"):
+            BacktestEngine().run(strategy, make_candle_series(2), BacktestConfig())
+
+    def test_candles_require_strictly_increasing_timestamps(self) -> None:
+        candles = make_candle_series(2)
+        candles[1] = Candle(
+            timestamp=candles[0].timestamp,
+            open=candles[1].open,
+            high=candles[1].high,
+            low=candles[1].low,
+            close=candles[1].close,
+            volume=candles[1].volume,
+            adj_close=candles[1].adj_close,
+        )
+
+        with pytest.raises(
+            ValueError, match="candles must have strictly increasing timestamps"
+        ):
+            BacktestEngine().run(_SignalOnlyOnLastBar(), candles, BacktestConfig())

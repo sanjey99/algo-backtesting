@@ -29,9 +29,9 @@ class SignalEvent(Event):
     direction: Direction
     strength: float = 1.0  # 0.0-1.0, used by position sizer
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
-    order_type: OrderType = OrderType.MARKET   # NEW
-    limit_price: float | None = None            # NEW
-    stop_price: float | None = None             # NEW
+    order_type: OrderType = OrderType.MARKET
+    limit_price: float | None = None
+    stop_price: float | None = None
 
 
 @dataclass
