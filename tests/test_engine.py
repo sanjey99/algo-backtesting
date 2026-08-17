@@ -570,6 +570,25 @@ class _CaptureContexts:
         return None
 
 
+class _CaptureRejectedOrderContext:
+    name = "rejected-order-context"
+    parameters: dict[str, object] = {}
+
+    def __init__(self) -> None:
+        self.index = 0
+        self.contexts: list[StrategyContext] = []
+
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
+        index = self.index
+        self.index += 1
+        self.contexts.append(context)
+        if index == 0:
+            return SignalEvent("X", Direction.LONG, timestamp=candle.timestamp)
+        return None
+
+
 class TestBacktestEnginePendingOrders:
     def test_signal_on_bar_n_fills_at_next_bar_open(self) -> None:
         candles = [
@@ -678,6 +697,23 @@ class TestBacktestEnginePendingOrders:
 
         with pytest.raises(ValueError, match="LIMIT order requires limit_price"):
             BacktestEngine().run(strategy, make_candle_series(2), BacktestConfig())
+
+    def test_rejected_order_is_absent_from_next_strategy_context(self) -> None:
+        strategy = _CaptureRejectedOrderContext()
+        candles = [
+            _bar(0, 100, 101, 99, 100),
+            _bar(1, 100, 101, 99, 100),
+        ]
+
+        result = BacktestEngine().run(
+            strategy,
+            candles,
+            BacktestConfig(initial_capital=50.0),
+        )
+
+        assert strategy.contexts[1] == StrategyContext()
+        assert result.trades == []
+        assert result.final_equity == 50.0
 
     def test_candles_require_strictly_increasing_timestamps(self) -> None:
         candles = make_candle_series(2)

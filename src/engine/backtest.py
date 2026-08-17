@@ -12,7 +12,7 @@ from src.engine.context import StrategyContext
 from src.engine.event import FillEvent, SignalEvent
 from src.models.candle import Candle
 from src.models.order import Order, OrderType
-from src.models.portfolio import EquityPoint, Portfolio
+from src.models.portfolio import EquityPoint, FillOutcome, Portfolio
 from src.models.trade import Trade
 
 # ---------------------------------------------------------------------------
@@ -119,7 +119,7 @@ class BacktestEngine:
                     ):
                         pending = None
                 else:
-                    portfolio.record_fill(
+                    fill_outcome: FillOutcome = portfolio.record_fill(
                         symbol=fill.symbol,
                         direction=fill.direction,
                         quantity=fill.quantity,
@@ -127,7 +127,12 @@ class BacktestEngine:
                         fill_date=fill.fill_date,
                         commission=fill.commission,
                     )
-                    pending = None
+                    if not fill_outcome.accepted:
+                        # A typed rejection terminates the attempted order.
+                        pending = None
+                    else:
+                        symbol = fill.symbol
+                        pending = None
 
             portfolio.update({symbol: candle.close}, candle.timestamp)
 
