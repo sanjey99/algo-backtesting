@@ -539,6 +539,93 @@ class _SignalOnlyOnLastBar:
         return None
 
 
+class _OpenShortOnce:
+    name = "short-once"
+    parameters: dict[str, object] = {}
+
+    def __init__(self) -> None:
+        self.submitted = False
+
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
+        if self.submitted:
+            return None
+        self.submitted = True
+        return SignalEvent("X", Direction.SHORT, timestamp=candle.timestamp)
+
+
+class _OpenShortThenLimitCover:
+    name = "short-then-limit-cover"
+    parameters: dict[str, object] = {}
+
+    def __init__(self) -> None:
+        self.index = 0
+
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
+        index = self.index
+        self.index += 1
+        if index == 0:
+            return SignalEvent("X", Direction.SHORT, timestamp=candle.timestamp)
+        if index == 1:
+            return SignalEvent(
+                "X",
+                Direction.LONG,
+                timestamp=candle.timestamp,
+                order_type=OrderType.LIMIT,
+                limit_price=900.0,
+            )
+        return None
+
+
+def _margin_config() -> BacktestConfig:
+    return BacktestConfig(
+        initial_capital=1_000.0,
+        commission_pct=0.0,
+        slippage_pct=0.0,
+        short_maintenance_margin=0.30,
+    )
+
+
+def _margin_breach_candles(include_cover_bar: bool = True) -> list[Candle]:
+    candles = [
+        _bar(0, 100, 100, 100, 100),
+        _bar(1, 100, 1_000, 100, 1_000),
+    ]
+    if include_cover_bar:
+        candles.append(_bar(2, 1_100, 1_110, 1_090, 1_100))
+    return candles
+
+
+def test_margin_breach_forces_cover_at_following_open() -> None:
+    candles = _margin_breach_candles()
+    result = BacktestEngine().run(_OpenShortOnce(), candles, _margin_config())
+
+    assert len(result.trades) == 1
+    assert result.trades[0].exit_date == candles[2].timestamp
+    assert result.trades[0].exit_price == 1_100.0
+
+
+def test_final_bar_margin_breach_does_not_invent_cover() -> None:
+    result = BacktestEngine().run(
+        _OpenShortOnce(), _margin_breach_candles(False), _margin_config()
+    )
+
+    assert result.trades == []
+
+
+def test_margin_forced_cover_cannot_be_replaced_by_strategy_order() -> None:
+    candles = _margin_breach_candles()
+    result = BacktestEngine().run(
+        _OpenShortThenLimitCover(), candles, _margin_config()
+    )
+
+    assert len(result.trades) == 1
+    assert result.trades[0].exit_price == 1_100.0
+
+
 class _ScheduledSignals:
     name = "scheduled"
     parameters: dict[str, object] = {}

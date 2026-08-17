@@ -12,7 +12,7 @@ from src.engine.broker import SimulatedBroker
 from src.engine.context import StrategyContext
 from src.engine.event import FillEvent, SignalEvent
 from src.models.candle import Candle
-from src.models.order import Order, OrderType
+from src.models.order import Direction, Order, OrderType
 from src.models.portfolio import EquityPoint, FillOutcome, Portfolio
 from src.models.trade import Trade
 
@@ -99,9 +99,10 @@ class BacktestEngine:
     1. Execute an order queued by an earlier candle, retaining an untriggered
        conditional order.
     2. Mark the filled portfolio to the current close.
-    3. Build immutable strategy context from filled and pending state.
-    4. Queue a valid strategy order for execution on a later candle, replacing
-       any stale strategy order.
+    3. Queue a forced market cover after a short maintenance-margin breach.
+    4. Build immutable strategy context from filled and pending state.
+    5. Queue a valid strategy order for execution on a later candle, replacing
+       any stale strategy order unless a forced cover is pending.
 
     The engine is stateless between runs: a fresh Portfolio and
     SimulatedBroker are constructed from *config* on every call to run().
@@ -167,10 +168,34 @@ class BacktestEngine:
 
             portfolio.update({symbol: candle.close}, candle.timestamp)
 
+            if pending is None or not pending.forced_cover:
+                open_positions = portfolio.open_positions
+                if len(open_positions) == 1:
+                    position_symbol, position = next(iter(open_positions.items()))
+                    position_direction, position_quantity, *_ = position
+                    maintenance_ratio = portfolio.maintenance_ratio(position_symbol)
+                    if (
+                        position_direction is Direction.SHORT
+                        and maintenance_ratio is not None
+                        and maintenance_ratio < config.short_maintenance_margin
+                    ):
+                        pending = _PendingOrder(
+                            order=Order(
+                                symbol=position_symbol,
+                                direction=Direction.LONG,
+                                quantity=position_quantity,
+                                order_type=OrderType.MARKET,
+                                created_at=candle.timestamp,
+                            ),
+                            forced_cover=True,
+                        )
+
             context = self._build_context(portfolio, pending)
             signal: SignalEvent | None = strategy.on_candle(candle, context)
 
-            if signal is not None:
+            if signal is not None and not (
+                pending is not None and pending.forced_cover
+            ):
                 order: Order | None = self._build_order(
                     signal, portfolio, candle
                 )
