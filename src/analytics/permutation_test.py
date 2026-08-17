@@ -234,15 +234,8 @@ class PermutationTester:
                             exception_type=type(error).__name__,
                         )
                         permuted_metrics.append(0.0)
-        except Exception as error:
+        except Exception:
             # Fallback: single-process (e.g., in test environments)
-            log_event(
-                logger,
-                logging.WARNING,
-                "permutation.failed",
-                seed=self.seed,
-                exception_type=type(error).__name__,
-            )
             lr_arr = np.array(log_returns)
             for s in seeds:
                 local_rng = np.random.default_rng(s)

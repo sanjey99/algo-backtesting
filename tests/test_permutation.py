@@ -147,6 +147,35 @@ class TestPermutationTester:
         assert fields == {"seed": 23, "exception_type": "RuntimeError"}
         assert result.permuted_metrics == [0.0]
 
+    def test_executor_fallback_without_failed_runs_is_not_logged(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        class FailingExecutor:
+            def __init__(self, *, max_workers: int) -> None:
+                self.max_workers = max_workers
+
+            def __enter__(self) -> FailingExecutor:
+                raise RuntimeError("executor unavailable")
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+        monkeypatch.setattr("src.analytics.permutation_test.ProcessPoolExecutor", FailingExecutor)
+        tester = PermutationTester(
+            MACrossoverStrategy(fast_period=5, slow_period=20),
+            make_candles(20),
+            n_permutations=1,
+            seed=31,
+            max_workers=1,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = tester.run()
+
+        events = [getattr(record, "event", None) for record in caplog.records]
+        assert "permutation.failed" not in events
+        assert len(result.permuted_metrics) == 1
+
     def test_returns_permutation_result(self) -> None:
         strategy = MACrossoverStrategy(fast_period=5, slow_period=20)
         candles = make_candles(150)

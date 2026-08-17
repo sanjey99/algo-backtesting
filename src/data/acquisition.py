@@ -419,7 +419,8 @@ class AcquisitionService:
         expected = self._calendar.expected_sessions(request.start, request.end)
         errors: list[Exception] = []
         provider_order = self._provider_order(parent.source)
-        for provider_index, provider_id in enumerate(provider_order):
+        pending_fallback: tuple[Provider, str] | None = None
+        for provider_id in provider_order:
             factory = self._provider_factories.get(provider_id)
             if factory is None:
                 evidence.provider_skips.setdefault(provider_id.value, "provider is not configured")
@@ -434,6 +435,17 @@ class AcquisitionService:
                     eligibility.reason or "provider is ineligible"
                 )
                 continue
+            if pending_fallback is not None:
+                failed_provider, exception_type = pending_fallback
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "acquisition.fallback",
+                    acquisition_id=acquisition_id,
+                    provider=failed_provider,
+                    exception_type=exception_type,
+                )
+                pending_fallback = None
             try:
                 log_event(
                     logger,
@@ -465,15 +477,7 @@ class AcquisitionService:
                 ):
                     raise
                 errors.append(error)
-                if provider_index < len(provider_order) - 1:
-                    log_event(
-                        logger,
-                        logging.WARNING,
-                        "acquisition.fallback",
-                        acquisition_id=acquisition_id,
-                        provider=provider_id,
-                        exception_type=type(error).__name__,
-                    )
+                pending_fallback = (provider_id, type(error).__name__)
                 continue
             if batch.provider is not provider_id or batch.request != request:
                 raise ContractViolationError("provider batch identity is incompatible")
@@ -484,15 +488,7 @@ class AcquisitionService:
             evidence.rejected_rows.extend(quality.rejected_rows)
             if quality.is_fatal or quality.frame is None:
                 errors.append(QualityError("provider range failed structural validation"))
-                if provider_index < len(provider_order) - 1:
-                    log_event(
-                        logger,
-                        logging.WARNING,
-                        "acquisition.fallback",
-                        acquisition_id=acquisition_id,
-                        provider=provider_id,
-                        exception_type=QualityError.__name__,
-                    )
+                pending_fallback = (provider_id, QualityError.__name__)
                 continue
             if quality.severity is QualitySeverity.WARNING:
                 log_event(

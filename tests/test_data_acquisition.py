@@ -515,6 +515,48 @@ def test_provider_failure_and_fallback_are_logged(
     )
 
 
+def test_provider_failure_without_configured_successor_does_not_log_fallback(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    yfinance = FakeProvider(
+        Provider.YFINANCE,
+        lambda _: (_ for _ in ()).throw(TransientProviderError("down")),
+    )
+    acquisition, _, _ = service(tmp_path, {Provider.YFINANCE: lambda: yfinance})
+
+    with caplog.at_level(logging.WARNING), pytest.raises(NoUsableDataError):
+        acquisition.acquire(AcquisitionRequest("SPY", date(2024, 1, 2), date(2024, 1, 10)))
+
+    events = [getattr(record, "event", None) for record in caplog.records]
+    assert "acquisition.fallback" not in events
+
+
+def test_provider_failure_with_ineligible_successor_does_not_log_fallback(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    yfinance = FakeProvider(
+        Provider.YFINANCE,
+        lambda _: (_ for _ in ()).throw(TransientProviderError("down")),
+    )
+    alpha = FakeProvider(
+        Provider.ALPHA_VANTAGE,
+        lambda item: native_batch(Provider.ALPHA_VANTAGE, item),
+        eligible=False,
+        reason="not entitled",
+    )
+    acquisition, _, _ = service(
+        tmp_path,
+        {Provider.YFINANCE: lambda: yfinance, Provider.ALPHA_VANTAGE: lambda: alpha},
+    )
+
+    with caplog.at_level(logging.WARNING), pytest.raises(NoUsableDataError):
+        acquisition.acquire(AcquisitionRequest("SPY", date(2024, 1, 2), date(2024, 1, 10)))
+
+    events = [getattr(record, "event", None) for record in caplog.records]
+    assert "acquisition.fallback" not in events
+    assert alpha.requests == []
+
+
 def test_quality_warning_is_logged(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     request = AcquisitionRequest("AAPL", date(2024, 1, 9), date(2024, 1, 10))
     provider = FakeProvider(
