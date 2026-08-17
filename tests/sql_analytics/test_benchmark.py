@@ -1,6 +1,7 @@
 """Deterministic SQLite benchmark and query-plan evidence tests."""
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from pathlib import Path
 
@@ -74,6 +75,19 @@ def test_different_seed_changes_fixture_while_all_query_contracts_still_pass(
     assert first.fixture.value_sha256 != second.fixture.value_sha256
     assert all(measurement.contract_valid for measurement in first.measurements)
     assert all(measurement.contract_valid for measurement in second.measurements)
+
+
+def test_benchmark_migration_does_not_disable_application_loggers(tmp_path: Path) -> None:
+    """Alembic setup must not suppress application lifecycle logs after a benchmark run."""
+    application_logger = logging.getLogger("src.engine.backtest")
+    original_disabled = application_logger.disabled
+    application_logger.disabled = False
+    try:
+        BenchmarkRunner(tmp_path / "benchmark.db").run(_small_config())
+
+        assert application_logger.disabled is False
+    finally:
+        application_logger.disabled = original_disabled
 
 
 @pytest.mark.parametrize(
