@@ -25,6 +25,15 @@ def _install_service(monkeypatch: pytest.MonkeyPatch, service: FakeAcquisitionSe
     monkeypatch.setattr(cli, "create_acquisition_service", lambda **_: service)
 
 
+def test_main_configures_logging_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CLI process opts into structured logging at its runtime boundary."""
+    calls: list[None] = []
+    monkeypatch.setattr(cli, "configure_logging", lambda: calls.append(None))
+
+    assert cli.main([]) == 2
+    assert calls == [None]
+
+
 def test_acquire_writes_atomic_artifacts_and_prints_acquisition_id(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

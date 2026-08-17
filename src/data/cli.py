@@ -32,6 +32,7 @@ from src.data.contracts import (
     QualityError,
     json_safe,
 )
+from src.observability import configure_logging
 
 EXIT_OK = 0
 EXIT_REQUEST = 2
@@ -52,6 +53,7 @@ class _ArgumentParser(argparse.ArgumentParser):
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one CLI command and return a stable process exit code."""
+    configure_logging()
     parser = _parser()
     try:
         args = parser.parse_args(argv)

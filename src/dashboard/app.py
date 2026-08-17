@@ -32,6 +32,7 @@ from src.engine.backtest import BacktestConfig, BacktestEngine, BacktestResult
 from src.models.candle import Candle
 from src.models.portfolio import EquityPoint
 from src.models.trade import Trade
+from src.observability import configure_logging
 from src.strategies import STRATEGY_REGISTRY
 
 type Metrics = dict[str, float]
@@ -49,6 +50,8 @@ class DashboardConfig(TypedDict):
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
+
+configure_logging()
 
 st.set_page_config(
     page_title="Algo Backtester",

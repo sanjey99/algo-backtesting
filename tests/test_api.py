@@ -16,6 +16,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from src.api import main as api_main
 from src.api.deps import get_db
 from src.api.main import app
 from src.data.contracts import (
@@ -126,6 +127,18 @@ def test_lifespan_rejects_unmigrated_real_engine(
             pass
 
     engine.dispose()
+
+
+async def test_lifespan_configures_logging_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The API process opts into structured logging only when it starts."""
+    calls: list[None] = []
+    monkeypatch.setattr(api_main, "configure_logging", lambda: calls.append(None))
+
+    with patch("src.api.main.init_db"):
+        async with api_main.lifespan(app):
+            pass
+
+    assert calls == [None]
 
 
 # ---------------------------------------------------------------------------

@@ -56,6 +56,29 @@ unversioned-baseline, and versioned databases. Use plain `alembic upgrade head` 
 is already configured to target the intended fresh or correctly versioned database; it does not
 provide the classifier's safeguards for an unversioned legacy schema.
 
+## Structured operational logs
+
+The API lifespan, data CLI, and Streamlit dashboard each configure one process-wide JSON logging
+handler at their runtime boundary. Library imports do not configure logging. The default level is
+`INFO`; use `LOG_LEVEL=DEBUG` to include diagnostic events:
+
+```bash
+LOG_LEVEL=DEBUG uvicorn src.api.main:app --reload
+LOG_LEVEL=DEBUG python -m src.data.cli benchmark --output artifacts/data-quality-benchmark.json
+LOG_LEVEL=DEBUG streamlit run src/dashboard/app.py
+```
+
+Each log line is a JSON object written by Python's default `StreamHandler` to stderr. CLI command
+results remain machine-readable JSON on stdout, so callers can process output independently from
+operational logs. Records include a UTC timestamp with a `Z` suffix, severity, logger, and a
+stable dot-separated lowercase event name (for example, `backtest.started` or
+`acquisition.cache_result`). Event names and fields are intended for operational queries rather
+than free-form messages.
+
+Sensitive fields are always emitted as `[REDACTED]` when their keys are `api_key`, `authorization`,
+`token`, `password`, `secret`, or `cookie` (case-insensitive). Credential-bearing URLs are also
+redacted, including URLs with user-info credentials or any of those keys in a query string.
+
 ## Execution semantics
 
 Strategy decisions are made from a completed daily bar and execute no earlier than the next

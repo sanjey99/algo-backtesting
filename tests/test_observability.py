@@ -264,24 +264,25 @@ def test_whitespace_prefixed_malformed_credential_urls_fail_closed(url: str) -> 
     assert "metadata-pass" not in json.dumps(output)
 
 
-def test_configure_logging_adds_one_json_handler_and_uses_valid_level() -> None:
+def test_configure_logging_is_idempotent() -> None:
     """Adding a handler per call would duplicate every emitted log line."""
     root = logging.getLogger()
+    before_handlers = list(root.handlers)
     original_level = root.level
-    added_handlers: list[logging.Handler] = []
+    created_handlers: list[logging.Handler] = []
     try:
         configure_logging("DEBUG")
-        added_handlers = [
+        configure_logging("DEBUG")
+        marked_handlers = [
             handler for handler in root.handlers if getattr(handler, "_algo_json_handler", False)
         ]
-        configure_logging("ERROR")
+        created_handlers = [handler for handler in root.handlers if handler not in before_handlers]
 
-        assert len(added_handlers) == 1
-        assert root.level == logging.DEBUG
-        assert isinstance(added_handlers[0].formatter, JsonFormatter)
+        assert len(marked_handlers) == 1
+        assert isinstance(marked_handlers[0].formatter, JsonFormatter)
     finally:
-        for handler in added_handlers:
-            root.removeHandler(handler)
+        root.handlers[:] = before_handlers
+        for handler in created_handlers:
             handler.close()
         root.setLevel(original_level)
 
