@@ -1,9 +1,10 @@
 """Tests for database layer — Step 9."""
-from datetime import datetime
+import warnings
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from src.db.crud import (
     get_backtest_run,
@@ -55,6 +56,17 @@ SAMPLE_RUN = dict(
     ],
     metrics={"sharpe_ratio": 1.24, "cagr": 0.087, "max_drawdown": -0.1532},
 )
+
+
+def test_created_at_default_is_naive_utc_without_deprecation(db_session: Session) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        run_id = save_backtest_run(db_session, **SAMPLE_RUN)
+        db_session.commit()
+
+    created_at = get_backtest_run(db_session, run_id).created_at
+    assert created_at.tzinfo is None
+    assert abs((datetime.now(UTC).replace(tzinfo=None) - created_at).total_seconds()) < 5
 
 
 class TestCRUD:
