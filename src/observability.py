@@ -14,7 +14,7 @@ import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Final
+from typing import Final, cast
 from urllib.parse import parse_qsl, unquote_plus, urlsplit
 
 _DEFAULT_EVENT: Final = "log.record"
@@ -26,6 +26,7 @@ _RESERVED_OUTPUT_FIELD_NAMES: Final[frozenset[str]] = frozenset(
     {"timestamp", "level", "logger", "event", "exception"}
 )
 _EVENT_NAME: Final = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*")
+_FIELD_NAME: Final = re.compile(r"[a-z][a-z0-9_]*")
 _URL_WITH_AUTHORITY: Final = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
 
 
@@ -91,13 +92,17 @@ def _safe_value(value: object) -> None | bool | int | float | str:
 
 
 def _sanitize_fields(
-    fields: Mapping[str, object], *, reject_reserved: bool = False
+    fields: Mapping[object, object], *, reject_invalid: bool = False
 ) -> dict[str, None | bool | int | float | str]:
     """Produce a fresh, safe field mapping for one logging record."""
     sanitized_fields: dict[str, None | bool | int | float | str] = {}
     for name, value in fields.items():
+        if not isinstance(name, str) or _FIELD_NAME.fullmatch(name) is None:
+            if reject_invalid:
+                raise ValueError("event field names must be stable identifiers")
+            continue
         if name.casefold() in _RESERVED_OUTPUT_FIELD_NAMES:
-            if reject_reserved:
+            if reject_invalid:
                 message = f"event fields cannot use reserved output key: {name}"
                 raise ValueError(message)
             continue
@@ -113,7 +118,7 @@ def _validate_event_name(event: str) -> None:
 def log_event(logger: logging.Logger, level: int, event: str, **fields: object) -> None:
     """Emit a structured event while preserving a caplog-friendly record contract."""
     _validate_event_name(event)
-    event_fields = _sanitize_fields(fields, reject_reserved=True)
+    event_fields = _sanitize_fields(cast(Mapping[object, object], fields), reject_invalid=True)
     logger.log(level, event, extra={"event": event, "event_fields": event_fields})
 
 
@@ -138,7 +143,7 @@ class JsonFormatter(logging.Formatter):
             }
         )
         if record.exc_info is not None and record.exc_info[0] is not None:
-            payload["exception"] = record.exc_info[0].__name__
+            payload["exception"] = _safe_value(record.exc_info[0].__name__)
 
         return json.dumps(payload, ensure_ascii=False, allow_nan=False)
 

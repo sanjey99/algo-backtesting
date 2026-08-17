@@ -160,8 +160,8 @@ def test_log_event_rejects_non_identifier_event_names() -> None:
         log_event(logger, logging.INFO, "https://metadata-user:metadata-pass@logs.example")
 
 
-def test_formatter_redacts_credential_urls_from_every_string_metadata_surface() -> None:
-    """Formatting metadata URL strings verbatim would bypass caller-field redaction."""
+def test_formatter_redacts_credential_urls_from_event_logger_and_level() -> None:
+    """Formatting event, logger, or level URL strings verbatim would bypass redaction."""
     metadata_url = "https://metadata-user:metadata-pass@logs.example"
     record = logging.LogRecord(
         name=metadata_url,
@@ -183,12 +183,70 @@ def test_formatter_redacts_credential_urls_from_every_string_metadata_surface() 
     assert "metadata-pass" not in json.dumps(output)
 
 
+def test_formatter_redacts_credential_bearing_exception_type_names() -> None:
+    """Exception type names must not bypass metadata sanitization."""
+    error_type = type(
+        "https://metadata-user:metadata-pass@errors.example",
+        (Exception,),
+        {},
+    )
+    error = error_type()
+    record = logging.LogRecord(
+        name="test.observability.exception_name",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg="unstructured record",
+        args=(),
+        exc_info=(error_type, error, None),
+    )
+
+    output = json.loads(JsonFormatter().format(record))
+
+    assert output["exception"] == "[REDACTED]"
+    assert "metadata-pass" not in json.dumps(output)
+
+
 def test_log_event_rejects_reserved_output_fields() -> None:
     """A caller-provided exception field would impersonate formatter exception context."""
     logger = logging.getLogger("test.observability.reserved_field")
 
     with pytest.raises(ValueError, match="reserved"):
         log_event(logger, logging.INFO, "backtest.failed", **{"exception": "caller-supplied"})
+
+
+def test_log_event_rejects_non_identifier_field_names() -> None:
+    """Credential-bearing field keys must not enter the stable JSON field namespace."""
+    logger = logging.getLogger("test.observability.invalid_field")
+
+    with pytest.raises(ValueError, match="stable identifier"):
+        log_event(
+            logger,
+            logging.INFO,
+            "backtest.failed",
+            **{"https://metadata-user:metadata-pass@fields.example": "field-value"},
+        )
+
+
+def test_formatter_filters_unsafe_external_field_names() -> None:
+    """Externally constructed records must not expose arbitrary field keys."""
+    field_name = "https://metadata-user:metadata-pass@fields.example"
+    record = logging.LogRecord(
+        name="test.observability.external_field",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="unstructured record",
+        args=(),
+        exc_info=None,
+    )
+    record.event_fields = {field_name: "field-value", "run_id": "run-1"}
+
+    output = json.loads(JsonFormatter().format(record))
+
+    assert field_name not in output
+    assert output["run_id"] == "run-1"
+    assert "metadata-pass" not in json.dumps(output)
 
 
 @pytest.mark.parametrize(
