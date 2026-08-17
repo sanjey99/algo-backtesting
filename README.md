@@ -56,6 +56,17 @@ unversioned-baseline, and versioned databases. Use plain `alembic upgrade head` 
 is already configured to target the intended fresh or correctly versioned database; it does not
 provide the classifier's safeguards for an unversioned legacy schema.
 
+## Execution semantics
+
+Strategy decisions are made from a completed daily bar and execute no earlier than the next
+bar's open. LIMIT and STOP orders are good-til-cancelled (GTC): unfilled conditional orders remain
+pending until they fill, are replaced, or the data ends. LIMIT fills are price-protected and never
+execute worse than their stated limit. STOP fills carry gap risk, because a gap through the stop
+uses the next open (with adverse slippage).
+
+Short positions use the Global Constraints defaults: initial margin `1.50`, maintenance margin
+`0.30`, annual borrow rate `0.03`, and borrow day count `365.0`.
+
 ## Market data acquisition quality
 
 The daily acquisition boundary normalizes provider data, applies XNYS-session-aware quality rules,

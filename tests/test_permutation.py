@@ -1,11 +1,17 @@
 """Tests for Permutation Testing — Step 8."""
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import datetime, timedelta
 
 import pytest
 
-from src.analytics.permutation_test import PermutationResult, PermutationTester
+from src.analytics.permutation_test import (
+    PermutationResult,
+    PermutationTester,
+    _run_single_permutation,
+)
+from src.engine.backtest import BacktestConfig
 from src.models.candle import Candle
 from src.strategies.ma_crossover import MACrossoverStrategy
 
@@ -56,6 +62,39 @@ class TestPermutationResult:
 
 
 class TestPermutationTester:
+    def test_permutation_worker_receives_margin_configuration(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = BacktestConfig(
+            short_initial_margin=1.6,
+            short_maintenance_margin=0.35,
+            annual_short_borrow_rate=0.05,
+        )
+        captured: dict[str, object] = {}
+        original_config = BacktestConfig
+
+        def recording_config(**kwargs: object) -> BacktestConfig:
+            captured.update(kwargs)
+            return original_config(**kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr("src.engine.backtest.BacktestConfig", recording_config)
+
+        _run_single_permutation(
+            "src.strategies.ma_crossover.MACrossoverStrategy",
+            {"fast_period": 2, "slow_period": 3},
+            [0.01, -0.01, 0.02],
+            [100.0, 101.0, 100.0, 102.0],
+            [datetime(2023, 1, day) for day in range(1, 5)],
+            "sharpe_ratio",
+            asdict(config),
+            42,
+        )
+
+        assert captured["short_initial_margin"] == 1.6
+        assert captured["short_maintenance_margin"] == 0.35
+        assert captured["annual_short_borrow_rate"] == 0.05
+        assert captured["borrow_day_count"] == 365.0
+
     def test_instantiation(self) -> None:
         strategy = MACrossoverStrategy(fast_period=5, slow_period=20)
         candles = make_candles(100)

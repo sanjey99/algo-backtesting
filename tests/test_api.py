@@ -218,6 +218,42 @@ class TestRunBacktest:
 # ---------------------------------------------------------------------------
 
 class TestGetBacktest:
+    def test_persists_entry_on_bar_after_signal(self, client: TestClient) -> None:
+        candles = [
+            Candle(
+                timestamp=datetime(2020, 1, 2) + timedelta(days=index),
+                open=price,
+                high=price,
+                low=price,
+                close=price,
+                volume=1_000_000.0,
+                adj_close=price,
+            )
+            for index, price in enumerate(
+                [100.0, 100.0, 100.0, 90.0, 100.0, 110.0, 115.0, 80.0, 75.0]
+            )
+        ]
+
+        with patch(PATCH_TARGET, return_value=candles):
+            post = client.post("/api/backtest", json={
+                "strategy": "ma_crossover",
+                "symbol": "SPY",
+                "start": "2020-01-01",
+                "end": "2022-12-31",
+                "params": {"fast_period": 2, "slow_period": 3},
+            })
+
+        assert post.status_code == 201
+        trades = client.get(f"/api/backtest/{post.json()['run_id']}/trades")
+        signal_candle = candles[5]
+        expected_entry_candle = candles[6]
+
+        assert trades.status_code == 200
+        assert len(trades.json()) == 1
+        entry_date = datetime.fromisoformat(trades.json()[0]["entry_date"])
+        assert entry_date == expected_entry_candle.timestamp
+        assert entry_date != signal_candle.timestamp
+
     def test_get_existing_run(self, client: TestClient) -> None:
         with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
             post = client.post("/api/backtest", json={

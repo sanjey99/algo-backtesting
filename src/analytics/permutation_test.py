@@ -129,6 +129,10 @@ def _run_single_permutation(
         initial_capital=config_dict.get("initial_capital", 100_000.0),
         commission_pct=config_dict.get("commission_pct", 0.001),
         slippage_pct=config_dict.get("slippage_pct", 0.0005),
+        short_initial_margin=config_dict.get("short_initial_margin", 1.50),
+        short_maintenance_margin=config_dict.get("short_maintenance_margin", 0.30),
+        annual_short_borrow_rate=config_dict.get("annual_short_borrow_rate", 0.03),
+        borrow_day_count=config_dict.get("borrow_day_count", 365.0),
     )
     engine = BacktestEngine()
     result = engine.run(strategy, candles, config)
@@ -188,6 +192,10 @@ class PermutationTester:
             "initial_capital": self.config.initial_capital,
             "commission_pct": self.config.commission_pct,
             "slippage_pct": self.config.slippage_pct,
+            "short_initial_margin": self.config.short_initial_margin,
+            "short_maintenance_margin": self.config.short_maintenance_margin,
+            "annual_short_borrow_rate": self.config.annual_short_borrow_rate,
+            "borrow_day_count": self.config.borrow_day_count,
         }
 
         # 3. Parallel permutations
