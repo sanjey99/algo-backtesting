@@ -25,6 +25,7 @@ dependencies = [
     "pyarrow>=14.0",
     "pandas_market_calendars>=4.4",
     "filelock>=3.13",
+    "gitpython>=3.1.58",
 ]
 
 [project.optional-dependencies]
