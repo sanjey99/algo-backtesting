@@ -288,20 +288,30 @@ def test_configure_logging_is_idempotent() -> None:
 
 
 def test_configure_logging_falls_back_to_info_for_unsupported_level() -> None:
-    """Passing an unsupported level must not leave the root logger misconfigured."""
+    """An invalid level uses INFO without disturbing an earlier process handler."""
     root = logging.getLogger()
-    original_level = root.level
-    added_handlers: list[logging.Handler] = []
+    before_handlers = list(root.handlers)
+    before_level = root.level
+    created_handlers: list[logging.Handler] = []
     try:
+        # API/dashboard startup may already have installed this process-wide handler.
+        # Detach it without closing it so this test always exercises fresh configuration.
+        root.handlers[:] = [
+            handler
+            for handler in before_handlers
+            if not getattr(handler, "_algo_json_handler", False)
+        ]
+        root.setLevel(logging.WARNING)
         configure_logging("NOT_A_LEVEL")
-        added_handlers = [
+        marked_handlers = [
             handler for handler in root.handlers if getattr(handler, "_algo_json_handler", False)
         ]
+        created_handlers = [handler for handler in root.handlers if handler not in before_handlers]
 
-        assert len(added_handlers) == 1
+        assert len(marked_handlers) == 1
         assert root.level == logging.INFO
     finally:
-        for handler in added_handlers:
-            root.removeHandler(handler)
+        root.handlers[:] = before_handlers
+        for handler in created_handlers:
             handler.close()
-        root.setLevel(original_level)
+        root.setLevel(before_level)
