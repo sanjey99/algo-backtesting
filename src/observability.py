@@ -22,6 +22,10 @@ _REDACTED: Final = "[REDACTED]"
 _SECRET_FIELD_NAMES: Final[frozenset[str]] = frozenset(
     {"api_key", "authorization", "token", "password", "secret", "cookie"}
 )
+_RESERVED_OUTPUT_FIELD_NAMES: Final[frozenset[str]] = frozenset(
+    {"timestamp", "level", "logger", "event", "exception"}
+)
+_EVENT_NAME: Final = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*")
 _URL_WITH_AUTHORITY: Final = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
 
 
@@ -44,13 +48,25 @@ def _has_secret_query_parameter(query: str) -> bool:
     return False
 
 
+def _normalize_url_input(value: str) -> str:
+    """Strip leading whitespace and C0 controls before URL parsing."""
+    index = 0
+    for character in value:
+        if character.isspace() or ord(character) < 32:
+            index += 1
+            continue
+        break
+    return value[index:]
+
+
 def _is_credential_bearing_url(value: str) -> bool:
     """Detect URL userinfo and secret-shaped query parameters conservatively."""
+    normalized_value = _normalize_url_input(value)
     try:
-        parsed = urlsplit(value)
+        parsed = urlsplit(normalized_value)
     except ValueError:
         # A malformed authority with userinfo is still safer to redact than emit.
-        return bool(_URL_WITH_AUTHORITY.match(value) and "@" in value)
+        return bool(_URL_WITH_AUTHORITY.match(normalized_value) and "@" in normalized_value)
 
     if parsed.username is not None:
         return True
@@ -74,17 +90,30 @@ def _safe_value(value: object) -> None | bool | int | float | str:
     return type(value).__name__
 
 
-def _sanitize_fields(fields: Mapping[str, object]) -> dict[str, None | bool | int | float | str]:
+def _sanitize_fields(
+    fields: Mapping[str, object], *, reject_reserved: bool = False
+) -> dict[str, None | bool | int | float | str]:
     """Produce a fresh, safe field mapping for one logging record."""
-    return {
-        name: _REDACTED if _is_secret_field_name(name) else _safe_value(value)
-        for name, value in fields.items()
-    }
+    sanitized_fields: dict[str, None | bool | int | float | str] = {}
+    for name, value in fields.items():
+        if name.casefold() in _RESERVED_OUTPUT_FIELD_NAMES:
+            if reject_reserved:
+                message = f"event fields cannot use reserved output key: {name}"
+                raise ValueError(message)
+            continue
+        sanitized_fields[name] = _REDACTED if _is_secret_field_name(name) else _safe_value(value)
+    return sanitized_fields
+
+
+def _validate_event_name(event: str) -> None:
+    if _EVENT_NAME.fullmatch(event) is None:
+        raise ValueError("event must be a stable identifier of dot-separated lowercase components")
 
 
 def log_event(logger: logging.Logger, level: int, event: str, **fields: object) -> None:
     """Emit a structured event while preserving a caplog-friendly record contract."""
-    event_fields = _sanitize_fields(fields)
+    _validate_event_name(event)
+    event_fields = _sanitize_fields(fields, reject_reserved=True)
     logger.log(level, event, extra={"event": event, "event_fields": event_fields})
 
 
@@ -95,7 +124,7 @@ class JsonFormatter(logging.Formatter):
         raw_fields = getattr(record, "event_fields", {})
         fields = _sanitize_fields(raw_fields) if isinstance(raw_fields, Mapping) else {}
         raw_event = getattr(record, "event", _DEFAULT_EVENT)
-        event = raw_event if isinstance(raw_event, str) else _safe_value(raw_event)
+        event = _safe_value(raw_event)
 
         payload: dict[str, object] = dict(fields)
         payload.update(
@@ -103,8 +132,8 @@ class JsonFormatter(logging.Formatter):
                 "timestamp": datetime.fromtimestamp(record.created, tz=UTC)
                 .isoformat(timespec="milliseconds")
                 .replace("+00:00", "Z"),
-                "level": record.levelname,
-                "logger": record.name,
+                "level": _safe_value(record.levelname),
+                "logger": _safe_value(record.name),
                 "event": event,
             }
         )

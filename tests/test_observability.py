@@ -152,6 +152,60 @@ def test_formatter_serializes_only_the_exception_type_from_exc_info() -> None:
     assert "fixture-exception-message" not in json.dumps(output)
 
 
+def test_log_event_rejects_non_identifier_event_names() -> None:
+    """Using arbitrary messages as events would let credentials bypass redaction."""
+    logger = logging.getLogger("test.observability.invalid_event")
+
+    with pytest.raises(ValueError, match="stable identifier"):
+        log_event(logger, logging.INFO, "https://metadata-user:metadata-pass@logs.example")
+
+
+def test_formatter_redacts_credential_urls_from_every_string_metadata_surface() -> None:
+    """Formatting metadata URL strings verbatim would bypass caller-field redaction."""
+    metadata_url = "https://metadata-user:metadata-pass@logs.example"
+    record = logging.LogRecord(
+        name=metadata_url,
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="unstructured record",
+        args=(),
+        exc_info=None,
+    )
+    record.event = metadata_url
+    record.levelname = metadata_url
+
+    output = json.loads(JsonFormatter().format(record))
+
+    assert output["event"] == "[REDACTED]"
+    assert output["logger"] == "[REDACTED]"
+    assert output["level"] == "[REDACTED]"
+    assert "metadata-pass" not in json.dumps(output)
+
+
+def test_log_event_rejects_reserved_output_fields() -> None:
+    """A caller-provided exception field would impersonate formatter exception context."""
+    logger = logging.getLogger("test.observability.reserved_field")
+
+    with pytest.raises(ValueError, match="reserved"):
+        log_event(logger, logging.INFO, "backtest.failed", **{"exception": "caller-supplied"})
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        " \nhttps://metadata-user:metadata-pass@[invalid",
+        "\thttps://metadata-user:metadata-pass@[invalid",
+    ],
+)
+def test_whitespace_prefixed_malformed_credential_urls_fail_closed(url: str) -> None:
+    """Whitespace before malformed URL authority must not bypass conservative redaction."""
+    output = _format_event("acquisition.requested", endpoint=url)
+
+    assert output["endpoint"] == "[REDACTED]"
+    assert "metadata-pass" not in json.dumps(output)
+
+
 def test_configure_logging_adds_one_json_handler_and_uses_valid_level() -> None:
     """Adding a handler per call would duplicate every emitted log line."""
     root = logging.getLogger()
