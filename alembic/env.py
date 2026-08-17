@@ -1,6 +1,7 @@
 """Alembic environment with explicit, injection-safe database routing."""
 from __future__ import annotations
 
+import logging
 import os
 from logging.config import fileConfig
 from typing import Any
@@ -13,7 +14,10 @@ from src.db.tables import Base
 
 config = context.config
 
-if config.config_file_name is not None:
+# ``fileConfig`` closes and replaces every existing handler, including the
+# embedding application's root handler. Let a preconfigured process own its
+# logging boundary; retain Alembic's ini configuration for standalone commands.
+if config.config_file_name is not None and not logging.getLogger().handlers:
     fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata

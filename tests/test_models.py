@@ -1,4 +1,5 @@
 """Tests for domain models — Step 1 exit criteria."""
+import math
 from datetime import datetime
 
 import pytest
@@ -178,6 +179,27 @@ class TestTrade:
 
 
 class TestPortfolio:
+    @staticmethod
+    def _state(portfolio: Portfolio) -> tuple[object, ...]:
+        return (
+            portfolio.cash,
+            portfolio.restricted_collateral,
+            portfolio.open_positions,
+            portfolio.trades,
+            portfolio.equity_curve,
+            dict(portfolio._short_collateral),
+            dict(portfolio._last_short_borrow_timestamp),
+        )
+
+    @staticmethod
+    def _portfolio_with_accounting_state() -> Portfolio:
+        portfolio = Portfolio(10_000.0)
+        portfolio.record_fill("Y", Direction.LONG, 1, 100.0, datetime(2023, 1, 1))
+        portfolio.record_fill("Y", Direction.SHORT, 1, 101.0, datetime(2023, 1, 2))
+        portfolio.record_fill("X", Direction.SHORT, 10, 100.0, datetime(2023, 1, 3))
+        portfolio.update({"X": 90.0}, datetime(2023, 1, 3))
+        return portfolio
+
     def test_initial_state(self, portfolio: Portfolio) -> None:
         assert portfolio.cash == 100_000.0
         assert portfolio.equity == 100_000.0
@@ -251,6 +273,93 @@ class TestPortfolio:
         with pytest.raises(ValueError, match="opposite"):
             portfolio.record_fill("X", Direction.LONG, 1, 101.0, datetime(2023, 1, 3))
 
+    @pytest.mark.parametrize("quantity", [0, -1, 1.5, True])
+    def test_invalid_fill_quantity_is_rejected_atomically(self, quantity: object) -> None:
+        """Invalid quantities must never create positions or alter account state."""
+        portfolio = self._portfolio_with_accounting_state()
+        before = self._state(portfolio)
+
+        with pytest.raises(ValueError, match="quantity"):
+            portfolio.record_fill(  # type: ignore[arg-type]
+                "X", Direction.LONG, quantity, 100.0, datetime(2023, 1, 4)
+            )
+
+        assert self._state(portfolio) == before
+
+    def test_invalid_fill_direction_is_rejected_atomically(self) -> None:
+        """Non-Direction values must not be treated as implicit short entries."""
+        portfolio = self._portfolio_with_accounting_state()
+        before = self._state(portfolio)
+
+        with pytest.raises(ValueError, match="direction"):
+            portfolio.record_fill(  # type: ignore[arg-type]
+                "X", "LONG", 10, 100.0, datetime(2023, 1, 4)
+            )
+
+        assert self._state(portfolio) == before
+
+    @pytest.mark.parametrize("fill_price", [0.0, -1.0, math.nan, math.inf, -math.inf])
+    def test_invalid_fill_price_is_rejected_atomically(self, fill_price: float) -> None:
+        """Nonpositive or non-finite prices must not alter account state."""
+        portfolio = self._portfolio_with_accounting_state()
+        before = self._state(portfolio)
+
+        with pytest.raises(ValueError, match="price"):
+            portfolio.record_fill(
+                "X", Direction.LONG, 10, fill_price, datetime(2023, 1, 4)
+            )
+
+        assert self._state(portfolio) == before
+
+    @pytest.mark.parametrize("commission", [-1.0, math.nan, math.inf, -math.inf])
+    def test_invalid_fill_commission_is_rejected_atomically(self, commission: float) -> None:
+        """Negative or non-finite commissions must not alter account state."""
+        portfolio = self._portfolio_with_accounting_state()
+        before = self._state(portfolio)
+
+        with pytest.raises(ValueError, match="commission"):
+            portfolio.record_fill(
+                "X",
+                Direction.LONG,
+                10,
+                100.0,
+                datetime(2023, 1, 4),
+                commission,
+            )
+
+        assert self._state(portfolio) == before
+
+    def test_negative_long_quantity_cannot_increase_cash(self) -> None:
+        """A negative long must fail instead of crediting cash and opening a position."""
+        portfolio = Portfolio(1_000.0)
+        before = self._state(portfolio)
+
+        with pytest.raises(ValueError, match="quantity"):
+            portfolio.record_fill("X", Direction.LONG, -1, 100.0, datetime(2023, 1, 2))
+
+        assert self._state(portfolio) == before
+
+    @pytest.mark.parametrize("closing_quantity", [1, 11])
+    def test_mismatched_close_quantity_is_rejected_atomically(
+        self, closing_quantity: int
+    ) -> None:
+        """A partial or oversized close must not close or credit a ten-share position."""
+        portfolio = Portfolio(10_000.0)
+        portfolio.record_fill("X", Direction.LONG, 10, 100.0, datetime(2023, 1, 2))
+        portfolio.update({"X": 101.0}, datetime(2023, 1, 2))
+        before = self._state(portfolio)
+
+        with pytest.raises(ValueError, match="quantity"):
+            portfolio.record_fill(
+                "X",
+                Direction.SHORT,
+                closing_quantity,
+                110.0,
+                datetime(2023, 1, 3),
+            )
+
+        assert self._state(portfolio) == before
+
     def test_short_entry_reserves_collateral_without_creating_equity(self) -> None:
         portfolio = Portfolio(10_000.0, short_initial_margin=1.5)
 
@@ -315,6 +424,14 @@ class TestPortfolio:
 
         assert portfolio.maintenance_ratio("X") == pytest.approx(7.8)
         assert portfolio.maintenance_ratio("MISSING") is None
+
+    def test_zero_price_short_has_infinite_maintenance_ratio(self) -> None:
+        """A worthless marked short has no current liability and must not divide by zero."""
+        portfolio = Portfolio(10_000.0, short_initial_margin=1.5)
+        portfolio.record_fill("X", Direction.SHORT, 10, 100.0, datetime(2023, 1, 2))
+        portfolio.update({"X": 0.0}, datetime(2023, 1, 2))
+
+        assert portfolio.maintenance_ratio("X") == math.inf
 
     def test_reset_clears_short_collateral_and_borrow_state(self) -> None:
         opened_at = datetime(2023, 1, 2)

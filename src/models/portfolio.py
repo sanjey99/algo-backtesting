@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -128,12 +129,15 @@ class Portfolio:
         commission: float = 0.0,
     ) -> FillOutcome:
         """Open or close a position and report whether the fill was accepted."""
+        self._validate_fill_inputs(direction, quantity, fill_price, commission)
         if symbol in self._open_positions:
             existing_dir, qty, entry_price, entry_date, trade_id, entry_comm = (
                 self._open_positions[symbol]
             )
             if direction != existing_dir.opposite():
                 raise ValueError("Closing fill direction must be opposite the open position")
+            if quantity != qty:
+                raise ValueError("Closing fill quantity must equal the open position quantity")
             # Closing trade (direction is opposite of position)
             trade = Trade(
                 symbol=symbol,
@@ -251,7 +255,10 @@ class Portfolio:
             return None
         _, quantity, entry_price, _, _, _ = position
         current_price = self._current_prices.get(symbol, entry_price)
-        return self.equity / (quantity * current_price)
+        current_short_value = quantity * current_price
+        if current_short_value == 0.0:
+            return math.inf
+        return self.equity / current_short_value
 
     # ------------------------------------------------------------------
     # Mark-to-market
@@ -283,6 +290,32 @@ class Portfolio:
         self._equity_curve.clear()
         self._peak_equity = self.initial_capital
         self._current_prices.clear()
+
+    @staticmethod
+    def _validate_fill_inputs(
+        direction: Direction,
+        quantity: int,
+        fill_price: float,
+        commission: float,
+    ) -> None:
+        if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
+            raise ValueError("Fill quantity must be a positive integer")
+        if not isinstance(direction, Direction):
+            raise ValueError("Fill direction must be a Direction value")
+        if (
+            isinstance(fill_price, bool)
+            or not isinstance(fill_price, int | float)
+            or not isfinite(fill_price)
+            or fill_price <= 0.0
+        ):
+            raise ValueError("Fill price must be finite and positive")
+        if (
+            isinstance(commission, bool)
+            or not isinstance(commission, int | float)
+            or not isfinite(commission)
+            or commission < 0.0
+        ):
+            raise ValueError("Fill commission must be finite and nonnegative")
 
     @staticmethod
     def _validate_short_settings(

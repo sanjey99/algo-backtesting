@@ -1,6 +1,8 @@
 """Deterministic SQLite benchmark and query-plan evidence tests."""
 from __future__ import annotations
 
+import io
+import json
 import logging
 from collections.abc import Callable
 from pathlib import Path
@@ -13,6 +15,7 @@ from src.analytics.sql_benchmark import (
     _measure_timing,
 )
 from src.analytics.sql_contracts import QueryId
+from src.observability import JsonFormatter, configure_logging, log_event
 
 
 def _small_config(*, seed: int = 42) -> BenchmarkConfig:
@@ -88,6 +91,47 @@ def test_benchmark_migration_does_not_disable_application_loggers(tmp_path: Path
         assert application_logger.disabled is False
     finally:
         application_logger.disabled = original_disabled
+
+
+def test_benchmark_migration_preserves_preconfigured_structured_root_logging(
+    tmp_path: Path,
+) -> None:
+    """Reconfiguring root logging in Alembic would corrupt embedding-process logs."""
+    root = logging.getLogger()
+    original_handlers = list(root.handlers)
+    original_level = root.level
+    created_handlers: list[logging.Handler] = []
+    stream = io.StringIO()
+    try:
+        root.handlers[:] = []
+        configure_logging("DEBUG")
+        application_handler = root.handlers[0]
+        assert isinstance(application_handler, logging.StreamHandler)
+        application_handler.setStream(stream)
+
+        BenchmarkRunner(tmp_path / "structured.db").run(_small_config())
+        log_event(
+            logging.getLogger("test.sql_benchmark"),
+            logging.INFO,
+            "benchmark.post_migration",
+            status="ready",
+        )
+
+        assert root.handlers == [application_handler]
+        assert root.level == logging.DEBUG
+        assert getattr(application_handler, "_algo_json_handler", False) is True
+        assert isinstance(application_handler.formatter, JsonFormatter)
+        assert json.loads(stream.getvalue().splitlines()[-1])["event"] == (
+            "benchmark.post_migration"
+        )
+    finally:
+        created_handlers = [
+            handler for handler in root.handlers if handler not in original_handlers
+        ]
+        root.handlers[:] = original_handlers
+        root.setLevel(original_level)
+        for handler in created_handlers:
+            handler.close()
 
 
 @pytest.mark.parametrize(

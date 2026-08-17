@@ -103,7 +103,7 @@
 |-----------|---------------|-----------------|
 | **DataFetcher** | Fetch, cache (parquet), and adjust historical OHLCV data | `DataFetcher` ABC with `YFinanceFetcher` and `AlphaVantageFetcher` |
 | **BacktestEngine** | Orchestrate bar-by-bar event loop; wire strategy, broker, portfolio | `BacktestEngine.run()` returns `BacktestResult` |
-| **Strategy** | Consume `MarketEvent`, emit `SignalEvent` based on indicator logic | `BaseStrategy` ABC with `on_candle()` and `parameter_space` |
+| **Strategy** | Consume a candle plus immutable execution context and emit `SignalEvent` based on indicator logic | `BaseStrategy` ABC with `on_candle(candle, context)` and `parameter_space` |
 | **SimulatedBroker** | Convert `OrderEvent` to `FillEvent` with realistic slippage and commission | Models MARKET, LIMIT, STOP order types |
 | **Portfolio** | Track positions, cash, equity; record fills | `Portfolio.update()` and `record_fill()` |
 | **PositionSizer** | Determine trade size from signal, portfolio state, and price | `PositionSizer` ABC with Kelly, FixedFraction, FixedQuantity |
@@ -129,21 +129,27 @@ Step 1: API Layer — validate BacktestRequest schema, resolve strategy class
 Step 2: DataFetcher — check parquet cache; if miss, fetch + adjust + validate + cache
 Step 3: BacktestEngine.run() — initialize Portfolio, Strategy, Broker, PositionSizer
 Step 4: Bar-by-bar Event Loop
-  ├── 4a. Engine emits MarketEvent(candle)
-  ├── 4b. Strategy.on_candle(candle) → SignalEvent (or nothing during warmup)
-  ├── 4c. PositionSizer.calculate(signal, portfolio, price) → quantity
-  │        Engine creates OrderEvent(direction, quantity, order_type)
-  ├── 4d. SimulatedBroker.execute(order, candle) → FillEvent
-  │        MARKET: fill_price = close * (1 ± slippage_pct)
-  │        LIMIT: fill only if candle.low <= limit_price (buy)
-  │        STOP: fill only if candle crosses stop level
-  ├── 4e. Portfolio.record_fill(fill) — update cash, open/close position
-  └── 4f. Portfolio.update(prices) — mark-to-market, append equity curve row
+  ├── 4a. Accrue short borrow from the previous mark to this candle
+  ├── 4b. Evaluate orders pending before this candle against current OHLC
+  │        MARKET: next eligible open with adverse slippage
+  │        LIMIT/STOP: apply gap rules; retain untriggered orders as GTC
+  ├── 4c. Portfolio.record_fill(fill) for accepted fills; remove rejected orders
+  ├── 4d. Portfolio.update(close) — mark-to-market, append equity curve row
+  ├── 4e. Evaluate maintenance margin; queue a forced next-open cover on breach
+  ├── 4f. Strategy.on_candle(candle, context) → SignalEvent (or nothing)
+  └── 4g. Size and enqueue the signal's order for execution on a later bar
 Step 5: Engine returns BacktestResult { trades, equity_curve, final_equity }
 Step 6: Analytics — compute_all_metrics(result) → dict[str, float]
 Step 7: DB — save_backtest_run() in single transaction (runs + trades + curve + metrics)
 Step 8: API Response — BacktestResponse with run_id, metrics, sub-resource links
 ```
+
+A signal generated on bar N cannot execute on bar N. Its first eligible execution is a later bar;
+a MARKET order uses that bar's open. LIMIT and STOP orders persist until filled, replaced, cancelled
+by a conflicting signal, superseded by a forced cover, or cancelled at end of data. A forced margin
+cover has priority over strategy orders for the same symbol. Custom strategies must migrate to the
+`on_candle(candle, context)` signature and use the supplied immutable `StrategyContext` rather than
+maintaining fill assumptions from signal time.
 
 ### Walk-Forward Flow (abbreviated)
 
@@ -333,7 +339,7 @@ Phase 4 (Firm-wide): Kafka real-time data, GPU permutation testing (CuPy), RBAC
 
 ### 6.3 Execution Realism
 
-> "Most academic backtests assume frictionless execution. My engine models three friction layers. Slippage: 5 basis points adverse price impact per trade, applied directionally. Commission: 10 basis points of notional. Order types: LIMIT orders only fill if the bar's low crosses the limit price; STOP orders trigger on adverse movement. These compound significantly — a strategy showing 8% annual return frictionless might show 3% after costs, which fails to beat a 4% risk-free rate. The SimulatedBroker implements the same interface as a LiveBroker, so I can swap in a real exchange connection without changing any other code."
+> "Most academic backtests assume frictionless execution. My engine models three friction layers. Slippage: 5 basis points adverse price impact per trade, applied directionally. Commission: 10 basis points of notional. Execution timing: signals are queued, MARKET orders first execute at a later bar's open, and persistent LIMIT/STOP orders use explicit intrabar and gap rules. These compound significantly — a strategy showing 8% annual return frictionless might show 3% after costs, which fails to beat a 4% risk-free rate. The SimulatedBroker implements the same interface as a LiveBroker, so I can swap in a real exchange connection without changing any other code."
 
 ### 6.4 Live-Backtest Parity
 
