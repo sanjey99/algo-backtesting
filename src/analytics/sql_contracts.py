@@ -7,10 +7,9 @@ from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import TypeAlias
 
-Scalar: TypeAlias = str | int | float | datetime | None
-BindValue: TypeAlias = Scalar | tuple[Scalar, ...]
+type Scalar = str | int | float | datetime | None
+type BindValue = Scalar | tuple[Scalar, ...]
 
 
 class QueryId(StrEnum):

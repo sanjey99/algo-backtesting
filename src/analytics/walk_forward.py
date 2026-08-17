@@ -8,16 +8,20 @@ realistic live performance estimate that cannot be cherry-picked.
 """
 from __future__ import annotations
 
+import logging
 import random
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from src.analytics.metrics import compute_all_metrics, equity_curve_to_returns, sharpe_ratio
 from src.engine.backtest import BacktestConfig, BacktestEngine, BacktestResult
 from src.models.candle import Candle
 from src.models.portfolio import EquityPoint
+from src.observability import log_event
 from src.strategies.base import BaseStrategy
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -88,16 +92,23 @@ class WalkForwardAnalyzer:
             strategy = self.strategy_cls(**params)
             engine = BacktestEngine()
             return engine.run(strategy, candles, self.config)
-        except Exception:
+        except ValueError as error:
             # Invalid param combo (e.g., fast >= slow) — return empty result
-            from datetime import datetime
-
+            log_event(
+                logger,
+                logging.DEBUG,
+                "walk_forward.invalid_parameters",
+                seed=self.seed,
+                exception_type=type(error).__name__,
+            )
             from src.engine.backtest import BacktestResult
             return BacktestResult(
-                strategy_name=self.strategy_cls.name if hasattr(self.strategy_cls, 'name') else "unknown",
+                strategy_name=(
+                    self.strategy_cls.name if hasattr(self.strategy_cls, "name") else "unknown"
+                ),
                 symbol="",
-                start_date=candles[0].timestamp if candles else datetime.utcnow(),
-                end_date=candles[-1].timestamp if candles else datetime.utcnow(),
+                start_date=candles[0].timestamp if candles else datetime.now(UTC),
+                end_date=candles[-1].timestamp if candles else datetime.now(UTC),
                 parameters=params,
                 trades=[],
                 equity_curve=[],
@@ -155,7 +166,11 @@ class WalkForwardAnalyzer:
                 scale = last_equity / first_oos if first_oos > 0 else 1.0
                 for pt in oos_result.equity_curve:
                     combined_equity.append(
-                        EquityPoint(date=pt.date, equity=pt.equity * scale, drawdown_pct=pt.drawdown_pct)
+                        EquityPoint(
+                            date=pt.date,
+                            equity=pt.equity * scale,
+                            drawdown_pct=pt.drawdown_pct,
+                        )
                     )
             else:
                 combined_equity.extend(oos_result.equity_curve)
@@ -190,19 +205,19 @@ class WalkForwardAnalyzer:
         combined_sharpe = sharpe_ratio(combined_returns)
 
         # Build a minimal BacktestResult for combined metrics
-        from datetime import datetime
-
         from src.engine.backtest import BacktestResult
         all_trades = [t for w in windows for t in w.oos_result.trades]
         combined_result = BacktestResult(
             strategy_name=getattr(self.strategy_cls, 'name', 'unknown'),
             symbol="combined",
-            start_date=combined_equity[0].date if combined_equity else datetime.utcnow(),
-            end_date=combined_equity[-1].date if combined_equity else datetime.utcnow(),
+            start_date=combined_equity[0].date if combined_equity else datetime.now(UTC),
+            end_date=combined_equity[-1].date if combined_equity else datetime.now(UTC),
             parameters={},
             trades=all_trades,
             equity_curve=combined_equity,
-            final_equity=combined_equity[-1].equity if combined_equity else self.config.initial_capital,
+            final_equity=(
+                combined_equity[-1].equity if combined_equity else self.config.initial_capital
+            ),
             initial_capital=self.config.initial_capital,
         )
         combined_metrics = compute_all_metrics(combined_result)

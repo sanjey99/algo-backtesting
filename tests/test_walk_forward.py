@@ -1,9 +1,13 @@
 """Tests for Walk-Forward Analysis — Step 7."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import logging
+from datetime import UTC, datetime, timedelta
+
+import pytest
 
 from src.analytics.walk_forward import WalkForwardAnalyzer
+from src.engine.backtest import BacktestEngine
 from src.models.candle import Candle
 from src.strategies.ma_crossover import MACrossoverStrategy
 
@@ -130,3 +134,46 @@ class TestWalkForwardAnalyzer:
         )
         result = analyzer.run(candles)
         assert len(result.windows) == 0
+        assert result.combined_equity_curve == []
+        assert result.combined_metrics["total_return"] == 0.0
+
+    def test_empty_backtest_fallback_uses_utc_timestamps(self) -> None:
+        analyzer = WalkForwardAnalyzer(MACrossoverStrategy)
+
+        result = analyzer._run_backtest([], {})
+
+        assert result.start_date.tzinfo is UTC
+        assert result.end_date.tzinfo is UTC
+
+    def test_invalid_parameters_are_logged_at_debug(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        analyzer = WalkForwardAnalyzer(MACrossoverStrategy, seed=17)
+
+        with caplog.at_level(logging.DEBUG):
+            analyzer._run_backtest(
+                make_trending_candles(2), {"fast_period": 20, "slow_period": 5}
+            )
+
+        record = next(
+            record
+            for record in caplog.records
+            if getattr(record, "event", None) == "walk_forward.invalid_parameters"
+        )
+        fields = getattr(record, "event_fields", {})
+        assert record.levelno == logging.DEBUG
+        assert fields == {"seed": 17, "exception_type": "ValueError"}
+
+    def test_unexpected_backtest_failure_is_propagated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Engine failures must not become plausible zero-trade results."""
+        analyzer = WalkForwardAnalyzer(MACrossoverStrategy)
+
+        def fail_run(*_: object, **__: object) -> None:
+            raise RuntimeError("engine invariant violated")
+
+        monkeypatch.setattr(BacktestEngine, "run", fail_run)
+
+        with pytest.raises(RuntimeError, match="engine invariant violated"):
+            analyzer._run_backtest(make_trending_candles(2), {})

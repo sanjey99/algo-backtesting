@@ -1,4 +1,5 @@
 """Backtest routes — run, retrieve, walk-forward, permutation."""
+
 from __future__ import annotations
 
 import uuid
@@ -10,7 +11,8 @@ from sqlalchemy.orm import Session
 from src.analytics.metrics import compute_all_metrics
 from src.analytics.permutation_test import PermutationTester
 from src.analytics.walk_forward import WalkForwardAnalyzer
-from src.api.deps import get_db, get_job, set_job
+from src.api.deps import get_acquisition_service, get_db, get_job, set_job
+from src.api.routes.data import acquire_result
 from src.api.schemas import (
     AsyncJobOut,
     BacktestDetail,
@@ -24,6 +26,9 @@ from src.api.schemas import (
     WalkForwardRequest,
     WindowOut,
 )
+from src.data import df_to_candles
+from src.data.acquisition import AcquisitionService
+from src.data.contracts import AcquisitionRequest, ContractViolationError
 from src.db.crud import (
     get_backtest_run,
     get_equity_curve,
@@ -33,32 +38,40 @@ from src.db.crud import (
     save_backtest_run,
 )
 from src.engine.backtest import BacktestConfig, BacktestEngine
+from src.models.candle import Candle
 from src.strategies import STRATEGY_REGISTRY
+from src.strategies.base import BaseStrategy
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
 
 DBDep = Annotated[Session, Depends(get_db)]
+AcquisitionDep = Annotated[AcquisitionService, Depends(get_acquisition_service)]
 
 
-def _fetch_candles(symbol: str, start: str, end: str) -> list[Any]:
-    """Fetch candles via YFinanceFetcher, with parquet caching via DataStore."""
-    from datetime import datetime
-    from src.data import df_to_candles
-    from src.data.fetcher import YFinanceFetcher
-    from src.data.store import DataStore
+def _fetch_candles(
+    symbol: str,
+    start: str,
+    end: str,
+    service: AcquisitionService,
+) -> list[Candle]:
+    """Acquire through the shared service and cross the strict Candle boundary."""
+    from datetime import date
 
-    fetcher = YFinanceFetcher()
-    store = DataStore()
-    df = store.fetch_or_cache(
-        symbol,
-        datetime.fromisoformat(start),
-        datetime.fromisoformat(end),
-        fetcher,
-    )
-    return df_to_candles(df)
+    try:
+        request = AcquisitionRequest(
+            symbol,
+            date.fromisoformat(start),
+            date.fromisoformat(end),
+        )
+        result = acquire_result(service, request)
+        return df_to_candles(result.frame)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="Invalid acquisition date range") from error
+    except ContractViolationError as error:
+        raise HTTPException(status_code=422, detail="Acquired candle data is invalid") from error
 
 
-def _strategy_from_request(strategy_key: str, params: dict[str, Any]):
+def _strategy_from_request(strategy_key: str, params: dict[str, Any]) -> BaseStrategy:
     cls = STRATEGY_REGISTRY.get(strategy_key)
     if cls is None:
         raise HTTPException(status_code=400, detail=f"Unknown strategy: {strategy_key!r}")
@@ -74,11 +87,18 @@ def _strategy_from_request(strategy_key: str, params: dict[str, Any]):
 
 
 @router.post("", response_model=BacktestSummary, status_code=201)
-def run_backtest(req: BacktestRequest, db: DBDep):
+def run_backtest(
+    req: BacktestRequest,
+    db: DBDep,
+    acquisition: AcquisitionDep,
+) -> BacktestSummary:
     strategy = _strategy_from_request(req.strategy, req.params)
-    candles = _fetch_candles(req.symbol, req.start, req.end)
+    candles = _fetch_candles(req.symbol, req.start, req.end, acquisition)
     if not candles:
-        raise HTTPException(status_code=422, detail="No candle data returned for given symbol/range")
+        raise HTTPException(
+            status_code=422,
+            detail="No candle data returned for given symbol/range",
+        )
 
     config = BacktestConfig(
         initial_capital=req.initial_capital,
@@ -90,17 +110,19 @@ def run_backtest(req: BacktestRequest, db: DBDep):
 
     trades_dicts = []
     for t in result.trades:
-        trades_dicts.append({
-            "entry_date": t.entry_date,
-            "exit_date": t.exit_date,
-            "direction": t.direction.value,
-            "entry_price": t.entry_price,
-            "exit_price": t.exit_price,
-            "quantity": t.quantity,
-            "pnl": t.pnl if t.is_closed else None,
-            "pnl_pct": t.pnl_pct if t.is_closed else None,
-            "commission": t.commission,
-        })
+        trades_dicts.append(
+            {
+                "entry_date": t.entry_date,
+                "exit_date": t.exit_date,
+                "direction": t.direction.value,
+                "entry_price": t.entry_price,
+                "exit_price": t.exit_price,
+                "quantity": t.quantity,
+                "pnl": t.pnl if t.is_closed else None,
+                "pnl_pct": t.pnl_pct if t.is_closed else None,
+                "commission": t.commission,
+            }
+        )
 
     equity_dicts = [
         {"date": pt.date, "equity": pt.equity, "drawdown_pct": pt.drawdown_pct}
@@ -141,22 +163,24 @@ def run_backtest(req: BacktestRequest, db: DBDep):
 
 
 @router.get("", response_model=list[BacktestSummary])
-def list_runs(db: DBDep, limit: int = 50):
+def list_runs(db: DBDep, limit: int = 50) -> list[BacktestSummary]:
     runs = list_backtest_runs(db, limit=limit)
     result = []
     for run in runs:
         m = get_metrics(db, run.id)
         equity_pts = get_equity_curve(db, run.id)
-        result.append(BacktestSummary(
-            run_id=run.id,
-            strategy_name=run.strategy_name,
-            symbol=run.symbol,
-            start_date=run.start_date,
-            end_date=run.end_date,
-            final_equity=equity_pts[-1].equity if equity_pts else run.initial_capital,
-            initial_capital=run.initial_capital,
-            metrics=m,
-        ))
+        result.append(
+            BacktestSummary(
+                run_id=run.id,
+                strategy_name=run.strategy_name,
+                symbol=run.symbol,
+                start_date=run.start_date,
+                end_date=run.end_date,
+                final_equity=equity_pts[-1].equity if equity_pts else run.initial_capital,
+                initial_capital=run.initial_capital,
+                metrics=m,
+            )
+        )
     return result
 
 
@@ -166,7 +190,7 @@ def list_runs(db: DBDep, limit: int = 50):
 
 
 @router.get("/{run_id}", response_model=BacktestDetail)
-def get_run(run_id: str, db: DBDep):
+def get_run(run_id: str, db: DBDep) -> BacktestDetail:
     import json
 
     run = get_backtest_run(db, run_id)
@@ -214,7 +238,7 @@ def get_run(run_id: str, db: DBDep):
 
 
 @router.get("/{run_id}/trades", response_model=list[TradeOut])
-def get_run_trades(run_id: str, db: DBDep):
+def get_run_trades(run_id: str, db: DBDep) -> list[TradeOut]:
     if get_backtest_run(db, run_id) is None:
         raise HTTPException(status_code=404, detail="Backtest run not found")
     return [
@@ -239,7 +263,7 @@ def get_run_trades(run_id: str, db: DBDep):
 
 
 @router.get("/{run_id}/equity-curve", response_model=list[EquityPointOut])
-def get_run_equity_curve(run_id: str, db: DBDep):
+def get_run_equity_curve(run_id: str, db: DBDep) -> list[EquityPointOut]:
     if get_backtest_run(db, run_id) is None:
         raise HTTPException(status_code=404, detail="Backtest run not found")
     return [
@@ -254,12 +278,15 @@ def get_run_equity_curve(run_id: str, db: DBDep):
 
 
 @router.post("/walk-forward", response_model=WalkForwardOut)
-def run_walk_forward(req: WalkForwardRequest):
+def run_walk_forward(
+    req: WalkForwardRequest,
+    acquisition: AcquisitionDep,
+) -> WalkForwardOut:
     cls = STRATEGY_REGISTRY.get(req.strategy)
     if cls is None:
         raise HTTPException(status_code=400, detail=f"Unknown strategy: {req.strategy!r}")
 
-    candles = _fetch_candles(req.symbol, req.start, req.end)
+    candles = _fetch_candles(req.symbol, req.start, req.end, acquisition)
     if not candles:
         raise HTTPException(status_code=422, detail="No candle data returned")
 
@@ -298,12 +325,16 @@ def run_walk_forward(req: WalkForwardRequest):
 # ---------------------------------------------------------------------------
 
 
-def _run_permutation_bg(job_id: str, req: PermutationRequest) -> None:
+def _run_permutation_bg(
+    job_id: str,
+    req: PermutationRequest,
+    acquisition: AcquisitionService,
+) -> None:
     """Background worker — updates job store on completion."""
     try:
         set_job(job_id, AsyncJobOut(job_id=job_id, status="running"))
         strategy = _strategy_from_request(req.strategy, req.params)
-        candles = _fetch_candles(req.symbol, req.start, req.end)
+        candles = _fetch_candles(req.symbol, req.start, req.end, acquisition)
         config = BacktestConfig(initial_capital=req.initial_capital)
         tester = PermutationTester(
             strategy=strategy,
@@ -327,20 +358,29 @@ def _run_permutation_bg(job_id: str, req: PermutationRequest) -> None:
                 ),
             ),
         )
-    except Exception as exc:
-        set_job(job_id, AsyncJobOut(job_id=job_id, status="error", error=str(exc)))
+    except Exception:
+        set_job(
+            job_id,
+            AsyncJobOut(job_id=job_id, status="error", error="Permutation test failed"),
+        )
 
 
 @router.post("/permutation-test", response_model=AsyncJobOut, status_code=202)
-def start_permutation_test(req: PermutationRequest, background_tasks: BackgroundTasks):
+def start_permutation_test(
+    req: PermutationRequest,
+    background_tasks: BackgroundTasks,
+    acquisition: AcquisitionDep,
+) -> AsyncJobOut:
     job_id = str(uuid.uuid4())
     set_job(job_id, AsyncJobOut(job_id=job_id, status="pending"))
-    background_tasks.add_task(_run_permutation_bg, job_id, req)
-    return get_job(job_id)
+    background_tasks.add_task(_run_permutation_bg, job_id, req, acquisition)
+    job = get_job(job_id)
+    assert job is not None
+    return job
 
 
 @router.get("/permutation-test/{job_id}", response_model=AsyncJobOut)
-def poll_permutation_test(job_id: str):
+def poll_permutation_test(job_id: str) -> AsyncJobOut:
     job = get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")

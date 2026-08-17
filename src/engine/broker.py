@@ -15,17 +15,19 @@ class SimulatedBroker:
     Fill logic
     ----------
     MARKET orders
-        Fill at close * (1 + slippage) for LONG, close * (1 - slippage) for SHORT.
+        Fill at open * (1 + slippage) for LONG, open * (1 - slippage) for SHORT.
 
     LIMIT orders
-        BUY  fills when candle.low  <= limit_price  (price came down to our bid)
-        SELL fills when candle.high >= limit_price  (price came up  to our ask)
-        Fill price is the limit_price itself (conservative; no price improvement).
+        BUY  fills at an adverse slipped open on a favorable down gap; otherwise,
+        when candle.low <= limit_price, fills at the limit price.
+        SELL fills at an adverse slipped open on a favorable up gap; otherwise,
+        when candle.high >= limit_price, fills at the limit price.
 
     STOP orders
-        BUY  fills when candle.high >= stop_price   (price broke above our trigger)
-        SELL fills when candle.low  <= stop_price   (price broke below our trigger)
-        Fill price is the stop_price (market-order at trigger).
+        BUY  fills at the open when it gaps above the stop; otherwise, when
+        candle.high >= stop_price, fills at the stop. Both receive slippage.
+        SELL fills at the open when it gaps below the stop; otherwise, when
+        candle.low <= stop_price, fills at the stop. Both receive slippage.
     """
 
     def __init__(
@@ -71,33 +73,32 @@ class SimulatedBroker:
         return None  # unknown order type
 
     def _market_fill(self, order: Order, candle: Candle) -> float:
-        """Slip away from close in the direction that is adverse to the trader."""
-        if order.direction == Direction.LONG:
-            return candle.close * (1.0 + self.slippage_pct)
-        return candle.close * (1.0 - self.slippage_pct)
+        return self._adverse_price(candle.open, order.direction)
 
     def _limit_fill(self, order: Order, candle: Candle) -> float | None:
         assert order.limit_price is not None  # guaranteed by Order.__post_init__
         limit = order.limit_price
-        if order.direction == Direction.LONG:
-            # We want to buy: fill only if market dropped to our bid
-            if candle.low <= limit:
-                return limit
-        else:
-            # We want to sell: fill only if market rose to our ask
-            if candle.high >= limit:
-                return limit
-        return None
+        if order.direction is Direction.LONG:
+            if candle.open <= limit:
+                return min(limit, self._adverse_price(candle.open, order.direction))
+            return limit if candle.low <= limit else None
+        if candle.open >= limit:
+            return max(limit, self._adverse_price(candle.open, order.direction))
+        return limit if candle.high >= limit else None
 
     def _stop_fill(self, order: Order, candle: Candle) -> float | None:
         assert order.stop_price is not None  # guaranteed by Order.__post_init__
         stop = order.stop_price
-        if order.direction == Direction.LONG:
-            # Buy stop: triggered when price breaks *above* the stop level
-            if candle.high >= stop:
-                return stop
+        if order.direction is Direction.LONG:
+            raw = candle.open if candle.open >= stop else stop if candle.high >= stop else None
         else:
-            # Sell stop: triggered when price breaks *below* the stop level
-            if candle.low <= stop:
-                return stop
-        return None
+            raw = candle.open if candle.open <= stop else stop if candle.low <= stop else None
+        return None if raw is None else self._adverse_price(raw, order.direction)
+
+    def _adverse_price(self, price: float, direction: Direction) -> float:
+        multiplier = (
+            1.0 + self.slippage_pct
+            if direction is Direction.LONG
+            else 1.0 - self.slippage_pct
+        )
+        return price * multiplier

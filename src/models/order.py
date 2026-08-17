@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
-from typing import Optional
 
 
 class OrderType(Enum):
@@ -17,7 +16,7 @@ class Direction(Enum):
     LONG = "LONG"
     SHORT = "SHORT"
 
-    def opposite(self) -> "Direction":
+    def opposite(self) -> Direction:
         return Direction.SHORT if self == Direction.LONG else Direction.LONG
 
 
@@ -33,9 +32,9 @@ class Order:
     direction: Direction
     quantity: int
     order_type: OrderType = OrderType.MARKET
-    limit_price: Optional[float] = None
-    stop_price: Optional[float] = None
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    limit_price: float | None = None
+    stop_price: float | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     order_id: str = field(default="")
 
     def __post_init__(self) -> None:

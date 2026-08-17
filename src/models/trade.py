@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
 
 from src.models.order import Direction
 
@@ -22,8 +21,8 @@ class Trade:
     quantity: int
     entry_date: datetime
     commission: float = 0.0
-    exit_price: Optional[float] = None
-    exit_date: Optional[datetime] = None
+    exit_price: float | None = None
+    exit_date: datetime | None = None
     trade_id: str = field(default="")
 
     @property
@@ -51,7 +50,7 @@ class Trade:
         return self.pnl / cost
 
     @property
-    def duration_days(self) -> Optional[float]:
+    def duration_days(self) -> float | None:
         if self.exit_date is None:
             return None
         return (self.exit_date - self.entry_date).total_seconds() / 86400.0

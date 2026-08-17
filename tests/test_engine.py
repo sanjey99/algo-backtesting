@@ -1,18 +1,191 @@
 """Tests for the event system and backtest engine (Step 3)."""
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 
 import pytest
 
 from src.engine.backtest import BacktestConfig, BacktestEngine
 from src.engine.broker import SimulatedBroker
+from src.engine.context import StrategyContext
 from src.engine.event import FillEvent, MarketEvent, OrderEvent, SignalEvent
 from src.models.candle import Candle
 from src.models.order import Direction, Order, OrderType
 
 # Re-use conftest helpers directly (not as fixtures) for unit-level tests
 from tests.conftest import make_candle, make_candle_series
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("short_initial_margin", 0.99),
+        ("short_maintenance_margin", -0.01),
+        ("annual_short_borrow_rate", -0.01),
+        ("borrow_day_count", 0.0),
+    ],
+)
+def test_backtest_config_rejects_invalid_margin_values(field: str, value: float) -> None:
+    with pytest.raises(ValueError):
+        BacktestConfig(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("short_initial_margin", float("inf")),
+        ("short_maintenance_margin", float("nan")),
+        ("annual_short_borrow_rate", float("inf")),
+        ("borrow_day_count", float("nan")),
+    ],
+)
+def test_backtest_config_rejects_non_finite_margin_values(field: str, value: float) -> None:
+    with pytest.raises(ValueError):
+        BacktestConfig(**{field: value})
+
+
+def _bar(index: int, open_: float, high: float, low: float, close: float) -> Candle:
+    return Candle(
+        timestamp=datetime(2023, 1, index + 1),
+        open=open_,
+        high=high,
+        low=low,
+        close=close,
+        volume=1_000.0,
+        adj_close=close,
+    )
+
+
+def test_backtest_emits_start_fill_and_completion(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The run lifecycle exposes its authoritative order transitions."""
+    with caplog.at_level(logging.DEBUG):
+        BacktestEngine().run(
+            _BuyOnZeroSellOnOne(),
+            [
+                _bar(0, 100, 101, 99, 100),
+                _bar(1, 101, 102, 100, 101),
+                _bar(2, 102, 103, 101, 102),
+            ],
+            BacktestConfig(),
+        )
+
+    events = [getattr(record, "event", None) for record in caplog.records]
+    assert events[0] == "backtest.started"
+    assert "order.queued" in events
+    assert "order.filled" in events
+    assert events[-1] == "backtest.completed"
+    records_by_event = {getattr(record, "event", None): record for record in caplog.records}
+    assert records_by_event["backtest.started"].levelno == logging.INFO
+    assert records_by_event["order.queued"].levelno == logging.DEBUG
+    assert records_by_event["order.filled"].levelno == logging.DEBUG
+    assert records_by_event["backtest.completed"].levelno == logging.INFO
+
+
+def test_rejected_order_logs_reason_not_payload(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Expected rejection is observable through its stable typed reason."""
+    with caplog.at_level(logging.WARNING):
+        BacktestEngine().run(
+            _BuyOnZeroSellOnOne(),
+            [_bar(0, 100, 101, 99, 100), _bar(1, 101, 102, 100, 101)],
+            BacktestConfig(initial_capital=1.0),
+        )
+
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "order.rejected"
+    )
+    fields = getattr(record, "event_fields")
+    assert isinstance(fields, dict)
+    assert fields["reason"] == "insufficient_buying_power"
+    assert record.levelno == logging.WARNING
+
+
+def test_pending_order_transitions_are_logged(caplog: pytest.LogCaptureFixture) -> None:
+    """Conditional execution records retry, replacement, and final cancellation."""
+    strategy = _ScheduledSignals(
+        {
+            0: (Direction.LONG, OrderType.LIMIT, 90.0),
+            1: (Direction.LONG, OrderType.LIMIT, 95.0),
+        }
+    )
+    candles = [_bar(0, 100, 101, 99, 100), _bar(1, 100, 101, 98, 100)]
+
+    with caplog.at_level(logging.DEBUG):
+        BacktestEngine().run(strategy, candles, BacktestConfig())
+
+    events = [getattr(record, "event", None) for record in caplog.records]
+    assert "order.untriggered" in events
+    assert "order.replaced" in events
+    assert "order.cancelled_end_of_data" in events
+    records_by_event = {getattr(record, "event", None): record for record in caplog.records}
+    assert records_by_event["order.untriggered"].levelno == logging.DEBUG
+    assert records_by_event["order.replaced"].levelno == logging.DEBUG
+    assert records_by_event["order.cancelled_end_of_data"].levelno == logging.DEBUG
+
+
+def test_margin_lifecycle_transitions_are_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Borrow and margin calls remain visible without INFO-level bar noise."""
+    with caplog.at_level(logging.DEBUG):
+        BacktestEngine().run(_OpenShortOnce(), _margin_breach_candles(), _margin_config())
+
+    events = [getattr(record, "event", None) for record in caplog.records]
+    assert "margin.borrow_accrued" in events
+    assert "margin.call_queued" in events
+    records_by_event = {getattr(record, "event", None): record for record in caplog.records}
+    assert records_by_event["margin.borrow_accrued"].levelno == logging.DEBUG
+    assert records_by_event["margin.call_queued"].levelno == logging.WARNING
+
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        BacktestEngine().run(
+            _OpenShortOnce(), _margin_breach_candles(False), _margin_config()
+        )
+
+    events = [getattr(record, "event", None) for record in caplog.records]
+    assert "order.cancelled_end_of_data" in events
+    assert "margin.call_unresolved" in events
+    records_by_event = {getattr(record, "event", None): record for record in caplog.records}
+    assert records_by_event["margin.call_unresolved"].levelno == logging.WARNING
+
+
+def test_backtest_failure_logs_safe_type_and_reraises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unexpected strategy errors retain failure propagation without raw diagnostics."""
+
+    class _FailingStrategy:
+        name = "failing"
+        parameters: dict[str, object] = {}
+
+        def on_candle(
+            self, candle: Candle, context: StrategyContext
+        ) -> SignalEvent | None:
+            del candle, context
+            raise RuntimeError("fixture-sensitive-error")
+
+    with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match="sensitive"):
+        BacktestEngine().run(
+            _FailingStrategy(), [_bar(0, 100, 101, 99, 100)], BacktestConfig()
+        )
+
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "backtest.failed"
+    )
+    fields = getattr(record, "event_fields")
+    assert isinstance(fields, dict)
+    assert fields["error_type"] == "RuntimeError"
+    assert record.levelno == logging.ERROR
+    assert "fixture-sensitive-error" not in record.getMessage()
 
 # ---------------------------------------------------------------------------
 # Event dataclass instantiation
@@ -88,21 +261,19 @@ class TestSimulatedBrokerMarket:
         self.broker = SimulatedBroker(
             slippage_pct=self.SLIPPAGE, commission_pct=self.COMMISSION
         )
-        self.candle = make_candle(close=100.0, high=101.0, low=98.0)
+        self.candle = make_candle(open_=90.0, close=100.0, high=101.0, low=89.0)
 
-    def test_market_long_fill_price(self) -> None:
+    def test_market_long_fills_at_open(self) -> None:
         order = Order(symbol="X", direction=Direction.LONG, quantity=1)
         fill = self.broker.execute(order, self.candle)
         assert fill is not None
-        expected = 100.0 * (1 + self.SLIPPAGE)
-        assert abs(fill.fill_price - expected) < 1e-9
+        assert fill.fill_price == pytest.approx(90.0 * (1 + self.SLIPPAGE))
 
     def test_market_short_fill_price(self) -> None:
         order = Order(symbol="X", direction=Direction.SHORT, quantity=1)
         fill = self.broker.execute(order, self.candle)
         assert fill is not None
-        expected = 100.0 * (1 - self.SLIPPAGE)
-        assert abs(fill.fill_price - expected) < 1e-9
+        assert fill.fill_price == pytest.approx(90.0 * (1 - self.SLIPPAGE))
 
     def test_market_commission_is_percentage_of_notional(self) -> None:
         order = Order(symbol="X", direction=Direction.LONG, quantity=10)
@@ -165,6 +336,14 @@ class TestSimulatedBrokerLimit:
         fill = self.broker.execute(order, self.candle)
         assert fill is None
 
+    def test_buy_limit_gap_gets_protected_slipped_open(self) -> None:
+        broker = SimulatedBroker(slippage_pct=0.01, commission_pct=0.0)
+        candle = make_candle(open_=90.0, high=96.0, low=89.0, close=95.0)
+        order = Order("X", Direction.LONG, 1, OrderType.LIMIT, limit_price=95.0)
+        fill = broker.execute(order, candle)
+        assert fill is not None
+        assert fill.fill_price == pytest.approx(90.9)
+
     # -- SELL LIMIT ----------------------------------------------------------
 
     def test_limit_sell_fills_when_high_at_limit(self) -> None:
@@ -190,6 +369,14 @@ class TestSimulatedBrokerLimit:
         fill = self.broker.execute(order, self.candle)
         assert fill is None
 
+    def test_sell_limit_gap_gets_protected_slipped_open(self) -> None:
+        broker = SimulatedBroker(slippage_pct=0.01, commission_pct=0.0)
+        candle = make_candle(open_=110.0, high=111.0, low=104.0, close=105.0)
+        order = Order("X", Direction.SHORT, 1, OrderType.LIMIT, limit_price=105.0)
+        fill = broker.execute(order, candle)
+        assert fill is not None
+        assert fill.fill_price == pytest.approx(108.9)
+
 
 class TestSimulatedBrokerStop:
     """STOP order conditional fill tests."""
@@ -208,7 +395,7 @@ class TestSimulatedBrokerStop:
         )
         fill = self.broker.execute(order, self.candle)
         assert fill is not None
-        assert fill.fill_price == 101.0
+        assert fill.fill_price == pytest.approx(101.0 * (1 + self.broker.slippage_pct))
 
     def test_stop_buy_fills_when_high_above_stop(self) -> None:
         order = Order(
@@ -232,6 +419,14 @@ class TestSimulatedBrokerStop:
         fill = self.broker.execute(order, self.candle)
         assert fill is None
 
+    def test_buy_stop_gap_pays_open_plus_slippage(self) -> None:
+        broker = SimulatedBroker(slippage_pct=0.01, commission_pct=0.0)
+        candle = make_candle(open_=110.0, high=112.0, low=109.0, close=111.0)
+        order = Order("X", Direction.LONG, 1, OrderType.STOP, stop_price=105.0)
+        fill = broker.execute(order, candle)
+        assert fill is not None
+        assert fill.fill_price == pytest.approx(111.1)
+
     def test_stop_sell_fills_when_low_at_stop(self) -> None:
         order = Order(
             symbol="X",
@@ -254,6 +449,14 @@ class TestSimulatedBrokerStop:
         fill = self.broker.execute(order, self.candle)
         assert fill is None
 
+    def test_sell_stop_gap_pays_open_minus_slippage(self) -> None:
+        broker = SimulatedBroker(slippage_pct=0.01, commission_pct=0.0)
+        candle = make_candle(open_=90.0, high=91.0, low=88.0, close=89.0)
+        order = Order("X", Direction.SHORT, 1, OrderType.STOP, stop_price=95.0)
+        fill = broker.execute(order, candle)
+        assert fill is not None
+        assert fill.fill_price == pytest.approx(89.1)
+
 
 # ---------------------------------------------------------------------------
 # BacktestEngine integration test
@@ -261,19 +464,21 @@ class TestSimulatedBrokerStop:
 
 
 class _BuyDay0SellDay49Strategy:
-    """Signals LONG on the first candle, SHORT on the 50th candle (index 49).
+    """Signals LONG on the first candle, SHORT before the 50th candle.
 
     Uses a bar counter so it is self-contained and repeatable.
     """
 
     name: str = "BuyDay0SellDay49"
-    parameters: dict = {}
+    parameters: dict[str, object] = {}
 
     def __init__(self, symbol: str = "TEST") -> None:
         self._symbol = symbol
         self._bar_count = 0
 
-    def on_candle(self, candle: Candle) -> SignalEvent | None:
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
         idx = self._bar_count
         self._bar_count += 1
 
@@ -283,7 +488,7 @@ class _BuyDay0SellDay49Strategy:
                 direction=Direction.LONG,
                 timestamp=candle.timestamp,
             )
-        if idx == 49:
+        if idx == 48:
             return SignalEvent(
                 symbol=self._symbol,
                 direction=Direction.SHORT,
@@ -323,12 +528,12 @@ class TestBacktestEngine:
         result = engine.run(strategy, candles, self._config())
 
         # Manual calculation matching broker logic
-        buy_close = candles[0].close   # 100.0
-        sell_close = candles[49].close  # 100 + 49*0.5 = 124.5
+        buy_open = candles[1].open  # 100.2
+        sell_open = candles[49].open  # 100 + 49*0.5 - 0.3 = 124.2
         qty = 1
 
-        entry_price = buy_close * (1 + self.SLIPPAGE)
-        exit_price = sell_close * (1 - self.SLIPPAGE)
+        entry_price = buy_open * (1 + self.SLIPPAGE)
+        exit_price = sell_open * (1 - self.SLIPPAGE)
         entry_comm = entry_price * qty * self.COMMISSION
         exit_comm = exit_price * qty * self.COMMISSION
 
@@ -377,9 +582,11 @@ class TestBacktestEngine:
 
         class _NullStrategy:
             name = "Null"
-            parameters: dict = {}
+            parameters: dict[str, object] = {}
 
-            def on_candle(self, candle: Candle) -> SignalEvent | None:
+            def on_candle(
+                self, candle: Candle, context: StrategyContext
+            ) -> SignalEvent | None:
                 return None
 
         candles = make_candle_series(n=10, base=100.0)
@@ -391,10 +598,405 @@ class TestBacktestEngine:
     def test_empty_candles_raises(self) -> None:
         class _NullStrategy:
             name = "Null"
-            parameters: dict = {}
+            parameters: dict[str, object] = {}
 
-            def on_candle(self, candle: Candle) -> SignalEvent | None:
+            def on_candle(
+                self, candle: Candle, context: StrategyContext
+            ) -> SignalEvent | None:
                 return None
 
         with pytest.raises(ValueError, match="candles list must not be empty"):
             BacktestEngine().run(_NullStrategy(), [], self._config())
+
+
+class _BuyOnZeroSellOnOne:
+    name = "timing"
+    parameters: dict[str, object] = {}
+
+    def __init__(self) -> None:
+        self.index = 0
+
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
+        index = self.index
+        self.index += 1
+        if index == 0:
+            return SignalEvent("X", Direction.LONG, timestamp=candle.timestamp)
+        if index == 1 and context.position_direction is Direction.LONG:
+            return SignalEvent("X", Direction.SHORT, timestamp=candle.timestamp)
+        return None
+
+
+class _BuyLimitThenCloseAfterFill:
+    name = "limit-timing"
+    parameters: dict[str, object] = {}
+
+    def __init__(self, limit: float) -> None:
+        self.limit = limit
+        self.submitted = False
+
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
+        if not self.submitted:
+            self.submitted = True
+            return SignalEvent(
+                "X",
+                Direction.LONG,
+                timestamp=candle.timestamp,
+                order_type=OrderType.LIMIT,
+                limit_price=self.limit,
+            )
+        if context.position_direction is Direction.LONG:
+            return SignalEvent("X", Direction.SHORT, timestamp=candle.timestamp)
+        return None
+
+
+class _SignalOnlyOnLastBar:
+    name = "last-bar"
+    parameters: dict[str, object] = {}
+
+    def __init__(self, last_index: int = 2) -> None:
+        self.index = 0
+        self.last_index = last_index
+
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
+        index = self.index
+        self.index += 1
+        if index == self.last_index:
+            return SignalEvent("X", Direction.LONG, timestamp=candle.timestamp)
+        return None
+
+
+class _OpenShortOnce:
+    name = "short-once"
+    parameters: dict[str, object] = {}
+
+    def __init__(self) -> None:
+        self.submitted = False
+
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
+        if self.submitted:
+            return None
+        self.submitted = True
+        return SignalEvent("X", Direction.SHORT, timestamp=candle.timestamp)
+
+
+class _OpenShortThenLimitCover:
+    name = "short-then-limit-cover"
+    parameters: dict[str, object] = {}
+
+    def __init__(self) -> None:
+        self.index = 0
+
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
+        index = self.index
+        self.index += 1
+        if index == 0:
+            return SignalEvent("X", Direction.SHORT, timestamp=candle.timestamp)
+        if index == 1:
+            return SignalEvent(
+                "X",
+                Direction.LONG,
+                timestamp=candle.timestamp,
+                order_type=OrderType.LIMIT,
+                limit_price=900.0,
+            )
+        return None
+
+
+def _margin_config() -> BacktestConfig:
+    return BacktestConfig(
+        initial_capital=1_000.0,
+        commission_pct=0.0,
+        slippage_pct=0.0,
+        short_maintenance_margin=0.30,
+    )
+
+
+def _margin_breach_candles(include_cover_bar: bool = True) -> list[Candle]:
+    candles = [
+        _bar(0, 100, 100, 100, 100),
+        _bar(1, 100, 1_000, 100, 1_000),
+    ]
+    if include_cover_bar:
+        candles.append(_bar(2, 1_100, 1_110, 1_090, 1_100))
+    return candles
+
+
+def test_margin_breach_forces_cover_at_following_open() -> None:
+    candles = _margin_breach_candles()
+    result = BacktestEngine().run(_OpenShortOnce(), candles, _margin_config())
+
+    assert len(result.trades) == 1
+    assert result.trades[0].exit_date == candles[2].timestamp
+    assert result.trades[0].exit_price == 1_100.0
+
+
+def test_final_bar_margin_breach_does_not_invent_cover() -> None:
+    result = BacktestEngine().run(
+        _OpenShortOnce(), _margin_breach_candles(False), _margin_config()
+    )
+
+    assert result.trades == []
+
+
+def test_margin_forced_cover_cannot_be_replaced_by_strategy_order() -> None:
+    candles = _margin_breach_candles()
+    result = BacktestEngine().run(
+        _OpenShortThenLimitCover(), candles, _margin_config()
+    )
+
+    assert len(result.trades) == 1
+    assert result.trades[0].exit_price == 1_100.0
+
+
+class _ScheduledSignals:
+    name = "scheduled"
+    parameters: dict[str, object] = {}
+
+    def __init__(
+        self,
+        schedule: dict[int, tuple[Direction, OrderType, float | None]],
+    ) -> None:
+        self.index = 0
+        self.schedule = schedule
+
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
+        index = self.index
+        self.index += 1
+        instruction = self.schedule.get(index)
+        if instruction is None:
+            return None
+        direction, order_type, price = instruction
+        return SignalEvent(
+            "X",
+            direction,
+            timestamp=candle.timestamp,
+            order_type=order_type,
+            limit_price=price if order_type is OrderType.LIMIT else None,
+            stop_price=price if order_type is OrderType.STOP else None,
+        )
+
+
+class _CaptureContexts:
+    name = "contexts"
+    parameters: dict[str, object] = {}
+
+    def __init__(self) -> None:
+        self.index = 0
+        self.contexts: list[StrategyContext] = []
+
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
+        index = self.index
+        self.index += 1
+        self.contexts.append(context)
+        if index == 0:
+            return SignalEvent(
+                "X",
+                Direction.LONG,
+                timestamp=candle.timestamp,
+                order_type=OrderType.LIMIT,
+                limit_price=90.0,
+            )
+        if index == 1:
+            return SignalEvent("X", Direction.LONG, timestamp=candle.timestamp)
+        if index == 2:
+            return SignalEvent("WRONG", Direction.SHORT, timestamp=candle.timestamp)
+        return None
+
+
+class _CaptureRejectedOrderContext:
+    name = "rejected-order-context"
+    parameters: dict[str, object] = {}
+
+    def __init__(self) -> None:
+        self.index = 0
+        self.contexts: list[StrategyContext] = []
+
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
+        index = self.index
+        self.index += 1
+        self.contexts.append(context)
+        if index == 0:
+            return SignalEvent("X", Direction.LONG, timestamp=candle.timestamp)
+        return None
+
+
+class TestBacktestEnginePendingOrders:
+    def test_engine_accrues_short_borrow_from_previous_close_before_next_fill_phase(self) -> None:
+        candles = [
+            _bar(0, 100.0, 101.0, 99.0, 100.0),
+            _bar(1, 100.0, 201.0, 99.0, 200.0),
+            _bar(2, 50.0, 51.0, 49.0, 50.0),
+        ]
+        strategy = _ScheduledSignals({0: (Direction.SHORT, OrderType.MARKET, None)})
+
+        result = BacktestEngine().run(
+            strategy,
+            candles,
+            BacktestConfig(
+                initial_capital=1_000.0,
+                commission_pct=0.0,
+                slippage_pct=0.0,
+                annual_short_borrow_rate=0.365,
+                borrow_day_count=365.0,
+            ),
+        )
+
+        assert result.final_equity == pytest.approx(1_049.8)
+
+    def test_signal_on_bar_n_fills_at_next_bar_open(self) -> None:
+        candles = [
+            _bar(0, 100.0, 101.0, 99.0, 100.0),
+            _bar(1, 110.0, 111.0, 109.0, 110.0),
+            _bar(2, 120.0, 121.0, 119.0, 120.0),
+        ]
+
+        result = BacktestEngine().run(
+            _BuyOnZeroSellOnOne(), candles, BacktestConfig()
+        )
+
+        trade = result.trades[0]
+        assert trade.entry_date == candles[1].timestamp
+        assert trade.entry_price == pytest.approx(candles[1].open * 1.0005)
+        assert trade.exit_date == candles[2].timestamp
+
+    def test_limit_order_persists_until_later_bar_crosses(self) -> None:
+        candles = [
+            _bar(0, 100, 105, 99, 103),
+            _bar(1, 103, 104, 101, 102),
+            _bar(2, 98, 100, 95, 99),
+            _bar(3, 100, 102, 99, 101),
+        ]
+
+        result = BacktestEngine().run(
+            _BuyLimitThenCloseAfterFill(limit=99.0), candles, BacktestConfig()
+        )
+
+        assert result.trades[0].entry_date == candles[2].timestamp
+        assert result.trades[0].exit_date == candles[3].timestamp
+
+    def test_final_bar_signal_is_not_filled(self) -> None:
+        result = BacktestEngine().run(
+            _SignalOnlyOnLastBar(), make_candle_series(3), BacktestConfig()
+        )
+
+        assert result.trades == []
+        assert result.final_equity == result.initial_capital
+
+    def test_newer_same_direction_limit_replaces_stale_pending_order(self) -> None:
+        strategy = _ScheduledSignals(
+            {
+                0: (Direction.LONG, OrderType.LIMIT, 90.0),
+                1: (Direction.LONG, OrderType.LIMIT, 95.0),
+                2: (Direction.SHORT, OrderType.MARKET, None),
+            }
+        )
+        candles = [
+            _bar(0, 100, 101, 99, 100),
+            _bar(1, 100, 101, 98, 100),
+            _bar(2, 94, 96, 93, 95),
+            _bar(3, 96, 97, 95, 96),
+        ]
+
+        result = BacktestEngine().run(strategy, candles, BacktestConfig())
+
+        assert result.trades[0].entry_date == candles[2].timestamp
+
+    def test_opposite_signal_replaces_unfilled_entry(self) -> None:
+        strategy = _ScheduledSignals(
+            {
+                0: (Direction.LONG, OrderType.LIMIT, 90.0),
+                1: (Direction.SHORT, OrderType.MARKET, None),
+                2: (Direction.LONG, OrderType.MARKET, None),
+            }
+        )
+        candles = [
+            _bar(0, 100, 101, 99, 100),
+            _bar(1, 100, 101, 98, 100),
+            _bar(2, 99, 100, 98, 99),
+            _bar(3, 98, 99, 97, 98),
+        ]
+
+        result = BacktestEngine().run(strategy, candles, BacktestConfig())
+
+        assert result.trades[0].direction is Direction.SHORT
+        assert result.trades[0].entry_date == candles[2].timestamp
+
+    def test_context_reflects_pending_and_filled_execution_state(self) -> None:
+        strategy = _CaptureContexts()
+        candles = [
+            _bar(0, 100, 101, 99, 100),
+            _bar(1, 100, 101, 99, 100),
+            _bar(2, 101, 102, 100, 101),
+            _bar(3, 102, 103, 101, 102),
+        ]
+
+        result = BacktestEngine().run(strategy, candles, BacktestConfig())
+
+        assert strategy.contexts[1] == StrategyContext(
+            pending_direction=Direction.LONG,
+            pending_order_type=OrderType.LIMIT,
+        )
+        assert strategy.contexts[2] == StrategyContext(
+            position_direction=Direction.LONG,
+            position_quantity=1,
+        )
+        assert strategy.contexts[2].forced_cover_pending is False
+        assert result.trades[0].symbol == "X"
+
+    def test_conditional_signal_requires_a_price(self) -> None:
+        strategy = _ScheduledSignals(
+            {0: (Direction.LONG, OrderType.LIMIT, None)}
+        )
+
+        with pytest.raises(ValueError, match="LIMIT order requires limit_price"):
+            BacktestEngine().run(strategy, make_candle_series(2), BacktestConfig())
+
+    def test_rejected_order_is_absent_from_next_strategy_context(self) -> None:
+        strategy = _CaptureRejectedOrderContext()
+        candles = [
+            _bar(0, 100, 101, 99, 100),
+            _bar(1, 100, 101, 99, 100),
+        ]
+
+        result = BacktestEngine().run(
+            strategy,
+            candles,
+            BacktestConfig(initial_capital=50.0),
+        )
+
+        assert strategy.contexts[1] == StrategyContext()
+        assert result.trades == []
+        assert result.final_equity == 50.0
+
+    def test_candles_require_strictly_increasing_timestamps(self) -> None:
+        candles = make_candle_series(2)
+        candles[1] = Candle(
+            timestamp=candles[0].timestamp,
+            open=candles[1].open,
+            high=candles[1].high,
+            low=candles[1].low,
+            close=candles[1].close,
+            volume=candles[1].volume,
+            adj_close=candles[1].adj_close,
+        )
+
+        with pytest.raises(
+            ValueError, match="candles must have strictly increasing timestamps"
+        ):
+            BacktestEngine().run(_SignalOnlyOnLastBar(), candles, BacktestConfig())

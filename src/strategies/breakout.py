@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import deque
 from typing import Any
 
+from src.engine.context import StrategyContext
 from src.engine.event import SignalEvent
 from src.models.candle import Candle
 from src.models.order import Direction
@@ -37,9 +38,10 @@ class BreakoutStrategy(BaseStrategy):
         self._lows: deque[float] = deque(maxlen=lookback)
         self._prev_high: float | None = None
         self._prev_low: float | None = None
-        self._in_position: bool = False
 
-    def on_candle(self, candle: Candle) -> SignalEvent | None:
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
         # Record previous channel levels BEFORE updating
         if len(self._highs) >= self.lookback:
             self._prev_high = max(self._highs)
@@ -48,27 +50,37 @@ class BreakoutStrategy(BaseStrategy):
         self._highs.append(candle.high)
         self._lows.append(candle.low)
 
-        if len(self._highs) < self.lookback or self._prev_high is None:
+        if (
+            len(self._highs) < self.lookback
+            or self._prev_high is None
+            or self._prev_low is None
+        ):
             return None
 
         signal: SignalEvent | None = None
 
-        if not self._in_position and candle.close > self._prev_high:
+        if (
+            context.position_direction is None
+            and context.pending_direction is None
+            and candle.close > self._prev_high
+        ):
             signal = SignalEvent(
                 symbol="",
                 direction=Direction.LONG,
                 strength=1.0,
                 timestamp=candle.timestamp,
             )
-            self._in_position = True
-        elif self._in_position and candle.close < self._prev_low:  # type: ignore[operator]
+        elif (
+            context.position_direction is Direction.LONG
+            and not context.forced_cover_pending
+            and candle.close < self._prev_low
+        ):
             signal = SignalEvent(
                 symbol="",
                 direction=Direction.SHORT,
                 strength=1.0,
                 timestamp=candle.timestamp,
             )
-            self._in_position = False
 
         return signal
 
@@ -77,4 +89,3 @@ class BreakoutStrategy(BaseStrategy):
         self._lows.clear()
         self._prev_high = None
         self._prev_low = None
-        self._in_position = False

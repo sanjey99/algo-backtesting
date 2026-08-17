@@ -15,7 +15,9 @@ Run:
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import date
+from typing import TypedDict, cast
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -26,12 +28,30 @@ from plotly.subplots import make_subplots
 # Inline imports — avoid heavy imports at module level for faster startup
 # ---------------------------------------------------------------------------
 from src.analytics.metrics import compute_all_metrics
-from src.engine.backtest import BacktestConfig, BacktestEngine
+from src.engine.backtest import BacktestConfig, BacktestEngine, BacktestResult
+from src.models.candle import Candle
+from src.models.portfolio import EquityPoint
+from src.models.trade import Trade
+from src.observability import configure_logging
 from src.strategies import STRATEGY_REGISTRY
+
+type Metrics = dict[str, float]
+
+
+class DashboardConfig(TypedDict):
+    strategy_key: str
+    params: dict[str, int | float]
+    symbol: str
+    start: str
+    end: str
+    initial_capital: float
+    run: bool
 
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
+
+configure_logging()
 
 st.set_page_config(
     page_title="Algo Backtester",
@@ -45,8 +65,9 @@ st.set_page_config(
 # Helper — run backtest inline (no API dependency for dashboard)
 # ---------------------------------------------------------------------------
 
-def _fetch_candles(symbol: str, start: str, end: str) -> list:
+def _fetch_candles(symbol: str, start: str, end: str) -> list[Candle]:
     from datetime import datetime
+
     from src.data import df_to_candles
     from src.data.fetcher import YFinanceFetcher
     from src.data.store import DataStore
@@ -62,7 +83,14 @@ def _fetch_candles(symbol: str, start: str, end: str) -> list:
     return df_to_candles(df)
 
 
-def _run_backtest(strategy_key, params, symbol, start, end, initial_capital):
+def _run_backtest(
+    strategy_key: str,
+    params: Mapping[str, int | float],
+    symbol: str,
+    start: str,
+    end: str,
+    initial_capital: float,
+) -> tuple[BacktestResult | None, Metrics | None, list[Candle] | None]:
     cls = STRATEGY_REGISTRY[strategy_key]
     strategy = cls(**params) if params else cls()
     candles = _fetch_candles(symbol, start, end)
@@ -78,7 +106,7 @@ def _run_backtest(strategy_key, params, symbol, start, end, initial_capital):
 # Section 1 — Sidebar inputs
 # ---------------------------------------------------------------------------
 
-def render_sidebar() -> dict:
+def render_sidebar() -> DashboardConfig:
     st.sidebar.header("⚙️ Backtest Config")
 
     strategy_key = st.sidebar.selectbox(
@@ -98,7 +126,7 @@ def render_sidebar() -> dict:
     st.sidebar.subheader("Strategy Parameters")
     cls = STRATEGY_REGISTRY[strategy_key]
     instance = cls()
-    params: dict = {}
+    params: dict[str, int | float] = {}
     for name, (low, high, step) in instance.parameter_space.items():
         default = getattr(instance, name, low)
         params[name] = st.sidebar.slider(
@@ -117,7 +145,7 @@ def render_sidebar() -> dict:
         "symbol": symbol.upper().strip(),
         "start": str(start),
         "end": str(end),
-        "initial_capital": initial_capital,
+        "initial_capital": float(initial_capital),
         "run": run,
     }
 
@@ -126,7 +154,7 @@ def render_sidebar() -> dict:
 # Section 2 — KPI cards
 # ---------------------------------------------------------------------------
 
-def render_kpis(metrics: dict, initial_capital: float, final_equity: float):
+def render_kpis(metrics: Metrics, initial_capital: float, final_equity: float) -> None:
     st.subheader("📊 Key Performance Indicators")
     kpis = [
         ("Sharpe Ratio", f"{metrics.get('sharpe_ratio', 0):.2f}", ""),
@@ -147,7 +175,7 @@ def render_kpis(metrics: dict, initial_capital: float, final_equity: float):
 # Section 3 — Equity curve + drawdown overlay
 # ---------------------------------------------------------------------------
 
-def render_equity_curve(equity_curve):
+def render_equity_curve(equity_curve: list[EquityPoint]) -> None:
     if not equity_curve:
         st.info("No equity data.")
         return
@@ -199,7 +227,7 @@ def render_equity_curve(equity_curve):
 # Section 4 — Trade table
 # ---------------------------------------------------------------------------
 
-def render_trade_table(trades):
+def render_trade_table(trades: list[Trade]) -> None:
     st.subheader("📋 Trade Log")
     if not trades:
         st.info("No closed trades.")
@@ -227,7 +255,7 @@ def render_trade_table(trades):
 # Section 5 — Monthly returns heatmap
 # ---------------------------------------------------------------------------
 
-def render_monthly_heatmap(equity_curve):
+def render_monthly_heatmap(equity_curve: list[EquityPoint]) -> None:
     st.subheader("🗓️ Monthly Returns Heatmap")
     if len(equity_curve) < 5:
         st.info("Not enough data for monthly heatmap.")
@@ -277,7 +305,7 @@ def render_monthly_heatmap(equity_curve):
 # Section 6 — Walk-Forward Analysis tab
 # ---------------------------------------------------------------------------
 
-def render_walk_forward_tab(cfg: dict):
+def render_walk_forward_tab(cfg: DashboardConfig) -> None:
     st.subheader("🔄 Walk-Forward Analysis")
 
     col1, col2, col3 = st.columns(3)
@@ -339,10 +367,14 @@ def render_walk_forward_tab(cfg: dict):
 # Section 7 — Permutation Test tab
 # ---------------------------------------------------------------------------
 
-def render_permutation_tab(cfg: dict, current_metrics: dict | None):
+def render_permutation_tab(
+    cfg: DashboardConfig, current_metrics: Metrics | None
+) -> None:
     st.subheader("🎲 Permutation Test (Statistical Significance)")
 
-    n_perms = st.number_input("Number of Permutations", min_value=10, max_value=1000, value=100, step=10)
+    n_perms = st.number_input(
+        "Number of Permutations", min_value=10, max_value=1000, value=100, step=10
+    )
 
     perm = st.session_state.get("perm_result")
 
@@ -407,13 +439,16 @@ def render_permutation_tab(cfg: dict, current_metrics: dict | None):
 # Section 8 — Strategy comparison tab
 # ---------------------------------------------------------------------------
 
-def render_comparison_tab(cfg: dict):
+def render_comparison_tab(cfg: DashboardConfig) -> None:
     st.subheader("🆚 Strategy Comparison")
 
-    st.info("ℹ️ Strategies are compared using their **default parameters**. Run Walk-Forward Analysis first to find optimal parameters per strategy.")
+    st.info(
+        "ℹ️ Strategies are compared using their **default parameters**. Run Walk-Forward "
+        "Analysis first to find optimal parameters per strategy."
+    )
 
-    candles = None
-    results = st.session_state.get("comparison_results", {})
+    candles: list[Candle] | None = None
+    results: dict[str, Metrics] = st.session_state.get("comparison_results", {})
 
     if st.button("▶ Compare All Strategies", key="compare_run"):
         with st.spinner("Running all strategies…"):
@@ -464,7 +499,7 @@ def render_comparison_tab(cfg: dict):
 # Main app
 # ---------------------------------------------------------------------------
 
-def main():
+def main() -> None:
     st.title("📈 Algorithmic Backtester")
     st.caption("Event-driven • Walk-Forward Analysis • Permutation Testing")
 
@@ -488,11 +523,11 @@ def main():
         st.session_state["metrics"] = metrics
         st.session_state["cfg"] = cfg
 
-    result = st.session_state.get("result")
-    metrics = st.session_state.get("metrics")
-    active_cfg = st.session_state.get("cfg", cfg)
+    result = cast(BacktestResult | None, st.session_state.get("result"))
+    metrics = cast(Metrics | None, st.session_state.get("metrics"))
+    active_cfg = cast(DashboardConfig, st.session_state.get("cfg", cfg))
 
-    if result is None:
+    if result is None or metrics is None:
         st.info("👈 Configure and click **▶ Run Backtest** to get started.")
         return
 

@@ -1,9 +1,10 @@
 """Tests for database layer — Step 9."""
-from datetime import datetime
+import warnings
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from src.db.crud import (
     get_backtest_run,
@@ -21,8 +22,8 @@ def db_session():
     """In-memory SQLite session for tests."""
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
-    Session = sessionmaker(bind=engine)
-    session = Session()
+    session_factory = sessionmaker(bind=engine)
+    session = session_factory()
     yield session
     session.close()
 
@@ -55,6 +56,17 @@ SAMPLE_RUN = dict(
     ],
     metrics={"sharpe_ratio": 1.24, "cagr": 0.087, "max_drawdown": -0.1532},
 )
+
+
+def test_created_at_default_is_naive_utc_without_deprecation(db_session: Session) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        run_id = save_backtest_run(db_session, **SAMPLE_RUN)
+        db_session.commit()
+
+    created_at = get_backtest_run(db_session, run_id).created_at
+    assert created_at.tzinfo is None
+    assert abs((datetime.now(UTC).replace(tzinfo=None) - created_at).total_seconds()) < 5
 
 
 class TestCRUD:
@@ -122,15 +134,15 @@ class TestCRUD:
         """Data saved in one session is visible in a fresh session (R-17)."""
         engine = create_engine("sqlite:///:memory:")
         Base.metadata.create_all(engine)
-        SessionFactory = sessionmaker(bind=engine)
+        session_factory = sessionmaker(bind=engine)
 
         # Write session
-        session1 = SessionFactory()
+        session1 = session_factory()
         run_id = save_backtest_run(session1, **SAMPLE_RUN)
         session1.close()
 
         # Read session — completely fresh
-        session2 = SessionFactory()
+        session2 = session_factory()
         session2.expire_all()  # force real DB round-trip
         run = get_backtest_run(session2, run_id)
         assert run is not None

@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "algo-backtester"
 version = "0.1.0"
 description = "Production-grade event-driven algorithmic trading backtesting platform"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "pandas>=2.0",
     "numpy>=1.24",
@@ -22,8 +22,10 @@ dependencies = [
     "plotly>=5.18",
     "matplotlib>=3.8",
     "python-dotenv>=1.0",
-    "httpx>=0.27",
     "pyarrow>=14.0",
+    "pandas_market_calendars>=4.4",
+    "filelock>=3.13",
+    "gitpython>=3.1.58",
 ]
 
 [project.optional-dependencies]
@@ -35,6 +37,7 @@ dev = [
     "mypy>=1.8",
     "ruff>=0.3",
     "pandas-stubs>=2.0",
+    "httpx2>=2.10.0",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -50,12 +53,12 @@ artifacts = ["src/analytics/sql/**/*.sql"]
 
 [tool.mypy]
 strict = true
-python_version = "3.11"
+python_version = "3.12"
 ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]

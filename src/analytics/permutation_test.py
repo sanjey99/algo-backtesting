@@ -9,6 +9,7 @@ Parallelized with ProcessPoolExecutor for ~N_CPU speedup.
 """
 from __future__ import annotations
 
+import logging
 import math
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -20,7 +21,10 @@ import numpy as np
 from src.analytics.metrics import compute_all_metrics
 from src.engine.backtest import BacktestConfig, BacktestEngine
 from src.models.candle import Candle
+from src.observability import log_event
 from src.strategies.base import BaseStrategy
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -129,6 +133,10 @@ def _run_single_permutation(
         initial_capital=config_dict.get("initial_capital", 100_000.0),
         commission_pct=config_dict.get("commission_pct", 0.001),
         slippage_pct=config_dict.get("slippage_pct", 0.0005),
+        short_initial_margin=config_dict.get("short_initial_margin", 1.50),
+        short_maintenance_margin=config_dict.get("short_maintenance_margin", 0.30),
+        annual_short_borrow_rate=config_dict.get("annual_short_borrow_rate", 0.03),
+        borrow_day_count=config_dict.get("borrow_day_count", 365.0),
     )
     engine = BacktestEngine()
     result = engine.run(strategy, candles, config)
@@ -188,6 +196,10 @@ class PermutationTester:
             "initial_capital": self.config.initial_capital,
             "commission_pct": self.config.commission_pct,
             "slippage_pct": self.config.slippage_pct,
+            "short_initial_margin": self.config.short_initial_margin,
+            "short_maintenance_margin": self.config.short_maintenance_margin,
+            "annual_short_borrow_rate": self.config.annual_short_borrow_rate,
+            "borrow_day_count": self.config.borrow_day_count,
         }
 
         # 3. Parallel permutations
@@ -213,7 +225,14 @@ class PermutationTester:
                 for future in as_completed(futures):
                     try:
                         permuted_metrics.append(future.result())
-                    except Exception:
+                    except Exception as error:
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "permutation.failed",
+                            seed=futures[future],
+                            exception_type=type(error).__name__,
+                        )
                         permuted_metrics.append(0.0)
         except Exception:
             # Fallback: single-process (e.g., in test environments)
@@ -233,7 +252,14 @@ class PermutationTester:
                     self.strategy.reset()
                     m = compute_all_metrics(r)
                     permuted_metrics.append(m.get(self.metric, 0.0))
-                except Exception:
+                except Exception as error:
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "permutation.failed",
+                        seed=s,
+                        exception_type=type(error).__name__,
+                    )
                     permuted_metrics.append(0.0)
 
         # 4. Compute p-value

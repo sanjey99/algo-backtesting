@@ -1,7 +1,7 @@
 """SQLAlchemy 2.0 ORM table definitions."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -9,6 +9,11 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 class Base(DeclarativeBase):
     pass
+
+
+def _utc_now_naive() -> datetime:
+    """Return UTC for SQLite's intentionally timezone-naive DateTime contract."""
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 class BacktestRun(Base):
@@ -26,7 +31,7 @@ class BacktestRun(Base):
     initial_capital: Mapped[float] = mapped_column(Float, nullable=False, default=100_000.0)
     commission_pct: Mapped[float] = mapped_column(Float, nullable=False, default=0.001)
     slippage_pct: Mapped[float] = mapped_column(Float, nullable=False, default=0.0005)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utc_now_naive, nullable=False)
 
     trades: Mapped[list[TradeRecord]] = relationship(
         "TradeRecord", back_populates="backtest", cascade="all, delete-orphan"

@@ -5,18 +5,26 @@ Uses TestClient with an in-memory SQLite DB and patched data fetching.
 from __future__ import annotations
 
 from collections.abc import Generator
-from datetime import datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from src.api import main as api_main
 from src.api.deps import get_db
 from src.api.main import app
+from src.data.contracts import (
+    AcquisitionManifest,
+    AcquisitionRequest,
+    AcquisitionResult,
+    AcquisitionStatus,
+)
 from src.db import database
 from src.db.database import create_db_engine
 from src.db.migrate import SchemaNotCurrentError
@@ -79,6 +87,27 @@ def _make_candles(n: int = 150) -> list[Candle]:
 FAKE_CANDLES = _make_candles(150)
 
 
+def _fake_acquisition_result() -> AcquisitionResult:
+    now = datetime(2024, 1, 1, tzinfo=UTC)
+    request = AcquisitionRequest("SPY", date(2020, 1, 1), date(2022, 12, 31))
+    return AcquisitionResult(
+        pd.DataFrame(),
+        AcquisitionManifest(
+            "legacy-api-test",
+            request,
+            AcquisitionStatus.SUCCESS,
+            counters={
+                "expected_sessions": len(FAKE_CANDLES),
+                "accepted_expected_sessions": len(FAKE_CANDLES),
+                "missing_sessions": 0,
+            },
+            coverage=1.0,
+            started_at=now,
+            completed_at=now,
+        ),
+    )
+
+
 @pytest.fixture()
 def client() -> Generator[TestClient, None, None]:
     with patch("src.api.main.init_db"):
@@ -98,6 +127,18 @@ def test_lifespan_rejects_unmigrated_real_engine(
             pass
 
     engine.dispose()
+
+
+async def test_lifespan_configures_logging_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The API process opts into structured logging only when it starts."""
+    calls: list[None] = []
+    monkeypatch.setattr(api_main, "configure_logging", lambda: calls.append(None))
+
+    with patch("src.api.main.init_db"):
+        async with api_main.lifespan(app):
+            pass
+
+    assert calls == [None]
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +231,42 @@ class TestRunBacktest:
 # ---------------------------------------------------------------------------
 
 class TestGetBacktest:
+    def test_persists_entry_on_bar_after_signal(self, client: TestClient) -> None:
+        candles = [
+            Candle(
+                timestamp=datetime(2020, 1, 2) + timedelta(days=index),
+                open=price,
+                high=price,
+                low=price,
+                close=price,
+                volume=1_000_000.0,
+                adj_close=price,
+            )
+            for index, price in enumerate(
+                [100.0, 100.0, 100.0, 90.0, 100.0, 110.0, 115.0, 80.0, 75.0]
+            )
+        ]
+
+        with patch(PATCH_TARGET, return_value=candles):
+            post = client.post("/api/backtest", json={
+                "strategy": "ma_crossover",
+                "symbol": "SPY",
+                "start": "2020-01-01",
+                "end": "2022-12-31",
+                "params": {"fast_period": 2, "slow_period": 3},
+            })
+
+        assert post.status_code == 201
+        trades = client.get(f"/api/backtest/{post.json()['run_id']}/trades")
+        signal_candle = candles[5]
+        expected_entry_candle = candles[6]
+
+        assert trades.status_code == 200
+        assert len(trades.json()) == 1
+        entry_date = datetime.fromisoformat(trades.json()[0]["entry_date"])
+        assert entry_date == expected_entry_candle.timestamp
+        assert entry_date != signal_candle.timestamp
+
     def test_get_existing_run(self, client: TestClient) -> None:
         with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
             post = client.post("/api/backtest", json={
@@ -297,8 +374,9 @@ class TestPermutationEndpoint:
 class TestDataFetch:
     def test_fetch_returns_candle_count(self, client: TestClient) -> None:
         # Patch df_to_candles so we don't need a real DataFrame
-        with patch("src.data.fetcher.YFinanceFetcher"), \
-             patch("src.api.routes.data.df_to_candles", return_value=FAKE_CANDLES):
+        with patch(
+            "src.api.routes.data.acquire_result", return_value=_fake_acquisition_result()
+        ), patch("src.api.routes.data.df_to_candles", return_value=FAKE_CANDLES):
             r = client.post("/api/data/fetch", json={
                 "symbol": "SPY",
                 "start": "2020-01-01",
@@ -309,8 +387,9 @@ class TestDataFetch:
         assert r.json()["n_candles"] == len(FAKE_CANDLES)
 
     def test_fetch_empty_returns_422(self, client: TestClient) -> None:
-        with patch("src.data.fetcher.YFinanceFetcher"), \
-             patch("src.api.routes.data.df_to_candles", return_value=[]):
+        with patch(
+            "src.api.routes.data.acquire_result", return_value=_fake_acquisition_result()
+        ), patch("src.api.routes.data.df_to_candles", return_value=[]):
             r = client.post("/api/data/fetch", json={
                 "symbol": "FAKE",
                 "start": "2020-01-01",

@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import deque
 from typing import Any
 
+from src.engine.context import StrategyContext
 from src.engine.event import SignalEvent
 from src.models.candle import Candle
 from src.models.order import Direction
@@ -48,7 +49,6 @@ class RSIMeanReversionStrategy(BaseStrategy):
         self._avg_gain: float | None = None
         self._avg_loss: float | None = None
         self._rsi: float | None = None
-        self._in_position: bool = False
         self._bar_count: int = 0
 
     def _compute_rsi(self, prices: list[float]) -> float:
@@ -77,7 +77,9 @@ class RSIMeanReversionStrategy(BaseStrategy):
         rs = avg_gain / avg_loss
         return 100.0 - (100.0 / (1.0 + rs))
 
-    def on_candle(self, candle: Candle) -> SignalEvent | None:
+    def on_candle(
+        self, candle: Candle, context: StrategyContext
+    ) -> SignalEvent | None:
         self._prices.append(candle.adj_close)
         self._bar_count += 1
 
@@ -88,22 +90,28 @@ class RSIMeanReversionStrategy(BaseStrategy):
 
         signal: SignalEvent | None = None
 
-        if not self._in_position and self._rsi < self.oversold:
+        if (
+            context.position_direction is None
+            and context.pending_direction is None
+            and self._rsi < self.oversold
+        ):
             signal = SignalEvent(
                 symbol="",
                 direction=Direction.LONG,
                 strength=(self.oversold - self._rsi) / self.oversold,
                 timestamp=candle.timestamp,
             )
-            self._in_position = True
-        elif self._in_position and self._rsi >= self.exit_level:
+        elif (
+            context.position_direction is Direction.LONG
+            and not context.forced_cover_pending
+            and self._rsi >= self.exit_level
+        ):
             signal = SignalEvent(
                 symbol="",
                 direction=Direction.SHORT,
                 strength=1.0,
                 timestamp=candle.timestamp,
             )
-            self._in_position = False
 
         return signal
 
@@ -112,5 +120,4 @@ class RSIMeanReversionStrategy(BaseStrategy):
         self._avg_gain = None
         self._avg_loss = None
         self._rsi = None
-        self._in_position = False
         self._bar_count = 0

@@ -10,10 +10,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.routes import backtest, data, strategies
 from src.db.database import init_db
+from src.observability import configure_logging
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    configure_logging()
     init_db()
     yield
 

@@ -19,7 +19,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
-from typing import TypeAlias, cast
+from typing import cast
 from urllib.parse import quote
 
 import pandas as pd
@@ -78,7 +78,7 @@ _CONTRACTS: Mapping[QueryId, ResultContract] = MappingProxyType(
         QueryId.STRATEGY_COHORT_SUMMARY: COHORT_SUMMARY_CONTRACT,
     }
 )
-Identifier: TypeAlias = str | int
+type Identifier = str | int
 
 
 @dataclass(frozen=True)
