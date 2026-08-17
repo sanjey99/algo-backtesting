@@ -1,6 +1,7 @@
 """Tests for Permutation Testing — Step 8."""
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict
 from datetime import datetime, timedelta
 
@@ -100,6 +101,51 @@ class TestPermutationTester:
         candles = make_candles(100)
         tester = PermutationTester(strategy, candles, n_permutations=10)
         assert tester.n_permutations == 10
+
+    def test_failed_worker_is_logged_without_changing_fallback_metric(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        class FailingFuture:
+            def result(self) -> float:
+                raise RuntimeError("worker failure")
+
+        class Executor:
+            def __init__(self, *, max_workers: int) -> None:
+                self.max_workers = max_workers
+
+            def __enter__(self) -> Executor:
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def submit(self, *_: object) -> FailingFuture:
+                return FailingFuture()
+
+        monkeypatch.setattr("src.analytics.permutation_test.ProcessPoolExecutor", Executor)
+        monkeypatch.setattr(
+            "src.analytics.permutation_test.as_completed", lambda futures: list(futures)
+        )
+        tester = PermutationTester(
+            MACrossoverStrategy(fast_period=5, slow_period=20),
+            make_candles(20),
+            n_permutations=1,
+            seed=23,
+            max_workers=1,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = tester.run()
+
+        record = next(
+            record
+            for record in caplog.records
+            if getattr(record, "event", None) == "permutation.failed"
+        )
+        fields = getattr(record, "event_fields", {})
+        assert record.levelno == logging.WARNING
+        assert fields == {"seed": 23, "exception_type": "RuntimeError"}
+        assert result.permuted_metrics == [0.0]
 
     def test_returns_permutation_result(self) -> None:
         strategy = MACrossoverStrategy(fast_period=5, slow_period=20)

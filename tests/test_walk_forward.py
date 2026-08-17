@@ -1,6 +1,7 @@
 """Tests for Walk-Forward Analysis — Step 7."""
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -143,6 +144,25 @@ class TestWalkForwardAnalyzer:
 
         assert result.start_date.tzinfo is UTC
         assert result.end_date.tzinfo is UTC
+
+    def test_invalid_parameters_are_logged_at_debug(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        analyzer = WalkForwardAnalyzer(MACrossoverStrategy, seed=17)
+
+        with caplog.at_level(logging.DEBUG):
+            analyzer._run_backtest(
+                make_trending_candles(2), {"fast_period": 20, "slow_period": 5}
+            )
+
+        record = next(
+            record
+            for record in caplog.records
+            if getattr(record, "event", None) == "walk_forward.invalid_parameters"
+        )
+        fields = getattr(record, "event_fields", {})
+        assert record.levelno == logging.DEBUG
+        assert fields == {"seed": 17, "exception_type": "ValueError"}
 
     def test_unexpected_backtest_failure_is_propagated(
         self, monkeypatch: pytest.MonkeyPatch

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Mapping
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -118,7 +119,10 @@ def native_batch(
         if sessions is not None
         else FakeCalendar().expected_sessions(request.start, request.end)
     )
-    base = [10.0 + int(SESSIONS.get_indexer([session])[0]) for session in selected]
+    base = [
+        10.0 + int(SESSIONS.get_indexer(pd.DatetimeIndex([session]))[0])
+        for session in selected
+    ]
     if provider is Provider.YFINANCE:
         frame = pd.DataFrame(
             {
@@ -356,7 +360,9 @@ def test_warning_primary_is_accepted_but_fatal_primary_falls_back(tmp_path: Path
     warning_yf = FakeProvider(
         Provider.YFINANCE,
         lambda item: native_batch(
-            Provider.YFINANCE, item, SESSIONS[-2:].append(pd.DatetimeIndex([SESSIONS[-1]]))
+            Provider.YFINANCE,
+            item,
+            pd.DatetimeIndex(SESSIONS[-2:].append(pd.DatetimeIndex([SESSIONS[-1]]))),
         ),
     )
     acquisition, _, _ = service(
@@ -429,6 +435,133 @@ def test_terminal_request_error_does_not_fall_back(tmp_path: Path) -> None:
     report = repository.lookup("acquisition-1")
     assert report is not None
     assert report["status"] == "failed"
+
+
+def test_cache_hit_is_logged(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    request = AcquisitionRequest("AAPL", date(2024, 1, 2), date(2024, 1, 10))
+    acquisition, store, _ = service(tmp_path, {})
+    cached = canonical_frame(request, SESSIONS)
+    lineage = LineageSegment(
+        request.start,
+        request.end,
+        Provider.YFINANCE,
+        NOW - timedelta(minutes=20),
+        ActionCoverage.REPRESENTED,
+        "a" * 64,
+        "actions",
+    )
+    store.publish_generation(
+        request,
+        cached,
+        {},
+        AcquisitionManifest(
+            "seed",
+            request,
+            AcquisitionStatus.SUCCESS,
+            lineage=(lineage,),
+            started_at=NOW - timedelta(minutes=20),
+            completed_at=NOW - timedelta(minutes=20),
+        ),
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        acquisition.acquire(request)
+
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "acquisition.cache_result"
+    )
+    fields = getattr(record, "event_fields", {})
+    assert record.levelno == logging.DEBUG
+    assert fields["cache_status"] == "full_hit"
+    assert fields["planned_range_count"] == 0
+
+
+def test_provider_failure_and_fallback_are_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    yfinance = FakeProvider(
+        Provider.YFINANCE,
+        lambda _: (_ for _ in ()).throw(TransientProviderError("down")),
+    )
+    alpha = FakeProvider(
+        Provider.ALPHA_VANTAGE,
+        lambda request: native_batch(Provider.ALPHA_VANTAGE, request),
+    )
+    acquisition, _, _ = service(
+        tmp_path,
+        {Provider.YFINANCE: lambda: yfinance, Provider.ALPHA_VANTAGE: lambda: alpha},
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        acquisition.acquire(AcquisitionRequest("SPY", date(2024, 1, 2), date(2024, 1, 10)))
+
+    events = [getattr(record, "event", None) for record in caplog.records]
+    assert "acquisition.provider_attempt" in events
+    assert "acquisition.fallback" in events
+    fallback = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "acquisition.fallback"
+    )
+    fields = getattr(fallback, "event_fields", {})
+    assert fallback.levelno == logging.WARNING
+    assert fields["provider"] == Provider.YFINANCE.value
+    assert fields["exception_type"] == "TransientProviderError"
+    assert all(
+        "secret" not in str(getattr(record, "event_fields", {})).lower()
+        for record in caplog.records
+    )
+
+
+def test_quality_warning_is_logged(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    request = AcquisitionRequest("AAPL", date(2024, 1, 9), date(2024, 1, 10))
+    provider = FakeProvider(
+        Provider.YFINANCE,
+        lambda item: native_batch(
+            Provider.YFINANCE,
+            item,
+            pd.DatetimeIndex(SESSIONS[-2:].append(pd.DatetimeIndex([SESSIONS[-1]]))),
+        ),
+    )
+    acquisition, _, _ = service(tmp_path, {Provider.YFINANCE: lambda: provider})
+
+    with caplog.at_level(logging.WARNING):
+        acquisition.acquire(request)
+
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "acquisition.quality_warning"
+    )
+    fields = getattr(record, "event_fields", {})
+    assert record.levelno == logging.WARNING
+    assert fields["provider"] == Provider.YFINANCE.value
+    assert fields["severity"] == "warning"
+
+
+def test_terminal_acquisition_failure_is_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    request = AcquisitionRequest("AAPL", date(2024, 1, 9), date(2024, 1, 10))
+    provider = FakeProvider(
+        Provider.YFINANCE,
+        lambda _: (_ for _ in ()).throw(ProviderSchemaError("permanent")),
+    )
+    acquisition, _, _ = service(tmp_path, {Provider.YFINANCE: lambda: provider})
+
+    with caplog.at_level(logging.WARNING), pytest.raises(ProviderSchemaError):
+        acquisition.acquire(request)
+
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "acquisition.failed"
+    )
+    fields = getattr(record, "event_fields", {})
+    assert record.levelno == logging.WARNING
+    assert fields["exception_type"] == "ProviderSchemaError"
 
 
 def test_typed_invalid_request_error_is_terminal_and_does_not_fall_back(tmp_path: Path) -> None:

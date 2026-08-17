@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
@@ -45,6 +46,9 @@ from src.data.providers.base import ProviderEligibility
 from src.data.quality import action_signature, evaluate_complete_request, evaluate_range_candidate
 from src.data.retry import FailureClassification, RetryExecutor
 from src.data.store import CacheReadResult, DataStore, GenerationPublication
+from src.observability import log_event
+
+logger = logging.getLogger(__name__)
 
 
 class AcquisitionProvider(Protocol):
@@ -164,6 +168,15 @@ class AcquisitionService:
             )
             raise self._identified(error, admission.acquisition_id)
 
+        log_event(
+            logger,
+            logging.DEBUG,
+            "acquisition.cache_result",
+            acquisition_id=admission.acquisition_id,
+            cache_status=cache_status,
+            planned_range_count=len(planned),
+        )
+
         if not planned:
             final = evaluate_complete_request(
                 requested_cached,
@@ -200,12 +213,24 @@ class AcquisitionService:
                 output_hash=self._cached_output_hash(cache),
             )
             self._archive_manifest(manifest)
+            if final.severity is QualitySeverity.WARNING:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "acquisition.quality_warning",
+                    acquisition_id=admission.acquisition_id,
+                    cache_status=cache_status,
+                    severity=final.severity,
+                    finding_count=len(final.findings),
+                )
             return AcquisitionResult(final.frame, manifest)
 
         providers: dict[Provider, AcquisitionProvider] = {}
         try:
             accepted = [
-                self._fetch_range(request, start, end, providers, evidence)
+                self._fetch_range(
+                    admission.acquisition_id, request, start, end, providers, evidence
+                )
                 for start, end in planned
             ]
             if self._actions_changed(requested_cached, accepted) and not self._covers_all(
@@ -213,6 +238,7 @@ class AcquisitionService:
             ):
                 accepted = [
                     self._fetch_range(
+                        admission.acquisition_id,
                         request,
                         expected[0],
                         expected[-1],
@@ -263,6 +289,17 @@ class AcquisitionService:
             publication = self._archive_publication_if_needed(request, publication)
             result_frame = self._requested_frame(publication.frame, expected)
             warnings = (REPORT_ARCHIVE_DEFERRED_WARNING,) if publication.warnings else ()
+            if final.severity is QualitySeverity.WARNING and not any(
+                item.has_warnings for item in accepted
+            ):
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "acquisition.quality_warning",
+                    acquisition_id=admission.acquisition_id,
+                    severity=final.severity,
+                    finding_count=len(final.findings),
+                )
             return AcquisitionResult(result_frame, publication.manifest, warnings=warnings)
         except Exception as error:
             self._archive_failure(
@@ -369,6 +406,7 @@ class AcquisitionService:
 
     def _fetch_range(
         self,
+        acquisition_id: str,
         parent: AcquisitionRequest,
         start: pd.Timestamp,
         end: pd.Timestamp,
@@ -380,7 +418,8 @@ class AcquisitionService:
         )
         expected = self._calendar.expected_sessions(request.start, request.end)
         errors: list[Exception] = []
-        for provider_id in self._provider_order(parent.source):
+        provider_order = self._provider_order(parent.source)
+        for provider_index, provider_id in enumerate(provider_order):
             factory = self._provider_factories.get(provider_id)
             if factory is None:
                 evidence.provider_skips.setdefault(provider_id.value, "provider is not configured")
@@ -396,6 +435,14 @@ class AcquisitionService:
                 )
                 continue
             try:
+                log_event(
+                    logger,
+                    logging.DEBUG,
+                    "acquisition.provider_attempt",
+                    acquisition_id=acquisition_id,
+                    provider=provider_id,
+                    expected_session_count=len(expected),
+                )
                 observed_execute = getattr(self._retry, "execute_observed", None)
                 if callable(observed_execute):
                     retried = observed_execute(
@@ -418,6 +465,15 @@ class AcquisitionService:
                 ):
                     raise
                 errors.append(error)
+                if provider_index < len(provider_order) - 1:
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "acquisition.fallback",
+                        acquisition_id=acquisition_id,
+                        provider=provider_id,
+                        exception_type=type(error).__name__,
+                    )
                 continue
             if batch.provider is not provider_id or batch.request != request:
                 raise ContractViolationError("provider batch identity is incompatible")
@@ -428,7 +484,26 @@ class AcquisitionService:
             evidence.rejected_rows.extend(quality.rejected_rows)
             if quality.is_fatal or quality.frame is None:
                 errors.append(QualityError("provider range failed structural validation"))
+                if provider_index < len(provider_order) - 1:
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "acquisition.fallback",
+                        acquisition_id=acquisition_id,
+                        provider=provider_id,
+                        exception_type=QualityError.__name__,
+                    )
                 continue
+            if quality.severity is QualitySeverity.WARNING:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "acquisition.quality_warning",
+                    acquisition_id=acquisition_id,
+                    provider=provider_id,
+                    severity=quality.severity,
+                    finding_count=len(quality.findings),
+                )
             return _AcceptedRange(
                 request,
                 quality.frame,
@@ -676,6 +751,15 @@ class AcquisitionService:
             duration_seconds=max(0.0, (completed - started_at).total_seconds()),
             started_at=started_at,
             completed_at=completed,
+        )
+        log_event(
+            logger,
+            logging.WARNING,
+            "acquisition.failed",
+            acquisition_id=acquisition_id,
+            cache_status=cache_status,
+            provider_attempt_count=len(evidence.attempts),
+            exception_type=type(error).__name__,
         )
         self._archive_manifest(manifest)
 

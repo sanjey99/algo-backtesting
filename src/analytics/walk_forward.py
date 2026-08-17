@@ -8,6 +8,7 @@ realistic live performance estimate that cannot be cherry-picked.
 """
 from __future__ import annotations
 
+import logging
 import random
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -17,7 +18,10 @@ from src.analytics.metrics import compute_all_metrics, equity_curve_to_returns, 
 from src.engine.backtest import BacktestConfig, BacktestEngine, BacktestResult
 from src.models.candle import Candle
 from src.models.portfolio import EquityPoint
+from src.observability import log_event
 from src.strategies.base import BaseStrategy
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -88,8 +92,15 @@ class WalkForwardAnalyzer:
             strategy = self.strategy_cls(**params)
             engine = BacktestEngine()
             return engine.run(strategy, candles, self.config)
-        except ValueError:
+        except ValueError as error:
             # Invalid param combo (e.g., fast >= slow) — return empty result
+            log_event(
+                logger,
+                logging.DEBUG,
+                "walk_forward.invalid_parameters",
+                seed=self.seed,
+                exception_type=type(error).__name__,
+            )
             from src.engine.backtest import BacktestResult
             return BacktestResult(
                 strategy_name=(

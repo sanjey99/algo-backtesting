@@ -9,6 +9,7 @@ Parallelized with ProcessPoolExecutor for ~N_CPU speedup.
 """
 from __future__ import annotations
 
+import logging
 import math
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -20,7 +21,10 @@ import numpy as np
 from src.analytics.metrics import compute_all_metrics
 from src.engine.backtest import BacktestConfig, BacktestEngine
 from src.models.candle import Candle
+from src.observability import log_event
 from src.strategies.base import BaseStrategy
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -221,10 +225,24 @@ class PermutationTester:
                 for future in as_completed(futures):
                     try:
                         permuted_metrics.append(future.result())
-                    except Exception:
+                    except Exception as error:
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "permutation.failed",
+                            seed=futures[future],
+                            exception_type=type(error).__name__,
+                        )
                         permuted_metrics.append(0.0)
-        except Exception:
+        except Exception as error:
             # Fallback: single-process (e.g., in test environments)
+            log_event(
+                logger,
+                logging.WARNING,
+                "permutation.failed",
+                seed=self.seed,
+                exception_type=type(error).__name__,
+            )
             lr_arr = np.array(log_returns)
             for s in seeds:
                 local_rng = np.random.default_rng(s)
@@ -241,7 +259,14 @@ class PermutationTester:
                     self.strategy.reset()
                     m = compute_all_metrics(r)
                     permuted_metrics.append(m.get(self.metric, 0.0))
-                except Exception:
+                except Exception as error:
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "permutation.failed",
+                        seed=s,
+                        exception_type=type(error).__name__,
+                    )
                     permuted_metrics.append(0.0)
 
         # 4. Compute p-value
