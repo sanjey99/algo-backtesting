@@ -78,24 +78,16 @@ mkdir -p /private/tmp/algo-sql-portfolio-seed42
   --metadata /private/tmp/algo-sql-portfolio-seed42/comparison-metadata.json
 ```
 
-The Make targets use path defaults only. Override `PYTHON=.venv/bin/python` on Unix-like systems
-when using this repository's local environment. `SQL_SYMBOL`, `SQL_START`, and `SQL_END` are
-required rather than defaulted:
+The Make targets select `.venv/bin` on Unix-like systems and `.venv/Scripts` on Windows. Override
+`VENV` to use another virtual-environment directory and `TEMP_DIR` to choose where smoke artifacts
+are written. `SQL_SYMBOL`, `SQL_START`, and `SQL_END` are required rather than defaulted:
 
 ```bash
-make sql-benchmark-smoke PYTHON=.venv/bin/python \
-  SQL_BENCHMARK_DATABASE=/private/tmp/algo-sql-smoke.db \
-  SQL_BENCHMARK_REPORT=/private/tmp/algo-sql-smoke.json
+make sql-benchmark-smoke
 
-make sql-validate PYTHON=.venv/bin/python \
-  SQL_DATABASE=/private/tmp/algo-sql-smoke.db \
-  SQL_VALIDATION_OUT=/private/tmp/algo-sql-validation.json
+make sql-validate
 
-make sql-compare PYTHON=.venv/bin/python \
-  SQL_DATABASE=/private/tmp/algo-sql-smoke.db \
-  SQL_SYMBOL=SPY SQL_START=2022-01-01 SQL_END=2024-12-31 \
-  SQL_COMPARISON_CSV=/private/tmp/algo-sql-comparison.csv \
-  SQL_COMPARISON_METADATA=/private/tmp/algo-sql-comparison.json
+make sql-compare SQL_SYMBOL=SPY SQL_START=2022-01-01 SQL_END=2024-12-31
 ```
 
 The smoke target deliberately uses the smaller checked-in verification profile from the

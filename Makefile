@@ -1,15 +1,23 @@
-VENV := venv/Scripts
-PYTHON := $(VENV)/python
-PYTEST := $(VENV)/pytest
-MYPY := $(VENV)/mypy
-RUFF := $(VENV)/ruff
+VENV ?= .venv
+ifeq ($(OS),Windows_NT)
+VENV_BIN := $(VENV)/Scripts
+TEMP_DIR ?= $(or $(TEMP),$(TMP),.)
+else
+VENV_BIN := $(VENV)/bin
+TEMP_DIR ?= $(or $(TMPDIR),/tmp)
+endif
 
-SQL_DATABASE ?= /private/tmp/algo-sql-smoke.db
-SQL_VALIDATION_OUT ?= /private/tmp/algo-sql-validation.json
-SQL_COMPARISON_CSV ?= /private/tmp/algo-sql-comparison.csv
-SQL_COMPARISON_METADATA ?= /private/tmp/algo-sql-comparison.json
-SQL_BENCHMARK_DATABASE ?= /private/tmp/algo-sql-smoke.db
-SQL_BENCHMARK_REPORT ?= /private/tmp/algo-sql-smoke.json
+PYTHON := $(VENV_BIN)/python
+PYTEST := $(VENV_BIN)/pytest
+MYPY := $(VENV_BIN)/mypy
+RUFF := $(VENV_BIN)/ruff
+
+SQL_DATABASE ?= $(TEMP_DIR)/algo-sql-smoke.db
+SQL_VALIDATION_OUT ?= $(TEMP_DIR)/algo-sql-validation.json
+SQL_COMPARISON_CSV ?= $(TEMP_DIR)/algo-sql-comparison.csv
+SQL_COMPARISON_METADATA ?= $(TEMP_DIR)/algo-sql-comparison.json
+SQL_BENCHMARK_DATABASE ?= $(TEMP_DIR)/algo-sql-smoke.db
+SQL_BENCHMARK_REPORT ?= $(TEMP_DIR)/algo-sql-smoke.json
 DATA_ARTIFACT_DIR ?= artifacts/data-demo
 DATA_ACQUISITION_ID ?=
 
@@ -42,7 +50,7 @@ serve:
 	$(PYTHON) -m uvicorn src.api.main:app --reload --port 8000
 
 dashboard:
-	$(VENV)/streamlit run src/dashboard/app.py
+	$(VENV_BIN)/streamlit run src/dashboard/app.py
 
 report:
 	$(PYTHON) -m src.analytics.report --symbol SPY --strategy ma_crossover --out report.html
