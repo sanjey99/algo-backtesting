@@ -66,6 +66,7 @@ class WalkForwardAnalyzer:
         n_optimization_trials: int = 50,
         seed: int = 42,
         config: BacktestConfig | None = None,
+        symbol: str | None = None,
     ) -> None:
         self.strategy_cls = strategy_cls
         self.in_sample_days = in_sample_days
@@ -75,6 +76,7 @@ class WalkForwardAnalyzer:
         self.n_optimization_trials = n_optimization_trials
         self.seed = seed
         self.config = config or BacktestConfig()
+        self.symbol = symbol
         self._rng = random.Random(seed)
 
     def _sample_params(self) -> dict[str, Any]:
@@ -91,7 +93,7 @@ class WalkForwardAnalyzer:
         try:
             strategy = self.strategy_cls(**params)
             engine = BacktestEngine()
-            return engine.run(strategy, candles, self.config)
+            return engine.run(strategy, candles, self.config, symbol=self.symbol)
         except ValueError as error:
             # Invalid param combo (e.g., fast >= slow) — return empty result
             log_event(
@@ -106,7 +108,7 @@ class WalkForwardAnalyzer:
                 strategy_name=(
                     self.strategy_cls.name if hasattr(self.strategy_cls, "name") else "unknown"
                 ),
-                symbol="",
+                symbol=self.symbol or "",
                 start_date=candles[0].timestamp if candles else datetime.now(UTC),
                 end_date=candles[-1].timestamp if candles else datetime.now(UTC),
                 parameters=params,
@@ -209,7 +211,7 @@ class WalkForwardAnalyzer:
         all_trades = [t for w in windows for t in w.oos_result.trades]
         combined_result = BacktestResult(
             strategy_name=getattr(self.strategy_cls, 'name', 'unknown'),
-            symbol="combined",
+            symbol=self.symbol or "combined",
             start_date=combined_equity[0].date if combined_equity else datetime.now(UTC),
             end_date=combined_equity[-1].date if combined_equity else datetime.now(UTC),
             parameters={},

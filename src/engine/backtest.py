@@ -117,6 +117,7 @@ class BacktestEngine:
         strategy: Strategy,
         candles: list[Candle],
         config: BacktestConfig,
+        symbol: str | None = None,
     ) -> BacktestResult:
         run_id = str(uuid.uuid4())
         try:
@@ -128,7 +129,7 @@ class BacktestEngine:
                 strategy=strategy.name,
                 bar_count=len(candles),
             )
-            return self._run(strategy, candles, config, run_id)
+            return self._run(strategy, candles, config, run_id, symbol)
         except Exception as error:
             log_event(
                 logger,
@@ -145,6 +146,7 @@ class BacktestEngine:
         candles: list[Candle],
         config: BacktestConfig,
         run_id: str,
+        requested_symbol: str | None,
     ) -> BacktestResult:
         if not candles:
             raise ValueError("candles list must not be empty")
@@ -166,9 +168,9 @@ class BacktestEngine:
             commission_pct=config.commission_pct,
         )
 
-        # The engine is single-symbol per run. Capture the symbol from the
-        # first actionable order, defaulting to "UNKNOWN" if none is queued.
-        symbol: str = "UNKNOWN"
+        # A request-supplied symbol defines the instrument for the entire run.
+        # Older direct callers retain their signal-derived behavior when omitted.
+        symbol = requested_symbol or "UNKNOWN"
         pending: _PendingOrder | None = None
 
         for candle_index, candle in enumerate(candles):
@@ -274,7 +276,7 @@ class BacktestEngine:
                 pending is not None and pending.forced_cover
             ):
                 order: Order | None = self._build_order(
-                    signal, portfolio, candle
+                    signal, portfolio, candle, requested_symbol
                 )
                 if order is not None:
                     if pending is not None:
@@ -360,10 +362,11 @@ class BacktestEngine:
         signal: SignalEvent,
         portfolio: Portfolio,
         candle: Candle,
+        requested_symbol: str | None,
     ) -> Order | None:
         """Translate a signal into an opening or exact-position closing order."""
         del candle
-        execution_symbol = signal.symbol
+        execution_symbol = requested_symbol or signal.symbol
         quantity = 1
         open_positions = portfolio.open_positions
 

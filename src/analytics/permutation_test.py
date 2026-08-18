@@ -27,6 +27,10 @@ from src.strategies.base import BaseStrategy
 logger = logging.getLogger(__name__)
 
 
+class _PermutationWorkerError(RuntimeError):
+    """A completed permutation task failed and must not trigger a fallback."""
+
+
 @dataclass
 class PermutationResult:
     actual_metric: float
@@ -85,6 +89,7 @@ def _run_single_permutation(
     metric: str,
     config_dict: dict[str, float],
     seed: int,
+    symbol: str | None = None,
 ) -> float:
     """Run one permutation — designed to run in a subprocess (no shared state)."""
     import importlib
@@ -124,10 +129,7 @@ def _run_single_permutation(
     mod = importlib.import_module(parts[0])
     cls = getattr(mod, parts[1])
 
-    try:
-        strategy = cls(**strategy_params)
-    except Exception:
-        strategy = cls()
+    strategy = cls(**strategy_params)
 
     config = BacktestConfig(
         initial_capital=config_dict.get("initial_capital", 100_000.0),
@@ -139,7 +141,7 @@ def _run_single_permutation(
         borrow_day_count=config_dict.get("borrow_day_count", 365.0),
     )
     engine = BacktestEngine()
-    result = engine.run(strategy, candles, config)
+    result = engine.run(strategy, candles, config, symbol=symbol)
     metrics = compute_all_metrics(result)
     return metrics.get(metric, 0.0)
 
@@ -162,6 +164,7 @@ class PermutationTester:
         seed: int = 42,
         config: BacktestConfig | None = None,
         max_workers: int | None = None,
+        symbol: str | None = None,
     ) -> None:
         self.strategy = strategy
         self.candles = candles
@@ -170,6 +173,7 @@ class PermutationTester:
         self.seed = seed
         self.config = config or BacktestConfig()
         self.max_workers = max_workers or max(1, (cpu_count() or 2) - 1)
+        self.symbol = symbol
 
     def _compute_log_returns(self) -> np.ndarray:
         prices = np.array([c.adj_close for c in self.candles], dtype=float)
@@ -179,7 +183,7 @@ class PermutationTester:
         """Execute permutation test; return PermutationResult."""
         # 1. Actual metric on real data
         engine = BacktestEngine()
-        actual_result = engine.run(self.strategy, self.candles, self.config)
+        actual_result = engine.run(self.strategy, self.candles, self.config, symbol=self.symbol)
         self.strategy.reset()
         actual_metrics = compute_all_metrics(actual_result)
         actual_metric = actual_metrics.get(self.metric, 0.0)
@@ -203,7 +207,6 @@ class PermutationTester:
         }
 
         # 3. Parallel permutations
-        permuted_metrics: list[float] = []
         seeds = [self.seed + i for i in range(self.n_permutations)]
 
         try:
@@ -219,9 +222,11 @@ class PermutationTester:
                         self.metric,
                         config_dict,
                         s,
+                        self.symbol,
                     ): s
                     for s in seeds
                 }
+                permuted_metrics: list[float] = []
                 for future in as_completed(futures):
                     try:
                         permuted_metrics.append(future.result())
@@ -233,38 +238,31 @@ class PermutationTester:
                             seed=futures[future],
                             exception_type=type(error).__name__,
                         )
-                        permuted_metrics.append(0.0)
+                        raise _PermutationWorkerError(str(error)) from error
+        except _PermutationWorkerError:
+            raise
         except Exception:
-            # Fallback: single-process (e.g., in test environments)
-            lr_arr = np.array(log_returns)
-            for s in seeds:
-                local_rng = np.random.default_rng(s)
-                shuffled = lr_arr.copy()
-                local_rng.shuffle(shuffled)
-                prices = np.empty(len(shuffled) + 1)
-                prices[0] = original_prices[0]
-                for i, lr in enumerate(shuffled):
-                    prices[i + 1] = prices[i] * math.exp(float(lr))
-                synth_candles = _candles_from_prices(prices, self.candles)
-                try:
-                    self.strategy.reset()
-                    r = engine.run(self.strategy, synth_candles, self.config)
-                    self.strategy.reset()
-                    m = compute_all_metrics(r)
-                    permuted_metrics.append(m.get(self.metric, 0.0))
-                except Exception as error:
-                    log_event(
-                        logger,
-                        logging.WARNING,
-                        "permutation.failed",
-                        seed=s,
-                        exception_type=type(error).__name__,
-                    )
-                    permuted_metrics.append(0.0)
+            # Process-pool infrastructure can fail after some completions.  Restart
+            # every seed sequentially so partial samples cannot be duplicated.
+            permuted_metrics = [
+                _run_single_permutation(
+                    strategy_cls_name,
+                    self.strategy.parameters,
+                    log_returns,
+                    original_prices,
+                    timestamps,
+                    self.metric,
+                    config_dict,
+                    s,
+                    self.symbol,
+                )
+                for s in seeds
+            ]
 
         # 4. Compute p-value
         n = len(permuted_metrics)
-        p_value = sum(1 for m in permuted_metrics if m >= actual_metric) / n if n > 0 else 1.0
+        count_gte = sum(1 for m in permuted_metrics if m >= actual_metric)
+        p_value = (count_gte + 1) / (n + 1)
 
         all_metrics = sorted(permuted_metrics + [actual_metric])
         rank = all_metrics.index(actual_metric)

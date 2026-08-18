@@ -84,6 +84,23 @@ def test_backtest_emits_start_fill_and_completion(
     assert records_by_event["backtest.completed"].levelno == logging.INFO
 
 
+def test_requested_symbol_overrides_a_strategy_signal_symbol() -> None:
+    """A run's requested instrument is authoritative over strategy placeholders."""
+    result = BacktestEngine().run(
+        _BuyOnZeroSellOnOne(),
+        [
+            _bar(0, 100, 101, 99, 100),
+            _bar(1, 101, 102, 100, 101),
+            _bar(2, 102, 103, 101, 102),
+        ],
+        BacktestConfig(),
+        symbol="AAPL",
+    )
+
+    assert result.symbol == "AAPL"
+    assert result.trades[0].symbol == "AAPL"
+
+
 def test_rejected_order_logs_reason_not_payload(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

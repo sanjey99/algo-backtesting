@@ -97,7 +97,7 @@ def _run_backtest(
     if not candles:
         return None, None, None
     config = BacktestConfig(initial_capital=initial_capital)
-    result = BacktestEngine().run(strategy, candles, config)
+    result = BacktestEngine().run(strategy, candles, config, symbol=symbol)
     metrics = compute_all_metrics(result)
     return result, metrics, candles
 
@@ -334,6 +334,7 @@ def render_walk_forward_tab(cfg: DashboardConfig) -> None:
                 step_days=int(step_days),
                 n_optimization_trials=int(n_trials),
                 config=BacktestConfig(initial_capital=cfg["initial_capital"]),
+                symbol=cfg["symbol"],
             )
             wf = analyzer.run(candles)
             st.session_state["wfa_result"] = wf
@@ -393,6 +394,7 @@ def render_permutation_tab(
                 strategy=strategy,
                 candles=candles,
                 n_permutations=int(n_perms),
+                symbol=cfg["symbol"],
             )
             perm = tester.run()
             st.session_state["perm_result"] = perm
@@ -460,7 +462,7 @@ def render_comparison_tab(cfg: DashboardConfig) -> None:
                         st.error("No data.")
                         return
                 config = BacktestConfig(initial_capital=cfg["initial_capital"])
-                result = BacktestEngine().run(strategy, candles, config)
+                result = BacktestEngine().run(strategy, candles, config, symbol=cfg["symbol"])
                 metrics = compute_all_metrics(result)
                 results[key] = metrics
         st.session_state["comparison_results"] = results

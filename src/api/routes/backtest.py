@@ -105,7 +105,7 @@ def run_backtest(
         commission_pct=req.commission_pct,
         slippage_pct=req.slippage_pct,
     )
-    result = BacktestEngine().run(strategy, candles, config)
+    result = BacktestEngine().run(strategy, candles, config, symbol=req.symbol)
     metrics = compute_all_metrics(result)
 
     trades_dicts = []
@@ -298,6 +298,7 @@ def run_walk_forward(
         step_days=req.step_days,
         n_optimization_trials=req.n_optimization_trials,
         config=config,
+        symbol=req.symbol,
     )
     wf = analyzer.run(candles)
 
@@ -342,6 +343,7 @@ def _run_permutation_bg(
             n_permutations=req.n_permutations,
             metric=req.metric,
             config=config,
+            symbol=req.symbol,
         )
         perm_result = tester.run()
         set_job(

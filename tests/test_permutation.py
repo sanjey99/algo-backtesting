@@ -12,7 +12,7 @@ from src.analytics.permutation_test import (
     PermutationTester,
     _run_single_permutation,
 )
-from src.engine.backtest import BacktestConfig
+from src.engine.backtest import BacktestConfig, BacktestEngine
 from src.models.candle import Candle
 from src.strategies.ma_crossover import MACrossoverStrategy
 
@@ -96,14 +96,53 @@ class TestPermutationTester:
         assert captured["annual_short_borrow_rate"] == 0.05
         assert captured["borrow_day_count"] == 365.0
 
+    def test_permutation_worker_uses_requested_symbol(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, str | None] = {}
+        original_run = BacktestEngine.run
+
+        def record_symbol(*args: object, **kwargs: object) -> object:
+            captured["symbol"] = kwargs.get("symbol")  # type: ignore[assignment]
+            return original_run(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr("src.engine.backtest.BacktestEngine.run", record_symbol)
+
+        _run_single_permutation(
+            "src.strategies.ma_crossover.MACrossoverStrategy",
+            {"fast_period": 2, "slow_period": 3},
+            [0.01, -0.01, 0.02],
+            [100.0, 101.0, 100.0, 102.0],
+            [datetime(2023, 1, day) for day in range(1, 5)],
+            "sharpe_ratio",
+            asdict(BacktestConfig()),
+            42,
+            "AAPL",
+        )
+
+        assert captured["symbol"] == "AAPL"
+
+    def test_permutation_worker_rejects_invalid_strategy_parameters(self) -> None:
+        with pytest.raises(ValueError, match="fast_period"):
+            _run_single_permutation(
+                "src.strategies.ma_crossover.MACrossoverStrategy",
+                {"fast_period": 20, "slow_period": 5},
+                [0.01, -0.01, 0.02],
+                [100.0, 101.0, 100.0, 102.0],
+                [datetime(2023, 1, day) for day in range(1, 5)],
+                "sharpe_ratio",
+                asdict(BacktestConfig()),
+                42,
+            )
+
     def test_instantiation(self) -> None:
         strategy = MACrossoverStrategy(fast_period=5, slow_period=20)
         candles = make_candles(100)
         tester = PermutationTester(strategy, candles, n_permutations=10)
         assert tester.n_permutations == 10
 
-    def test_failed_worker_is_logged_without_changing_fallback_metric(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    def test_failed_worker_fails_closed_without_a_zero_metric(
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         class FailingFuture:
             def result(self) -> float:
@@ -134,18 +173,89 @@ class TestPermutationTester:
             max_workers=1,
         )
 
-        with caplog.at_level(logging.WARNING):
-            result = tester.run()
+        with pytest.raises(RuntimeError, match="worker failure"):
+            tester.run()
 
-        record = next(
-            record
-            for record in caplog.records
-            if getattr(record, "event", None) == "permutation.failed"
+    def test_p_value_uses_the_exact_add_one_correction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class Future:
+            def __init__(self, value: float) -> None:
+                self.value = value
+
+            def result(self) -> float:
+                return self.value
+
+        class Executor:
+            def __init__(self, *, max_workers: int) -> None:
+                self.values = iter([1.0, 3.0, 4.0])
+
+            def __enter__(self) -> Executor:
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def submit(self, *_: object) -> Future:
+                return Future(next(self.values))
+
+        monkeypatch.setattr("src.analytics.permutation_test.ProcessPoolExecutor", Executor)
+        monkeypatch.setattr(
+            "src.analytics.permutation_test.as_completed", lambda futures: list(futures)
         )
-        fields = getattr(record, "event_fields", {})
-        assert record.levelno == logging.WARNING
-        assert fields == {"seed": 23, "exception_type": "RuntimeError"}
-        assert result.permuted_metrics == [0.0]
+        monkeypatch.setattr(
+            "src.analytics.permutation_test.compute_all_metrics",
+            lambda _: {"sharpe_ratio": 3.0},
+        )
+
+        result = PermutationTester(
+            MACrossoverStrategy(fast_period=5, slow_period=20),
+            make_candles(20),
+            n_permutations=3,
+            max_workers=1,
+        ).run()
+
+        assert result.p_value == 0.75
+
+    def test_pool_failure_restarts_all_seeds_sequentially_without_duplicates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class Future:
+            def result(self) -> float:
+                return 999.0
+
+        class Executor:
+            def __init__(self, *, max_workers: int) -> None:
+                pass
+
+            def __enter__(self) -> Executor:
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def submit(self, *_: object) -> Future:
+                return Future()
+
+        monkeypatch.setattr("src.analytics.permutation_test.ProcessPoolExecutor", Executor)
+        monkeypatch.setattr(
+            "src.analytics.permutation_test.as_completed",
+            lambda _: (_ for _ in ()).throw(RuntimeError("pool unavailable")),
+        )
+        monkeypatch.setattr(
+            "src.analytics.permutation_test._run_single_permutation",
+            lambda *args: float(args[-2]),
+        )
+
+        result = PermutationTester(
+            MACrossoverStrategy(fast_period=5, slow_period=20),
+            make_candles(20),
+            n_permutations=3,
+            seed=31,
+            max_workers=1,
+        ).run()
+
+        assert result.permuted_metrics == [31.0, 32.0, 33.0]
 
     def test_executor_fallback_without_failed_runs_is_not_logged(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture

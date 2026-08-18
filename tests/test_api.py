@@ -209,11 +209,11 @@ PATCH_TARGET = "src.api.routes.backtest._fetch_candles"
 
 
 class TestRunBacktest:
-    def test_returns_201_and_run_id(self, client: TestClient) -> None:
+    def test_returns_and_persists_the_requested_symbol(self, client: TestClient) -> None:
         with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
             r = client.post("/api/backtest", json={
                 "strategy": "ma_crossover",
-                "symbol": "SPY",
+                "symbol": "AAPL",
                 "start": "2020-01-01",
                 "end": "2022-12-31",
                 "params": {"fast_period": 5, "slow_period": 20},
@@ -222,6 +222,11 @@ class TestRunBacktest:
         body = r.json()
         assert "run_id" in body
         assert body["strategy_name"] == "ma_crossover"
+        assert body["symbol"] == "AAPL"
+
+        persisted = client.get(f"/api/backtest/{body['run_id']}")
+        assert persisted.status_code == 200
+        assert persisted.json()["symbol"] == "AAPL"
 
     def test_metrics_present(self, client: TestClient) -> None:
         with patch(PATCH_TARGET, return_value=FAKE_CANDLES):

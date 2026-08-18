@@ -35,6 +35,15 @@ def make_trending_candles(n: int = 500, start_price: float = 100.0) -> list[Cand
 
 
 class TestWalkForwardAnalyzer:
+    def test_runs_use_the_requested_symbol(self) -> None:
+        analyzer = WalkForwardAnalyzer(MACrossoverStrategy, symbol="AAPL")
+
+        result = analyzer._run_backtest(
+            make_trending_candles(30), {"fast_period": 2, "slow_period": 3}
+        )
+
+        assert result.symbol == "AAPL"
+
     def test_produces_at_least_one_window(self) -> None:
         candles = make_trending_candles(400)
         analyzer = WalkForwardAnalyzer(
