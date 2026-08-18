@@ -948,6 +948,37 @@ class TestBacktestEnginePendingOrders:
         assert result.trades[0].entry_date == candles[2].timestamp
         assert result.trades[0].exit_date == candles[3].timestamp
 
+    def test_stop_order_persists_until_later_bar_crosses(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        candles = [
+            _bar(0, 100, 101, 99, 100),
+            _bar(1, 100, 104, 99, 100),
+            _bar(2, 100, 105, 99, 104),
+            _bar(3, 110, 111, 109, 110),
+        ]
+        strategy = _ScheduledSignals(
+            {
+                0: (Direction.LONG, OrderType.STOP, 105.0),
+                2: (Direction.SHORT, OrderType.MARKET, None),
+            }
+        )
+
+        with caplog.at_level(logging.DEBUG):
+            result = BacktestEngine().run(strategy, candles, BacktestConfig())
+
+        trade = result.trades[0]
+        assert trade.entry_date == candles[2].timestamp
+        assert trade.entry_price == pytest.approx(105.0 * 1.0005)
+        assert trade.exit_date == candles[3].timestamp
+
+        stop_events = [
+            getattr(record, "event", None)
+            for record in caplog.records
+            if getattr(record, "event_fields", {}).get("order_type") == "STOP"
+        ]
+        assert stop_events == ["order.queued", "order.untriggered", "order.filled"]
+
     def test_final_bar_signal_is_not_filled(self) -> None:
         result = BacktestEngine().run(
             _SignalOnlyOnLastBar(), make_candle_series(3), BacktestConfig()
