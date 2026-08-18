@@ -30,9 +30,13 @@ lint:
 
 verify-warnings:
 	uv run --extra dev pytest tests/test_api.py tests/test_api_data_acquisition.py \
-		-W error::starlette.exceptions.StarletteDeprecationWarning
+		-W error::starlette.exceptions.StarletteDeprecationWarning \
+		-W error::ResourceWarning \
+		-W error::pytest.PytestUnraisableExceptionWarning
 	uv run --extra dev pytest tests/test_db.py tests/sql_analytics \
-		-W error::DeprecationWarning
+		-W error::DeprecationWarning \
+		-W error::ResourceWarning \
+		-W error::pytest.PytestUnraisableExceptionWarning
 
 serve:
 	$(PYTHON) -m uvicorn src.api.main:app --reload --port 8000

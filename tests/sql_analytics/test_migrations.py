@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.engine import Engine
 
 from alembic import command
 from src.db import database
@@ -29,6 +30,15 @@ def alembic_config(database_url: str) -> Config:
 
 def sqlite_url(path: Path) -> str:
     return f"sqlite:///{path}"
+
+
+@contextmanager
+def _sqlite_engine(path: Path) -> Iterator[Engine]:
+    engine = create_engine(sqlite_url(path))
+    try:
+        yield engine
+    finally:
+        engine.dispose()
 
 
 @contextmanager
@@ -52,24 +62,24 @@ def _downgrade(config: Config, revision: str, fallback_url: str) -> None:
 
 
 def _schema_names(path: Path) -> set[str]:
-    inspector = inspect(create_engine(sqlite_url(path)))
-    return set(inspector.get_table_names())
+    with _sqlite_engine(path) as engine:
+        return set(inspect(engine).get_table_names())
 
 
 def _unique_constraints(path: Path, table_name: str) -> dict[str, tuple[str, ...]]:
-    inspector = inspect(create_engine(sqlite_url(path)))
-    return {
-        str(item["name"]): tuple(str(column) for column in item["column_names"])
-        for item in inspector.get_unique_constraints(table_name)
-    }
+    with _sqlite_engine(path) as engine:
+        return {
+            str(item["name"]): tuple(str(column) for column in item["column_names"])
+            for item in inspect(engine).get_unique_constraints(table_name)
+        }
 
 
 def _indexes(path: Path, table_name: str) -> dict[str, tuple[str, ...]]:
-    inspector = inspect(create_engine(sqlite_url(path)))
-    return {
-        str(item["name"]): tuple(str(column) for column in item["column_names"])
-        for item in inspector.get_indexes(table_name)
-    }
+    with _sqlite_engine(path) as engine:
+        return {
+            str(item["name"]): tuple(str(column) for column in item["column_names"])
+            for item in inspect(engine).get_indexes(table_name)
+        }
 
 
 def test_upgrade_head_builds_fresh_hardened_schema(tmp_path: Path) -> None:
@@ -79,13 +89,14 @@ def test_upgrade_head_builds_fresh_hardened_schema(tmp_path: Path) -> None:
     database_url = sqlite_url(database_path)
     _upgrade(alembic_config(database_url), "head", database_url)
 
-    inspector = inspect(create_engine(sqlite_url(database_path)))
-    assert set(inspector.get_table_names()) == APPLICATION_TABLES | {"alembic_version"}
-    assert {
-        tuple(foreign_key["constrained_columns"])
-        for table_name in ("trades", "equity_curve", "metrics")
-        for foreign_key in inspector.get_foreign_keys(table_name)
-    } == {("backtest_id",)}
+    with _sqlite_engine(database_path) as engine:
+        inspector = inspect(engine)
+        assert set(inspector.get_table_names()) == APPLICATION_TABLES | {"alembic_version"}
+        assert {
+            tuple(foreign_key["constrained_columns"])
+            for table_name in ("trades", "equity_curve", "metrics")
+            for foreign_key in inspector.get_foreign_keys(table_name)
+        } == {("backtest_id",)}
     assert _unique_constraints(database_path, "metrics") == {
         "uq_metrics_backtest_metric": ("backtest_id", "metric_name")
     }
@@ -98,7 +109,7 @@ def test_upgrade_head_builds_fresh_hardened_schema(tmp_path: Path) -> None:
     assert _indexes(database_path, "backtest_runs") == {
         "ix_backtest_runs_symbol_dates": ("symbol", "start_date", "end_date")
     }
-    with create_engine(sqlite_url(database_path)).connect() as connection:
+    with _sqlite_engine(database_path) as engine, engine.connect() as connection:
         revision = connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
     assert revision == HEAD_REVISION
 
@@ -121,7 +132,7 @@ def test_explicit_target_wins_over_environment_decoy_in_subprocess(tmp_path: Pat
     """Falling back to DATABASE_URL would migrate the operator's unrelated database."""
     target_path = tmp_path / "target.db"
     decoy_path = tmp_path / "decoy.db"
-    with create_engine(sqlite_url(decoy_path)).begin() as connection:
+    with _sqlite_engine(decoy_path) as engine, engine.begin() as connection:
         connection.exec_driver_sql("CREATE TABLE sentinel (id INTEGER PRIMARY KEY)")
 
     script = """
@@ -151,14 +162,17 @@ def test_injected_connection_is_used_without_touching_configured_decoy(tmp_path:
     target_path = tmp_path / "connection-target.db"
     decoy_path = tmp_path / "configured-decoy.db"
     target_engine = create_engine(sqlite_url(target_path))
-    config = alembic_config(sqlite_url(decoy_path))
+    try:
+        config = alembic_config(sqlite_url(decoy_path))
 
-    with target_engine.begin() as connection:
-        config.attributes["connection"] = connection
-        _upgrade(config, "head", sqlite_url(decoy_path))
+        with target_engine.begin() as connection:
+            config.attributes["connection"] = connection
+            _upgrade(config, "head", sqlite_url(decoy_path))
 
-    assert _schema_names(target_path) == APPLICATION_TABLES | {"alembic_version"}
-    assert not decoy_path.exists()
+        assert _schema_names(target_path) == APPLICATION_TABLES | {"alembic_version"}
+        assert not decoy_path.exists()
+    finally:
+        target_engine.dispose()
 
 
 def test_downgrade_and_reupgrade_preserve_revision_chain(tmp_path: Path) -> None:
@@ -180,6 +194,6 @@ def test_downgrade_and_reupgrade_preserve_revision_chain(tmp_path: Path) -> None
     assert _unique_constraints(database_path, "metrics") == {
         "uq_metrics_backtest_metric": ("backtest_id", "metric_name")
     }
-    with create_engine(sqlite_url(database_path)).connect() as connection:
+    with _sqlite_engine(database_path) as engine, engine.connect() as connection:
         revision = connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
     assert revision == HEAD_REVISION

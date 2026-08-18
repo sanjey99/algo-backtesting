@@ -12,7 +12,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -58,6 +58,13 @@ def override_get_db() -> Generator[Session, None, None]:
 
 Base.metadata.create_all(bind=_engine)
 app.dependency_overrides[get_db] = override_get_db
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _dispose_test_engine() -> Generator[None, None, None]:
+    yield
+    app.dependency_overrides.pop(get_db, None)
+    _engine.dispose()
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +146,28 @@ async def test_lifespan_configures_logging_once(monkeypatch: pytest.MonkeyPatch)
             pass
 
     assert calls == [None]
+
+
+async def test_lifespan_disposes_database_engine_on_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Application shutdown must release connections owned by its global engine."""
+    engine = create_db_engine("sqlite:///:memory:")
+    closed_connections: list[object] = []
+    event.listen(
+        engine,
+        "close",
+        lambda dbapi_connection, _: closed_connections.append(dbapi_connection),
+    )
+    with engine.connect():
+        pass
+    monkeypatch.setattr(database, "get_engine", lambda: engine)
+
+    with patch("src.api.main.init_db"):
+        async with api_main.lifespan(app):
+            assert closed_connections == []
+
+    assert len(closed_connections) == 1
 
 
 # ---------------------------------------------------------------------------

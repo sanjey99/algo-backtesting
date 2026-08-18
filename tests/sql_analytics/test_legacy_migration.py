@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -41,7 +42,7 @@ def _config(path: Path) -> Config:
 def _baseline(path: Path, *, versioned: bool = True) -> None:
     command.upgrade(_config(path), BASELINE_REVISION)
     if not versioned:
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute("DROP TABLE alembic_version")
 
 
@@ -58,8 +59,16 @@ def _assessment(path: Path) -> Any:
         engine.dispose()
 
 
+def _table_names(path: Path) -> list[str]:
+    engine = create_engine(_database_url(path))
+    try:
+        return inspect(engine).get_table_names()
+    finally:
+        engine.dispose()
+
+
 def _schema_snapshot(path: Path) -> tuple[tuple[object, ...], ...]:
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         schema = connection.execute(
             """
             SELECT type, name, tbl_name, sql
@@ -79,7 +88,7 @@ def _schema_snapshot(path: Path) -> tuple[tuple[object, ...], ...]:
 
 
 def _seed_parent(path: Path) -> None:
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute(
             """
             INSERT INTO backtest_runs (
@@ -100,14 +109,14 @@ def test_empty_database_classifies_without_creating_schema(tmp_path: Path) -> No
     assert assessment.state.value == "empty"
     assert assessment.current_revision is None
     assert assessment.differences == ()
-    assert inspect(create_engine(_database_url(path))).get_table_names() == []
+    assert _table_names(path) == []
 
 
 def test_view_only_database_is_unknown_and_refused_without_mutation(tmp_path: Path) -> None:
     """Ignoring non-table objects would mutate an unrelated view-only database as EMPTY."""
     api = _migration_api()
     path = tmp_path / "view-only.db"
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute("CREATE VIEW sentinel_view AS SELECT 1 AS value")
     before = path.read_bytes()
 
@@ -144,7 +153,7 @@ def test_extra_view_and_trigger_make_exact_schema_unknown(tmp_path: Path) -> Non
     api = _migration_api()
     path = tmp_path / "extra-objects.db"
     _current(path)
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute(
             "CREATE VIEW run_symbols AS SELECT id, symbol FROM backtest_runs"
         )
@@ -176,7 +185,7 @@ def test_empty_version_table_is_unknown_and_refused_without_mutation(tmp_path: P
     api = _migration_api()
     path = tmp_path / "empty-version-table.db"
     _baseline(path)
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute("DELETE FROM alembic_version")
     before = _schema_snapshot(path)
 
@@ -195,7 +204,7 @@ def test_multiple_version_rows_are_unknown_and_refused_without_mutation(tmp_path
     api = _migration_api()
     path = tmp_path / "multiple-version-rows.db"
     _baseline(path)
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute(
             "INSERT INTO alembic_version (version_num) VALUES ('second_revision')"
         )
@@ -217,7 +226,7 @@ def test_cli_cleanly_refuses_malformed_version_metadata(tmp_path: Path) -> None:
     """Malformed metadata must return a sanitized nonzero CLI result without traceback."""
     path = tmp_path / "malformed-version-table.db"
     _baseline(path)
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute("DROP TABLE alembic_version")
         connection.execute("CREATE TABLE alembic_version (wrong_column TEXT)")
     before = _schema_snapshot(path)
@@ -320,7 +329,7 @@ def test_stamped_structural_mismatches_are_unknown(
     """Trusting a stamp alone would upgrade an incompatible schema."""
     path = tmp_path / "structural-mismatch.db"
     _baseline(path)
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         mutate(connection)  # type: ignore[operator]
 
     assessment = _assessment(path)
@@ -334,7 +343,7 @@ def test_partial_unversioned_schema_reports_sorted_missing_tables(tmp_path: Path
     """Matching one table name must not be enough to stamp a partial schema."""
     path = tmp_path / "partial.db"
     _baseline(path, versioned=False)
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute("DROP TABLE metrics")
         connection.execute("DROP TABLE equity_curve")
         connection.execute("DROP TABLE trades")
@@ -353,7 +362,7 @@ def test_wrong_sqlite_affinity_is_reported_exactly(tmp_path: Path) -> None:
     """Comparing only column names would accept a semantically wrong metric type."""
     path = tmp_path / "wrong-type.db"
     _baseline(path)
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute("ALTER TABLE metrics RENAME TO old_metrics")
         connection.execute(
             """
@@ -377,7 +386,7 @@ def test_unknown_revision_is_not_inferred_from_matching_tables(tmp_path: Path) -
     """Known table names must not make an unknown migration lineage safe."""
     path = tmp_path / "unknown-revision.db"
     _baseline(path)
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute("UPDATE alembic_version SET version_num = 'mystery_revision'")
 
     assessment = _assessment(path)
@@ -427,7 +436,7 @@ def test_unknown_schema_refusal_is_byte_for_byte_immutable(tmp_path: Path) -> No
     """An UNKNOWN branch that stamps before refusing corrupts operator evidence."""
     api = _migration_api()
     path = tmp_path / "unknown.db"
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute("CREATE TABLE sentinel (id INTEGER PRIMARY KEY)")
     before = path.read_bytes()
 
@@ -442,7 +451,7 @@ def test_stamped_missing_table_refusal_preserves_schema_and_rows(tmp_path: Path)
     api = _migration_api()
     path = tmp_path / "stamped-missing.db"
     _baseline(path)
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute("DROP TABLE metrics")
     before = _schema_snapshot(path)
 
@@ -490,7 +499,7 @@ def test_hardening_preflight_fails_before_any_ddl(
     path = tmp_path / f"unsafe-{invariant}.db"
     _baseline(path)
     _seed_parent(path)
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.execute(statement)
     before = _schema_snapshot(path)
 

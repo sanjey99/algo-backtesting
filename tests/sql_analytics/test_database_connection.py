@@ -12,9 +12,11 @@ from src.db.database import create_db_engine
 def test_sqlite_engine_enables_foreign_keys(tmp_path: Path) -> None:
     """A SQLite engine enables referential integrity for every connection."""
     engine = create_db_engine(f"sqlite:///{tmp_path / 'test.db'}")
-
-    with engine.connect() as connection:
-        assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+    try:
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+    finally:
+        engine.dispose()
 
 
 def test_non_sqlite_engine_has_no_sqlite_connect_args(monkeypatch: pytest.MonkeyPatch) -> None:

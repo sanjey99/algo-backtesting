@@ -1,5 +1,6 @@
 """Tests for database layer — Step 9."""
 import warnings
+from collections.abc import Generator
 from datetime import UTC, datetime
 
 import pytest
@@ -18,14 +19,17 @@ from src.db.tables import Base
 
 
 @pytest.fixture
-def db_session():
+def db_session() -> Generator[Session, None, None]:
     """In-memory SQLite session for tests."""
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine)
     session = session_factory()
-    yield session
-    session.close()
+    try:
+        yield session
+    finally:
+        session.close()
+        engine.dispose()
 
 
 SAMPLE_RUN = dict(
@@ -133,18 +137,19 @@ class TestCRUD:
     def test_round_trip_across_sessions(self) -> None:
         """Data saved in one session is visible in a fresh session (R-17)."""
         engine = create_engine("sqlite:///:memory:")
-        Base.metadata.create_all(engine)
-        session_factory = sessionmaker(bind=engine)
+        try:
+            Base.metadata.create_all(engine)
+            session_factory = sessionmaker(bind=engine)
 
-        # Write session
-        session1 = session_factory()
-        run_id = save_backtest_run(session1, **SAMPLE_RUN)
-        session1.close()
+            # Write session
+            with session_factory() as session1:
+                run_id = save_backtest_run(session1, **SAMPLE_RUN)
 
-        # Read session — completely fresh
-        session2 = session_factory()
-        session2.expire_all()  # force real DB round-trip
-        run = get_backtest_run(session2, run_id)
-        assert run is not None
-        assert run.strategy_name == SAMPLE_RUN["strategy_name"]
-        session2.close()
+            # Read session — completely fresh
+            with session_factory() as session2:
+                session2.expire_all()  # force real DB round-trip
+                run = get_backtest_run(session2, run_id)
+                assert run is not None
+                assert run.strategy_name == SAMPLE_RUN["strategy_name"]
+        finally:
+            engine.dispose()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -132,14 +133,13 @@ def _result(
 
 
 @pytest.fixture()
-def api_client(tmp_path: Path):
+def api_client(tmp_path: Path) -> Generator[TestClient, None, None]:
     engine = create_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
     session_factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
-    Base.metadata.create_all(bind=engine)
 
     def override_db():
         db = session_factory()
@@ -150,12 +150,18 @@ def api_client(tmp_path: Path):
             db.close()
 
     del tmp_path
-    app.dependency_overrides[get_db] = override_db
-    with patch("src.api.main.init_db"):
-        with TestClient(app) as client:
-            yield client
-    app.dependency_overrides.clear()
-    Base.metadata.drop_all(bind=engine)
+    try:
+        Base.metadata.create_all(bind=engine)
+        app.dependency_overrides[get_db] = override_db
+        with patch("src.api.main.init_db"):
+            with TestClient(app) as client:
+                yield client
+    finally:
+        app.dependency_overrides.clear()
+        try:
+            Base.metadata.drop_all(bind=engine)
+        finally:
+            engine.dispose()
 
 
 def _override_service(service: FakeAcquisitionService) -> None:

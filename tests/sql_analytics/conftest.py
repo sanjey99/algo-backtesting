@@ -1,6 +1,7 @@
 """Shared database fixture for SQL analytics tests."""
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -26,19 +27,25 @@ def _baseline_engine(path: Path) -> Engine:
 
 
 @pytest.fixture()
-def analytics_db(tmp_path: Path) -> Engine:
+def analytics_db(tmp_path: Path) -> Iterator[Engine]:
     """Return a file-backed database seeded with deterministic comparison runs."""
     engine = create_db_engine(f"sqlite:///{tmp_path / 'analytics.db'}")
-    Base.metadata.create_all(engine)
-    with Session(engine) as session:
-        seed_comparison_runs(session)
-    return engine
+    try:
+        Base.metadata.create_all(engine)
+        with Session(engine) as session:
+            seed_comparison_runs(session)
+        yield engine
+    finally:
+        engine.dispose()
 
 
 @pytest.fixture()
-def legacy_analytics_db(tmp_path: Path) -> Engine:
+def legacy_analytics_db(tmp_path: Path) -> Iterator[Engine]:
     """Return the explicit baseline for tests that intentionally need duplicate keys."""
     engine = _baseline_engine(tmp_path / "legacy-analytics.db")
-    with Session(engine) as session:
-        seed_comparison_runs(session)
-    return engine
+    try:
+        with Session(engine) as session:
+            seed_comparison_runs(session)
+        yield engine
+    finally:
+        engine.dispose()
