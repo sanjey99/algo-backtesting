@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import pairwise
@@ -11,7 +12,7 @@ from typing import Any, Protocol
 
 from src.engine.broker import SimulatedBroker
 from src.engine.context import StrategyContext
-from src.engine.event import FillEvent, SignalEvent
+from src.engine.event import Event, FillEvent, MarketEvent, OrderEvent, SignalEvent
 from src.engine.position_sizer import FixedQuantitySizer, PositionSizer
 from src.models.candle import Candle
 from src.models.order import Direction, Order, OrderType
@@ -90,6 +91,21 @@ class _PendingOrder:
 
     order: Order
     forced_cover: bool = False
+
+
+@dataclass
+class _RunState:
+    """Mutable state owned exclusively by one backtest run and its event queue."""
+
+    run_id: str
+    portfolio: Portfolio
+    broker: SimulatedBroker
+    strategy: Strategy
+    requested_symbol: str | None
+    position_sizer: PositionSizer
+    symbol: str
+    pending: _PendingOrder | None = None
+    forced_order_ids: set[int] = field(default_factory=set)
 
 
 # ---------------------------------------------------------------------------
@@ -180,65 +196,46 @@ class BacktestEngine:
 
         # A request-supplied symbol defines the instrument for the entire run.
         # Older direct callers retain their signal-derived behavior when omitted.
-        symbol = requested_symbol or "UNKNOWN"
-        pending: _PendingOrder | None = None
+        state = _RunState(
+            run_id=run_id,
+            portfolio=portfolio,
+            broker=broker,
+            strategy=strategy,
+            requested_symbol=requested_symbol,
+            position_sizer=position_sizer,
+            symbol=requested_symbol or "UNKNOWN",
+        )
+        events: deque[Event] = deque()
 
         for candle_index, candle in enumerate(candles):
             if candle_index > 0:
-                portfolio.accrue_short_borrow(candle.timestamp)
-            if pending is not None:
-                fill: FillEvent | None = broker.execute(pending.order, candle)
+                state.portfolio.accrue_short_borrow(candle.timestamp)
+            if state.pending is not None:
+                fill: FillEvent | None = state.broker.execute(state.pending.order, candle)
                 if fill is None:
                     log_event(
                         logger,
                         logging.DEBUG,
                         "order.untriggered",
-                        **self._order_fields(run_id, pending.order),
+                        **self._order_fields(run_id, state.pending.order),
                     )
-                    if pending.order.order_type not in (
+                    if state.pending.order.order_type not in (
                         OrderType.LIMIT,
                         OrderType.STOP,
                     ):
-                        pending = None
+                        state.pending = None
                 else:
-                    fill_outcome: FillOutcome = portfolio.record_fill(
-                        symbol=fill.symbol,
-                        direction=fill.direction,
-                        quantity=fill.quantity,
-                        fill_price=fill.fill_price,
-                        fill_date=fill.fill_date,
-                        commission=fill.commission,
-                    )
-                    if not fill_outcome.accepted:
-                        log_event(
-                            logger,
-                            logging.WARNING,
-                            "order.rejected",
-                            **self._order_fields(run_id, pending.order),
-                            reason=fill_outcome.rejection_reason,
-                        )
-                        # A typed rejection terminates the attempted order.
-                        pending = None
-                    else:
-                        log_event(
-                            logger,
-                            logging.DEBUG,
-                            "order.filled",
-                            **self._order_fields(run_id, pending.order),
-                            fill_price=fill.fill_price,
-                            commission=fill.commission,
-                        )
-                        symbol = fill.symbol
-                        pending = None
+                    events.append(fill)
+                    self._drain_events(events, state, candle)
 
-            portfolio.update({symbol: candle.close}, candle.timestamp)
+            state.portfolio.update({state.symbol: candle.close}, candle.timestamp)
 
-            if pending is None or not pending.forced_cover:
-                open_positions = portfolio.open_positions
+            if state.pending is None or not state.pending.forced_cover:
+                open_positions = state.portfolio.open_positions
                 if len(open_positions) == 1:
                     position_symbol, position = next(iter(open_positions.items()))
                     position_direction, position_quantity, *_ = position
-                    maintenance_ratio = portfolio.maintenance_ratio(position_symbol)
+                    maintenance_ratio = state.portfolio.maintenance_ratio(position_symbol)
                     if (
                         position_direction is Direction.SHORT
                         and maintenance_ratio is not None
@@ -251,23 +248,9 @@ class BacktestEngine:
                             order_type=OrderType.MARKET,
                             created_at=candle.timestamp,
                         )
-                        if pending is not None:
-                            log_event(
-                                logger,
-                                logging.DEBUG,
-                                "order.replaced",
-                                **self._order_fields(run_id, pending.order),
-                                replacement_order_type=forced_order.order_type,
-                                replacement_direction=forced_order.direction,
-                                replacement_quantity=forced_order.quantity,
-                            )
-                        pending = _PendingOrder(order=forced_order, forced_cover=True)
-                        log_event(
-                            logger,
-                            logging.DEBUG,
-                            "order.queued",
-                            **self._order_fields(run_id, forced_order),
-                        )
+                        state.forced_order_ids.add(id(forced_order))
+                        events.append(OrderEvent(forced_order))
+                        self._drain_events(events, state, candle)
                         log_event(
                             logger,
                             logging.WARNING,
@@ -279,61 +262,35 @@ class BacktestEngine:
                             maintenance_requirement=config.short_maintenance_margin,
                         )
 
-            context = self._build_context(portfolio, pending)
-            signal: SignalEvent | None = strategy.on_candle(candle, context)
+            events.append(MarketEvent(state.symbol, candle))
+            self._drain_events(events, state, candle)
 
-            if signal is not None and not (
-                pending is not None and pending.forced_cover
-            ):
-                order: Order | None = self._build_order(
-                    signal, portfolio, candle, requested_symbol, position_sizer
-                )
-                if order is not None:
-                    if pending is not None:
-                        log_event(
-                            logger,
-                            logging.DEBUG,
-                            "order.replaced",
-                            **self._order_fields(run_id, pending.order),
-                            replacement_order_type=order.order_type,
-                            replacement_direction=order.direction,
-                            replacement_quantity=order.quantity,
-                        )
-                    symbol = order.symbol
-                    pending = _PendingOrder(order=order)
-                    log_event(
-                        logger,
-                        logging.DEBUG,
-                        "order.queued",
-                        **self._order_fields(run_id, order),
-                    )
-
-        if pending is not None:
+        if state.pending is not None:
             log_event(
                 logger,
                 logging.DEBUG,
                 "order.cancelled_end_of_data",
-                **self._order_fields(run_id, pending.order),
+                **self._order_fields(run_id, state.pending.order),
             )
-            if pending.forced_cover:
+            if state.pending.forced_cover:
                 log_event(
                     logger,
                     logging.WARNING,
                     "margin.call_unresolved",
                     run_id=run_id,
-                    symbol=pending.order.symbol,
-                    quantity=pending.order.quantity,
+                    symbol=state.pending.order.symbol,
+                    quantity=state.pending.order.quantity,
                 )
 
         result = BacktestResult(
             strategy_name=strategy.name,
-            symbol=symbol,
+            symbol=state.symbol,
             start_date=candles[0].timestamp,
             end_date=candles[-1].timestamp,
             parameters=dict(strategy.parameters),
-            trades=portfolio.trades,
-            equity_curve=portfolio.equity_curve,
-            final_equity=portfolio.equity,
+            trades=state.portfolio.trades,
+            equity_curve=state.portfolio.equity_curve,
+            final_equity=state.portfolio.equity,
             initial_capital=config.initial_capital,
             run_id=run_id,
         )
@@ -343,7 +300,7 @@ class BacktestEngine:
             "backtest.completed",
             run_id=run_id,
             strategy=strategy.name,
-            symbol=symbol,
+            symbol=state.symbol,
             trade_count=len(result.trades),
             final_equity=result.final_equity,
         )
@@ -352,6 +309,126 @@ class BacktestEngine:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _drain_events(
+        self,
+        events: deque[Event],
+        state: _RunState,
+        candle: Candle,
+    ) -> None:
+        """Apply queued events in FIFO order at the current execution phase."""
+        while events:
+            self._dispatch_event(events.popleft(), events, state, candle)
+
+    def _dispatch_event(
+        self,
+        event: Event,
+        events: deque[Event],
+        state: _RunState,
+        candle: Candle,
+    ) -> None:
+        """Apply one real engine event, possibly queueing its downstream event."""
+        if isinstance(event, FillEvent):
+            self._handle_fill_event(event, state)
+            return
+
+        if isinstance(event, MarketEvent):
+            self._handle_market_event(event, events, state)
+            return
+
+        if isinstance(event, SignalEvent):
+            self._handle_signal_event(event, events, state, candle)
+            return
+
+        if isinstance(event, OrderEvent):
+            self._handle_order_event(event, state)
+            return
+
+        raise TypeError(f"Unsupported event type: {type(event).__name__}")
+
+    def _handle_fill_event(self, event: FillEvent, state: _RunState) -> None:
+        pending = state.pending
+        if pending is None:
+            raise RuntimeError("FillEvent dispatched without a pending order")
+        fill_outcome: FillOutcome = state.portfolio.record_fill(
+            symbol=event.symbol,
+            direction=event.direction,
+            quantity=event.quantity,
+            fill_price=event.fill_price,
+            fill_date=event.fill_date,
+            commission=event.commission,
+        )
+        if not fill_outcome.accepted:
+            log_event(
+                logger,
+                logging.WARNING,
+                "order.rejected",
+                **self._order_fields(state.run_id, pending.order),
+                reason=fill_outcome.rejection_reason,
+            )
+        else:
+            log_event(
+                logger,
+                logging.DEBUG,
+                "order.filled",
+                **self._order_fields(state.run_id, pending.order),
+                fill_price=event.fill_price,
+                commission=event.commission,
+            )
+            state.symbol = event.symbol
+        state.pending = None
+
+    def _handle_market_event(
+        self,
+        event: MarketEvent,
+        events: deque[Event],
+        state: _RunState,
+    ) -> None:
+        context = self._build_context(state.portfolio, state.pending)
+        signal = state.strategy.on_candle(event.candle, context)
+        if signal is not None:
+            events.append(signal)
+
+    def _handle_signal_event(
+        self,
+        event: SignalEvent,
+        events: deque[Event],
+        state: _RunState,
+        candle: Candle,
+    ) -> None:
+        if state.pending is not None and state.pending.forced_cover:
+            return
+        order = self._build_order(
+            event,
+            state.portfolio,
+            candle,
+            state.requested_symbol,
+            state.position_sizer,
+        )
+        if order is not None:
+            events.append(OrderEvent(order))
+
+    def _handle_order_event(self, event: OrderEvent, state: _RunState) -> None:
+        forced_cover = id(event.order) in state.forced_order_ids
+        state.forced_order_ids.discard(id(event.order))
+        if state.pending is not None:
+            log_event(
+                logger,
+                logging.DEBUG,
+                "order.replaced",
+                **self._order_fields(state.run_id, state.pending.order),
+                replacement_order_type=event.order.order_type,
+                replacement_direction=event.order.direction,
+                replacement_quantity=event.order.quantity,
+            )
+        state.symbol = event.order.symbol
+        state.pending = _PendingOrder(order=event.order, forced_cover=forced_cover)
+        log_event(
+            logger,
+            logging.DEBUG,
+            "order.queued",
+            **self._order_fields(state.run_id, event.order),
+        )
 
     @staticmethod
     def _order_fields(run_id: str, order: Order) -> dict[str, object]:

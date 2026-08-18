@@ -715,6 +715,77 @@ class TestBacktestEnginePositionSizing:
         assert result.trades[0].is_closed
 
 
+class TestBacktestEngineEventQueue:
+    def test_strategy_executes_while_its_market_event_is_dispatched(self) -> None:
+        class RecordingEngine(BacktestEngine):
+            def __init__(self) -> None:
+                self.dispatching_market = False
+
+            def _dispatch_event(self, event, queue, state, candle) -> None:
+                self.dispatching_market = isinstance(event, MarketEvent)
+                try:
+                    super()._dispatch_event(event, queue, state, candle)
+                finally:
+                    self.dispatching_market = False
+
+        class MarketPhaseStrategy:
+            name = "market-phase"
+            parameters: dict[str, object] = {}
+
+            def __init__(self, engine: RecordingEngine) -> None:
+                self.engine = engine
+                self.observed_market_dispatch: list[bool] = []
+
+            def on_candle(
+                self, candle: Candle, context: StrategyContext
+            ) -> SignalEvent | None:
+                del candle, context
+                self.observed_market_dispatch.append(self.engine.dispatching_market)
+                return None
+
+        engine = RecordingEngine()
+        strategy = MarketPhaseStrategy(engine)
+        engine.run(strategy, make_candle_series(3), BacktestConfig())
+
+        assert strategy.observed_market_dispatch == [True, True, True]
+
+    def test_dispatches_a_fresh_run_local_event_queue_in_execution_order(self) -> None:
+        class RecordingEngine(BacktestEngine):
+            def __init__(self) -> None:
+                self.dispatches: list[tuple[str, type[object], object, int]] = []
+
+            def _dispatch_event(self, event, queue, state, candle) -> None:
+                self.dispatches.append((state.run_id, type(event), queue, len(queue)))
+                super()._dispatch_event(event, queue, state, candle)
+
+        engine = RecordingEngine()
+        candles = [
+            _bar(0, 100.0, 101.0, 99.0, 100.0),
+            _bar(1, 110.0, 111.0, 109.0, 110.0),
+            _bar(2, 120.0, 121.0, 119.0, 120.0),
+        ]
+
+        first = engine.run(_BuyOnZeroSellOnOne(), candles, BacktestConfig())
+        second = engine.run(_BuyOnZeroSellOnOne(), candles, BacktestConfig())
+
+        dispatches_by_run: dict[str, list[tuple[type[object], object, int]]] = {}
+        for run_id, event_type, queue, queue_length in engine.dispatches:
+            dispatches_by_run.setdefault(run_id, []).append((event_type, queue, queue_length))
+
+        assert set(dispatches_by_run) == {first.run_id, second.run_id}
+        first_dispatches = dispatches_by_run[first.run_id]
+        first_types = [event_type for event_type, _, _ in first_dispatches]
+        first_queue = first_dispatches[0][1]
+        second_queue = dispatches_by_run[second.run_id][0][1]
+
+        assert first_types.index(MarketEvent) < first_types.index(SignalEvent)
+        assert first_types.index(SignalEvent) < first_types.index(OrderEvent)
+        assert first_types.index(OrderEvent) < first_types.index(FillEvent)
+        assert first_types.count(MarketEvent) == len(candles)
+        assert first_queue is not second_queue
+        assert all(queue_length == 0 for _, _, _, queue_length in engine.dispatches)
+
+
 class _BuyLimitThenCloseAfterFill:
     name = "limit-timing"
     parameters: dict[str, object] = {}
