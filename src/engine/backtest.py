@@ -12,6 +12,7 @@ from typing import Any, Protocol
 from src.engine.broker import SimulatedBroker
 from src.engine.context import StrategyContext
 from src.engine.event import FillEvent, SignalEvent
+from src.engine.position_sizer import FixedQuantitySizer, PositionSizer
 from src.models.candle import Candle
 from src.models.order import Direction, Order, OrderType
 from src.models.portfolio import EquityPoint, FillOutcome, Portfolio
@@ -118,6 +119,7 @@ class BacktestEngine:
         candles: list[Candle],
         config: BacktestConfig,
         symbol: str | None = None,
+        position_sizer: PositionSizer | None = None,
     ) -> BacktestResult:
         run_id = str(uuid.uuid4())
         try:
@@ -129,7 +131,14 @@ class BacktestEngine:
                 strategy=strategy.name,
                 bar_count=len(candles),
             )
-            return self._run(strategy, candles, config, run_id, symbol)
+            return self._run(
+                strategy,
+                candles,
+                config,
+                run_id,
+                symbol,
+                position_sizer if position_sizer is not None else FixedQuantitySizer(1),
+            )
         except Exception as error:
             log_event(
                 logger,
@@ -147,6 +156,7 @@ class BacktestEngine:
         config: BacktestConfig,
         run_id: str,
         requested_symbol: str | None,
+        position_sizer: PositionSizer,
     ) -> BacktestResult:
         if not candles:
             raise ValueError("candles list must not be empty")
@@ -276,7 +286,7 @@ class BacktestEngine:
                 pending is not None and pending.forced_cover
             ):
                 order: Order | None = self._build_order(
-                    signal, portfolio, candle, requested_symbol
+                    signal, portfolio, candle, requested_symbol, position_sizer
                 )
                 if order is not None:
                     if pending is not None:
@@ -363,11 +373,10 @@ class BacktestEngine:
         portfolio: Portfolio,
         candle: Candle,
         requested_symbol: str | None,
+        position_sizer: PositionSizer,
     ) -> Order | None:
         """Translate a signal into an opening or exact-position closing order."""
-        del candle
         execution_symbol = requested_symbol or signal.symbol
-        quantity = 1
         open_positions = portfolio.open_positions
 
         if open_positions:
@@ -375,6 +384,8 @@ class BacktestEngine:
             existing_direction, quantity, *_ = position
             if signal.direction is not existing_direction.opposite():
                 return None
+        else:
+            quantity = position_sizer.calculate(signal, portfolio, candle.close)
 
         return Order(
             symbol=execution_symbol,

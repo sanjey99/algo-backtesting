@@ -10,6 +10,11 @@ from src.engine.backtest import BacktestConfig, BacktestEngine
 from src.engine.broker import SimulatedBroker
 from src.engine.context import StrategyContext
 from src.engine.event import FillEvent, MarketEvent, OrderEvent, SignalEvent
+from src.engine.position_sizer import (
+    FixedFractionSizer,
+    FixedQuantitySizer,
+    KellyCriterionSizer,
+)
 from src.models.candle import Candle
 from src.models.order import Direction, Order, OrderType
 
@@ -643,6 +648,71 @@ class _BuyOnZeroSellOnOne:
         if index == 1 and context.position_direction is Direction.LONG:
             return SignalEvent("X", Direction.SHORT, timestamp=candle.timestamp)
         return None
+
+
+def _sizing_candles() -> list[Candle]:
+    return [
+        _bar(0, 80.0, 101.0, 79.0, 100.0),
+        _bar(1, 120.0, 151.0, 119.0, 150.0),
+        _bar(2, 150.0, 151.0, 149.0, 150.0),
+    ]
+
+
+def _sizing_config() -> BacktestConfig:
+    return BacktestConfig(initial_capital=10_000.0, commission_pct=0.0, slippage_pct=0.0)
+
+
+class TestBacktestEnginePositionSizing:
+    def test_default_sizer_retains_one_share_trade_compatibility(self) -> None:
+        result = BacktestEngine().run(_BuyOnZeroSellOnOne(), _sizing_candles(), _sizing_config())
+
+        assert result.trades[0].quantity == 1
+        assert result.final_equity == pytest.approx(10_030.0)
+
+    def test_fixed_quantity_sizer_controls_the_opening_fill(self) -> None:
+        result = BacktestEngine().run(
+            _BuyOnZeroSellOnOne(),
+            _sizing_candles(),
+            _sizing_config(),
+            position_sizer=FixedQuantitySizer(7),
+        )
+
+        assert result.trades[0].quantity == 7
+        assert result.trades[0].entry_date == _sizing_candles()[1].timestamp
+        assert result.final_equity == pytest.approx(10_210.0)
+
+    def test_fixed_fraction_sizer_uses_the_signal_bar_close_for_opening(self) -> None:
+        result = BacktestEngine().run(
+            _BuyOnZeroSellOnOne(),
+            _sizing_candles(),
+            _sizing_config(),
+            position_sizer=FixedFractionSizer(0.10),
+        )
+
+        assert result.trades[0].quantity == 10
+        assert result.final_equity == pytest.approx(10_300.0)
+
+    def test_kelly_fallback_sizes_from_the_fresh_run_portfolio(self) -> None:
+        result = BacktestEngine().run(
+            _BuyOnZeroSellOnOne(),
+            _sizing_candles(),
+            _sizing_config(),
+            position_sizer=KellyCriterionSizer(lookback=1),
+        )
+
+        assert result.trades[0].quantity == 2
+        assert result.final_equity == pytest.approx(10_060.0)
+
+    def test_close_uses_the_exact_filled_quantity_instead_of_resizing(self) -> None:
+        result = BacktestEngine().run(
+            _BuyOnZeroSellOnOne(),
+            _sizing_candles(),
+            _sizing_config(),
+            position_sizer=FixedFractionSizer(0.10),
+        )
+
+        assert result.trades[0].quantity == 10
+        assert result.trades[0].is_closed
 
 
 class _BuyLimitThenCloseAfterFill:
