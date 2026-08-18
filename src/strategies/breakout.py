@@ -7,7 +7,7 @@ from typing import Any
 from src.engine.context import StrategyContext
 from src.engine.event import SignalEvent
 from src.models.candle import Candle
-from src.models.order import Direction
+from src.models.order import Direction, OrderType
 from src.strategies.base import BaseStrategy
 
 
@@ -69,6 +69,8 @@ class BreakoutStrategy(BaseStrategy):
                 direction=Direction.LONG,
                 strength=1.0,
                 timestamp=candle.timestamp,
+                order_type=OrderType.STOP,
+                stop_price=self._prev_high,
             )
         elif (
             context.position_direction is Direction.LONG

@@ -8,7 +8,7 @@ import pytest
 from src.engine.context import StrategyContext
 from src.engine.event import SignalEvent
 from src.models.candle import Candle
-from src.models.order import Direction
+from src.models.order import Direction, OrderType
 from src.strategies import (
     STRATEGY_REGISTRY,
     BreakoutStrategy,
@@ -178,19 +178,6 @@ class TestMACrossoverStrategy:
 
 
 class TestRSIMeanReversionStrategy:
-    def _make_oversold_series(self, n_flat: int = 14, n_drop: int = 5) -> list[Candle]:
-        """Flat then sharp drop → RSI falls below oversold threshold."""
-        candles = []
-        start = datetime(2023, 1, 2)
-        # Flat period
-        for i in range(n_flat):
-            candles.append(make_candle_with_price(100.0, start + timedelta(days=i)))
-        # Sharp drop
-        for i in range(n_drop):
-            price = 100.0 - (i + 1) * 3.0
-            candles.append(make_candle_with_price(price, start + timedelta(days=n_flat + i)))
-        return candles
-
     def test_no_signal_during_warmup(self) -> None:
         s = RSIMeanReversionStrategy(period=14)
         context = StrategyContext()
@@ -202,60 +189,57 @@ class TestRSIMeanReversionStrategy:
             assert sig is None
 
     def test_long_signal_on_oversold(self) -> None:
-        """Sharp price drop should eventually push RSI below 30 and generate LONG."""
-        s = RSIMeanReversionStrategy(period=14, oversold=30.0)
+        """A seeded zero RSI opens a long position below the oversold threshold."""
+        s = RSIMeanReversionStrategy(period=3, oversold=30.0)
         context = StrategyContext()
-        signals = []
-        for c in self._make_oversold_series(n_flat=15, n_drop=10):
-            signals.append(s.on_candle(c, context))
+        prices = (100.0, 98.0, 96.0, 94.0)
 
-        long_signals = [
-            sig for sig in signals if sig is not None and sig.direction == Direction.LONG
+        signals = [
+            s.on_candle(
+                make_candle_with_price(price, datetime(2023, 1, index + 2)), context
+            )
+            for index, price in enumerate(prices)
         ]
-        # We expect at least one oversold trigger
-        assert len(long_signals) >= 0  # may or may not trigger depending on exact RSI
+
+        assert signals[-1] is not None
+        assert signals[-1].direction is Direction.LONG
+        assert signals[-1].strength == pytest.approx(1.0)
 
     def test_exit_signal_when_rsi_recovers(self) -> None:
-        """After LONG entry, RSI recovery above 50 should generate SHORT (exit)."""
-        s = RSIMeanReversionStrategy(period=5, oversold=40.0, exit_level=50.0)
+        """A long position closes when the Wilder-smoothed RSI recovers."""
+        s = RSIMeanReversionStrategy(period=3, oversold=30.0, exit_level=50.0)
         start = datetime(2023, 1, 2)
         empty_context = StrategyContext()
         long_context = StrategyContext(
             position_direction=Direction.LONG, position_quantity=1
         )
-        signals = []
 
-        # Flat start (warmup)
-        for i in range(5):
-            signals.append(
-                s.on_candle(
-                    make_candle_with_price(100.0, start + timedelta(days=i)), empty_context
-                )
+        for index, price in enumerate((100.0, 98.0, 96.0, 94.0)):
+            s.on_candle(
+                make_candle_with_price(price, start + timedelta(days=index)), empty_context
             )
+        exit_signal = s.on_candle(
+            make_candle_with_price(100.0, start + timedelta(days=4)), long_context
+        )
 
-        # Force entry — sharp drop below oversold
-        for i in range(6):
-            price = 100.0 - (i + 1) * 5.0
-            signals.append(
-                s.on_candle(
-                    make_candle_with_price(price, start + timedelta(days=5 + i)),
-                    empty_context,
-                )
+        assert exit_signal is not None
+        assert exit_signal.direction is Direction.SHORT
+
+    def test_rsi_uses_wilder_smoothing_after_the_initial_seed(self) -> None:
+        """Later values must retain the initial averages instead of reseeding a window."""
+        s = RSIMeanReversionStrategy(period=3, oversold=0.0)
+        context = StrategyContext()
+        prices = (100.0, 102.0, 101.0, 104.0, 103.0, 105.0)
+        observed: list[float] = []
+
+        for index, price in enumerate(prices):
+            s.on_candle(
+                make_candle_with_price(price, datetime(2023, 1, index + 2)), context
             )
+            if s._rsi is not None:
+                observed.append(s._rsi)
 
-        # Force exit — sharp recovery
-        for i in range(10):
-            price = 70.0 + (i + 1) * 5.0
-            signals.append(
-                s.on_candle(
-                    make_candle_with_price(price, start + timedelta(days=11 + i)),
-                    long_context,
-                )
-            )
-
-        non_none = [sig for sig in signals if sig is not None]
-        # Should have at least a LONG entry
-        assert len(non_none) >= 0  # permissive — depends on RSI math
+        assert observed == pytest.approx([83.3333333333, 66.6666666667, 79.1666666667])
 
     def test_reset_clears_state(self) -> None:
         s = RSIMeanReversionStrategy(period=5, oversold=30.0)
@@ -266,9 +250,16 @@ class TestRSIMeanReversionStrategy:
                 make_candle_with_price(100.0 - i, start + timedelta(days=i)), context
             )
         s.reset()
-        # After reset, should be in warmup
-        sig = s.on_candle(make_candle_with_price(100.0, start), context)
-        assert sig is None
+        assert s._avg_gain is None
+        assert s._avg_loss is None
+        assert s._rsi is None
+        assert all(
+            s.on_candle(
+                make_candle_with_price(100.0, start + timedelta(days=i)), context
+            )
+            is None
+            for i in range(3)
+        )
 
     def test_name_and_parameters(self) -> None:
         s = RSIMeanReversionStrategy(period=14, oversold=30.0)
@@ -316,7 +307,30 @@ class TestBreakoutStrategy:
         long_signals = [
             sig for sig in signals if sig is not None and sig.direction == Direction.LONG
         ]
-        assert len(long_signals) >= 1
+        assert len(long_signals) == 1
+        assert long_signals[0].order_type is OrderType.STOP
+        assert long_signals[0].stop_price == pytest.approx(100.5)
+
+    def test_breakout_stop_uses_the_prior_channel_high_not_current_bar_high(self) -> None:
+        s = BreakoutStrategy(lookback=3)
+        context = StrategyContext()
+        start = datetime(2023, 1, 2)
+
+        for index, (price, high) in enumerate(((10.0, 11.0), (11.0, 14.0), (12.0, 13.0))):
+            s.on_candle(
+                make_candle_with_price(
+                    price, start + timedelta(days=index), high_offset=high - price
+                ),
+                context,
+            )
+        signal = s.on_candle(
+            make_candle_with_price(15.0, start + timedelta(days=3), high_offset=35.0),
+            context,
+        )
+
+        assert signal is not None
+        assert signal.order_type is OrderType.STOP
+        assert signal.stop_price == 14.0
 
     def test_breakdown_generates_short_exit(self) -> None:
         """After LONG entry, price breaking below channel low → SHORT (exit)."""
@@ -345,6 +359,8 @@ class TestBreakoutStrategy:
         )
         assert exit_signal is not None
         assert exit_signal.direction == Direction.SHORT
+        assert exit_signal.order_type is OrderType.MARKET
+        assert exit_signal.stop_price is None
 
     def test_reset_clears_state(self) -> None:
         s = BreakoutStrategy(lookback=5)

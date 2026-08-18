@@ -1,7 +1,6 @@
-"""RSI Mean Reversion strategy — computed from scratch (no TA-Lib)."""
+"""RSI Mean Reversion strategy using incremental Wilder smoothing."""
 from __future__ import annotations
 
-from collections import deque
 from typing import Any
 
 from src.engine.context import StrategyContext
@@ -14,7 +13,7 @@ from src.strategies.base import BaseStrategy
 class RSIMeanReversionStrategy(BaseStrategy):
     """Buy when RSI falls below oversold threshold; exit when RSI recovers to 50.
 
-    RSI is computed from scratch using Wilder's exponential smoothing:
+    RSI is seeded once, then updated with Wilder's exponential smoothing:
       avg_gain = ((prev_avg_gain * (period-1)) + gain) / period
       avg_loss = ((prev_avg_loss * (period-1)) + loss) / period
       RS = avg_gain / avg_loss
@@ -45,33 +44,16 @@ class RSIMeanReversionStrategy(BaseStrategy):
             "oversold": oversold,
             "exit_level": exit_level,
         }
-        self._prices: deque[float] = deque(maxlen=period + 1)
+        self._previous_price: float | None = None
+        self._seed_gain_total = 0.0
+        self._seed_loss_total = 0.0
+        self._change_count = 0
         self._avg_gain: float | None = None
         self._avg_loss: float | None = None
         self._rsi: float | None = None
-        self._bar_count: int = 0
 
-    def _compute_rsi(self, prices: list[float]) -> float:
-        """Compute RSI from a price series using Wilder's smoothing."""
-        gains: list[float] = []
-        losses: list[float] = []
-        for i in range(1, len(prices)):
-            diff = prices[i] - prices[i - 1]
-            gains.append(max(diff, 0.0))
-            losses.append(max(-diff, 0.0))
-
-        if not gains:
-            return 50.0
-
-        # Seed with simple average over first period
-        avg_gain = sum(gains[:self.period]) / self.period
-        avg_loss = sum(losses[:self.period]) / self.period
-
-        # Wilder's smoothing for remaining periods
-        for gain, loss in zip(gains[self.period:], losses[self.period:]):
-            avg_gain = (avg_gain * (self.period - 1) + gain) / self.period
-            avg_loss = (avg_loss * (self.period - 1) + loss) / self.period
-
+    @staticmethod
+    def _rsi_from_averages(avg_gain: float, avg_loss: float) -> float:
         if avg_loss == 0:
             return 100.0
         rs = avg_gain / avg_loss
@@ -80,13 +62,28 @@ class RSIMeanReversionStrategy(BaseStrategy):
     def on_candle(
         self, candle: Candle, context: StrategyContext
     ) -> SignalEvent | None:
-        self._prices.append(candle.adj_close)
-        self._bar_count += 1
-
-        if self._bar_count < self.period + 1:
+        if self._previous_price is None:
+            self._previous_price = candle.adj_close
             return None
 
-        self._rsi = self._compute_rsi(list(self._prices))
+        change = candle.adj_close - self._previous_price
+        self._previous_price = candle.adj_close
+        gain = max(change, 0.0)
+        loss = max(-change, 0.0)
+        self._change_count += 1
+
+        if self._avg_gain is None or self._avg_loss is None:
+            self._seed_gain_total += gain
+            self._seed_loss_total += loss
+            if self._change_count < self.period:
+                return None
+            self._avg_gain = self._seed_gain_total / self.period
+            self._avg_loss = self._seed_loss_total / self.period
+        else:
+            self._avg_gain = (self._avg_gain * (self.period - 1) + gain) / self.period
+            self._avg_loss = (self._avg_loss * (self.period - 1) + loss) / self.period
+
+        self._rsi = self._rsi_from_averages(self._avg_gain, self._avg_loss)
 
         signal: SignalEvent | None = None
 
@@ -116,8 +113,10 @@ class RSIMeanReversionStrategy(BaseStrategy):
         return signal
 
     def reset(self) -> None:
-        self._prices.clear()
+        self._previous_price = None
+        self._seed_gain_total = 0.0
+        self._seed_loss_total = 0.0
+        self._change_count = 0
         self._avg_gain = None
         self._avg_loss = None
         self._rsi = None
-        self._bar_count = 0
