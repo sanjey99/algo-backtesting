@@ -194,11 +194,10 @@ Installed migration and query execution is exercised by
   --strict --python-version 3.12
 ```
 
-Both scoped commands are clean. The broader repository commands are not clean and are not claimed
-as passing gates for this feature: `ruff check src tests` reports the pre-existing baseline of 50
-findings in legacy non-feature modules and tests, including the API, dashboard, and data surfaces;
-`mypy src --strict --python-version 3.12` reports 34 errors in four legacy API, dashboard, and data
-files. These counts document existing repository debt separately from the SQL analytics layer.
+Both scoped commands are clean. The repository-wide `make lint` gate is also clean: Ruff passes
+across `src` and `tests`, and strict mypy passes across all source modules. Warning-promotion gates
+cover the API, database, and SQL analytics surfaces; current release evidence should be regenerated
+with the commands above rather than inferred from historical counts.
 
 ## Limitations
 

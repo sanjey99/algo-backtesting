@@ -1,8 +1,10 @@
 # Revisions: Gaps Between Design Docs and Implementation
 
-> **Purpose:** Machine-readable revision instructions for Claude Code.
-> Each revision is a self-contained task with exact file paths, what to change, and why.
-> Execute sequentially — later revisions may depend on earlier ones.
+> **Status (2026-08-18): Historical gap inventory, not an active sequential task list.**
+> The descriptions below capture the pre-remediation implementation. In particular, the run-local
+> event queue, integrated position sizing, and target-relative Sortino calculation are implemented.
+> Use current code, tests, and `BLOCKERS.md` for readiness decisions; preserve this document as the
+> provenance of earlier review findings.
 
 ---
 
@@ -184,13 +186,12 @@
 
 **Issue:** Sortino ratio should use returns below the *target return* (typically risk-free rate), not returns below zero. The current implementation filters on `arr < 0` (line 64). This means in a high-rate environment (risk_free=0.04), a return of +0.01% daily is treated as "not downside" even though it underperforms the risk-free rate.
 
-**Fix:** Change the filter to `arr < daily_rf` instead of `arr < 0`:
+**Resolution:** Implemented as target semideviation. Set above-target gaps to zero and compute the
+root mean square across *all* observations, so the denominator reflects both downside magnitude and
+frequency:
 ```python
-negative = arr[arr < daily_rf]
-```
-And compute downside deviation on `negative - daily_rf` to measure deviations below target:
-```python
-downside_std = float(np.std(negative - daily_rf, ddof=1))
+downside_gaps = np.minimum(arr - daily_rf, 0.0)
+downside_deviation = float(np.sqrt(np.mean(np.square(downside_gaps))))
 ```
 
 ---

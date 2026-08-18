@@ -4,7 +4,7 @@ date: "2026-03-21"
 tags:
   - project
   - project/algorithmic-trading-backtesting
-status: planning
+status: active
 domain: quantitative-finance
 target: Goldman Sachs, JP Morgan, Morgan Stanley — Quant Dev / Tech Analyst roles
 ---
@@ -23,8 +23,8 @@ Demonstrates: financial domain knowledge, data pipeline work, API integration, s
 - Walk-Forward validation and Permutation Testing (anti-overfitting)
 - Sharpe, CAGR, Max Drawdown, Profit Factor risk metrics
 - Historical market data via Yahoo Finance / Alpha Vantage
-- FastAPI backend, React/Streamlit frontend
-- PostgreSQL/SQLite for trade history persistence
+- FastAPI backend and Streamlit dashboard
+- SQLite persistence and direct SQL analytics; PostgreSQL is a future deployment option
 
 ## Differentiators vs. Tutorial Projects
 
@@ -47,9 +47,10 @@ Demonstrates: financial domain knowledge, data pipeline work, API integration, s
 ## Status
 
 - [x] Research complete
-- [ ] Blueprint
-- [ ] System design
-- [ ] Implementation
+- [x] Blueprint
+- [x] System design
+- [x] Core implementation
+- [ ] Native Windows verification (see `BLOCKERS.md`)
 
 ## Resources
 

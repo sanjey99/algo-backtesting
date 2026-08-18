@@ -171,7 +171,7 @@ optimization_stability = std(metric) / mean(metric) across windows
 2. For i in 1..1000 (parallelized across CPU cores via ProcessPoolExecutor):
      - Shuffle daily log-returns, reconstruct synthetic price series
      - Run same strategy on synthetic data → permuted_sharpe[i]
-3. p_value = count(permuted_sharpe >= actual_sharpe) / 1000
+3. p_value = (1 + count(permuted_sharpe >= actual_sharpe)) / (1000 + 1)
 4. p_value < 0.05 → result is statistically significant
 ```
 
@@ -185,7 +185,10 @@ optimization_stability = std(metric) / mean(metric) across windows
 
 **Rationale:**
 - **Execution realism.** Vectorized backtesting applies signals retroactively across entire columns — impossible to model path-dependent behavior: stop-losses that trigger mid-bar, position sizing that depends on current equity, or limit orders that only fill when price crosses a threshold.
-- **Live-backtest parity.** The only difference between backtest and live is swapping `SimulatedBroker` for a `LiveBroker`. Strategy, PositionSizer, Portfolio remain identical. This eliminates an entire class of bugs where strategies pass backtest but fail live.
+- **A path toward live-backtest parity.** Strategy, sizing, order, fill, and portfolio transitions are
+  explicit events that a future live adapter can reuse. A live broker is not implemented; production
+  parity would additionally require asynchronous market data, idempotent order submission,
+  reconnect handling, and broker-state reconciliation.
 - **Extensibility.** New order types, new event types, or new portfolio constraints can be added by extending the event hierarchy without modifying existing code.
 
 **Trade-off:** Event-driven is 10-100x slower than vectorized. Mitigation: add a `vectorized_signal()` fast-screening path on `BaseStrategy` for initial parameter sweeps.
@@ -229,15 +232,17 @@ optimization_stability = std(metric) / mean(metric) across windows
 
 ---
 
-### ADR-005: SQLite for Development, PostgreSQL for Production
+### ADR-005: SQLite as the Implemented Persistence Backend
 
-**Decision:** SQLAlchemy 2.0 ORM abstracting both backends via `DATABASE_URL` env var.
+**Decision:** SQLite is the only implemented, migrated, tested, and benchmarked backend. SQLAlchemy
+keeps a future PostgreSQL migration feasible, but backend portability is not currently claimed.
 
 **Rationale:**
 - SQLite: zero-setup dev, single file, no server. Removes the most common barrier to running/demoing the project.
-- PostgreSQL: concurrent writes, proper transaction isolation, production-grade. Switch = one env var change.
-- Four-table schema is fully portable — no database-specific features used.
-- Same pattern used at banks — demonstrates production engineering familiarity.
+- The SQL analytics layer deliberately uses SQLite plan evidence and migration contracts.
+- PostgreSQL would require a driver, dialect-specific migration verification, concurrency tests,
+  operational configuration, and fresh benchmark evidence; it is more than an environment-variable
+  change.
 
 ---
 
@@ -331,7 +336,11 @@ Phase 4 (Firm-wide): Kafka real-time data, GPU permutation testing (CuPy), RBAC
 
 ### 6.1 Survivorship Bias
 
-> "Yahoo Finance only provides data for companies that still exist today. If I backtest a stock-picking strategy on current S&P 500 constituents, I am implicitly excluding every company that went bankrupt, was delisted, or acquired at a loss. This creates systematic upward bias — potentially 1-2 percentage points annually, which is the difference between investable alpha and noise. My DataFetcher logs a warning when the symbol set matches a current index composition rather than a point-in-time composition. For production, I would use CRSP or Compustat survivorship-bias-free datasets."
+> "Yahoo Finance does not provide a point-in-time constituent universe. The acquisition pipeline
+> records provider provenance and quality warnings, but it cannot infer whether a caller supplied a
+> current-index or historical-index symbol set. Universe backtests must therefore provide
+> point-in-time membership externally; a production research stack would use a
+> survivorship-bias-aware dataset."
 
 ### 6.2 Permutation Testing
 
@@ -339,15 +348,27 @@ Phase 4 (Firm-wide): Kafka real-time data, GPU permutation testing (CuPy), RBAC
 
 ### 6.3 Execution Realism
 
-> "Most academic backtests assume frictionless execution. My engine models three friction layers. Slippage: 5 basis points adverse price impact per trade, applied directionally. Commission: 10 basis points of notional. Execution timing: signals are queued, MARKET orders first execute at a later bar's open, and persistent LIMIT/STOP orders use explicit intrabar and gap rules. These compound significantly — a strategy showing 8% annual return frictionless might show 3% after costs, which fails to beat a 4% risk-free rate. The SimulatedBroker implements the same interface as a LiveBroker, so I can swap in a real exchange connection without changing any other code."
+> "Most academic backtests assume frictionless execution. My engine models three friction layers:
+> directional slippage, notional commission, and next-bar execution. MARKET orders use a later
+> bar's open, while persistent LIMIT/STOP orders apply explicit intrabar and gap rules. The
+> `SimulatedBroker` isolates fill policy behind an execution boundary; a live adapter remains future
+> work and would add asynchronous submission and broker reconciliation."
 
 ### 6.4 Live-Backtest Parity
 
-> "The architecture decision I am most deliberate about is live-backtest parity. Event-driven processing means the backtest control flow is structurally identical to a live system: MarketEvent → Strategy → SignalEvent → PositionSizer → OrderEvent → Broker → FillEvent → Portfolio. In production, only `SimulatedBroker` changes to `LiveBroker`. Strategy, PositionSizer, and Portfolio run identical code. This eliminates an entire class of bugs — look-ahead bias, event ordering bugs, state management differences — that appear when backtest and live systems have fundamentally different architectures."
+> "The event pipeline makes execution order explicit: MarketEvent → Strategy → SignalEvent →
+> PositionSizer → OrderEvent, followed by a later eligible Broker fill → FillEvent → Portfolio. This
+> structure reduces backtest-only coupling and creates a reusable seam for future live integration.
+> It is not a claim that live trading is implemented; a production adapter must still solve
+> asynchronous delivery, idempotency, reconnects, and external-state reconciliation."
 
 ### 6.5 Why These Metrics Matter to Banks
 
-> "The risk metrics I compute map directly to regulatory requirements. Maximum drawdown and drawdown duration are central to VaR reporting under Basel III/IV. Sharpe and Sortino are how portfolio managers justify capital allocation to risk committees. Calmar ratio (CAGR ÷ max drawdown) captures return-per-unit-of-tail-risk that compliance teams use to assess strategy acceptability. Profit factor is what desk heads check to evaluate whether a strategy has edge or is lucky. By computing these from bar-by-bar returns, my numbers are directly comparable to how prime brokers and risk systems report — they could be dropped into an actual risk report without recalculation."
+> "The project computes common strategy-review measures from bar-by-bar equity returns: Sharpe,
+> target-relative Sortino, drawdown and duration, Calmar, win rate, and profit factor. These support
+> research and capital-allocation discussions, but they are not substitutes for VaR, expected
+> shortfall, stress testing, or regulatory-capital calculations. Any institutional report would
+> still need methodology, calendar, benchmark, and data-source alignment."
 
 ---
 

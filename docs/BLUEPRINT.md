@@ -1,6 +1,6 @@
 # Blueprint: SQL Analytics and Data Extraction Layer
 
-**Status:** Approved architecture; implementation not started
+**Status:** Implemented and verified for the accepted SQLite scope; checklist retained as history
 **Date:** 2026-08-04
 **Repository:** algo-backtesting
 **Architecture branch:** `blueprint/sql-analytics-layer`

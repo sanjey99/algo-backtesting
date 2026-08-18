@@ -1,5 +1,8 @@
 # Compatibility Warning Remediation Implementation Plan
 
+> **Status:** Implemented and verified. The unchecked steps below are retained as the original
+> execution plan; `make verify-warnings` is the authoritative regression gate.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Remove the known Starlette TestClient and SQLAlchemy UTC deprecation warnings through precise compatibility changes.
