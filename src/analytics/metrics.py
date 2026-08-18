@@ -53,25 +53,20 @@ def sortino_ratio(
 ) -> float:
     """Sharpe variant using only downside deviation in the denominator.
 
-    Downside deviation uses only negative (below zero) returns, per spec.
-    Returns 0.0 if no negative returns or fewer than 2 returns.
+    Downside deviation is target semideviation relative to the daily risk-free
+    rate, averaged across all observations. Returns 0.0 for fewer than two
+    observations or negligible downside deviation.
     """
     if len(returns) < 2:
         return 0.0
     arr = np.array(returns, dtype=float)
     daily_rf = risk_free_rate / periods_per_year
-    # Downside: only bars with negative returns (not excess)
-    negative = arr[arr < 0]
-    if len(negative) == 0:
-        return 0.0
-    if len(negative) == 1:
-        downside_std = float(np.abs(negative[0]))
-    else:
-        downside_std = float(np.std(negative, ddof=1))
-    if downside_std == 0:
+    downside_gaps = np.minimum(arr - daily_rf, 0.0)
+    downside_deviation = float(np.sqrt(np.mean(np.square(downside_gaps))))
+    if downside_deviation < 1e-10:
         return 0.0
     excess_mean = float(np.mean(arr)) - daily_rf
-    return float(excess_mean / downside_std * math.sqrt(periods_per_year))
+    return float(excess_mean / downside_deviation * math.sqrt(periods_per_year))
 
 
 def cagr(equity_curve: list[EquityPoint], periods_per_year: int = 252) -> float:

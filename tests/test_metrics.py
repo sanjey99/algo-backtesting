@@ -5,6 +5,8 @@ import math
 import uuid
 from datetime import datetime
 
+import pytest
+
 from src.analytics.metrics import (
     cagr,
     calmar_ratio,
@@ -143,8 +145,24 @@ class TestSortinoRatio:
         assert sortino_ratio([0.05]) == 0.0
 
     def test_all_positive_returns_zero(self):
-        """No negative returns → downside std is zero → return 0.0."""
+        """Returns all above the daily target have no downside deviation."""
         assert sortino_ratio([0.01] * 50) == 0.0
+
+    def test_positive_return_below_target_contributes_to_downside(self):
+        """A positive bar below the target must not be treated as zero downside."""
+        result = sortino_ratio([0.005, 0.025], risk_free_rate=0.12, periods_per_year=12)
+
+        # Daily target = 0.01; gaps = [-0.005, 0.0]; semideviation = 0.005 / sqrt(2).
+        assert result == pytest.approx(math.sqrt(24.0))
+
+    def test_downside_semideviation_uses_all_observations(self):
+        """One downside gap is averaged across every period, not just downside bars."""
+        result = sortino_ratio(
+            [-0.01, 0.03, 0.03, 0.03], risk_free_rate=0.0, periods_per_year=1
+        )
+
+        # Gaps = [-0.01, 0, 0, 0], semideviation = 0.005, excess mean = 0.02.
+        assert result == pytest.approx(4.0)
 
     def test_known_mixed_returns(self):
         import numpy as np
@@ -152,9 +170,9 @@ class TestSortinoRatio:
         r = [0.01, -0.005, 0.008, -0.012, 0.003] * 20
         arr = np.array(r)
         daily_rf = 0.04 / 252
-        negative = arr[arr < 0]
-        downside_std = float(np.std(negative, ddof=1))
-        expected = (float(arr.mean()) - daily_rf) / downside_std * math.sqrt(252)
+        gaps = np.minimum(arr - daily_rf, 0.0)
+        downside_deviation = float(np.sqrt(np.mean(np.square(gaps))))
+        expected = (float(arr.mean()) - daily_rf) / downside_deviation * math.sqrt(252)
         result = sortino_ratio(r)
         assert math.isclose(result, expected, rel_tol=1e-9)
 
