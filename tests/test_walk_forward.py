@@ -149,7 +149,7 @@ class TestWalkForwardAnalyzer:
     def test_empty_backtest_fallback_uses_utc_timestamps(self) -> None:
         analyzer = WalkForwardAnalyzer(MACrossoverStrategy)
 
-        result = analyzer._run_backtest([], {})
+        result = analyzer._run_backtest([], {"fast_period": 20, "slow_period": 5})
 
         assert result.start_date.tzinfo is UTC
         assert result.end_date.tzinfo is UTC
@@ -185,4 +185,18 @@ class TestWalkForwardAnalyzer:
         monkeypatch.setattr(BacktestEngine, "run", fail_run)
 
         with pytest.raises(RuntimeError, match="engine invariant violated"):
+            analyzer._run_backtest(make_trending_candles(2), {})
+
+    def test_engine_value_error_is_propagated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Engine validation failures must not be classified as bad strategy parameters."""
+        analyzer = WalkForwardAnalyzer(MACrossoverStrategy)
+
+        def fail_run(*_: object, **__: object) -> None:
+            raise ValueError("engine data invariant violated")
+
+        monkeypatch.setattr(BacktestEngine, "run", fail_run)
+
+        with pytest.raises(ValueError, match="engine data invariant violated"):
             analyzer._run_backtest(make_trending_candles(2), {})

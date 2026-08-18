@@ -92,8 +92,6 @@ class WalkForwardAnalyzer:
     def _run_backtest(self, candles: list[Candle], params: dict[str, Any]) -> BacktestResult:
         try:
             strategy = self.strategy_cls(**params)
-            engine = BacktestEngine()
-            return engine.run(strategy, candles, self.config, symbol=self.symbol)
         except ValueError as error:
             # Invalid param combo (e.g., fast >= slow) — return empty result
             log_event(
@@ -117,6 +115,9 @@ class WalkForwardAnalyzer:
                 final_equity=self.config.initial_capital,
                 initial_capital=self.config.initial_capital,
             )
+
+        engine = BacktestEngine()
+        return engine.run(strategy, candles, self.config, symbol=self.symbol)
 
     def _optimize_window(self, train_candles: list[Candle]) -> dict[str, Any]:
         """Random search over parameter_space; return best params."""
