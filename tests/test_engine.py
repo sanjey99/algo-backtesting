@@ -758,6 +758,64 @@ def test_margin_forced_cover_cannot_be_replaced_by_strategy_order() -> None:
     assert result.trades[0].exit_price == 1_100.0
 
 
+def test_margin_call_replaces_unfilled_gtc_cover_in_lifecycle_order(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A margin call supersedes a live conditional cover before the next open."""
+    strategy = _ScheduledSignals(
+        {
+            0: (Direction.SHORT, OrderType.MARKET, None),
+            1: (Direction.LONG, OrderType.LIMIT, 1.0),
+        }
+    )
+    candles = [
+        _bar(0, 100, 100, 100, 100),
+        _bar(1, 100, 100, 100, 100),
+        _bar(2, 1_000, 1_000, 1_000, 1_000),
+        _bar(3, 1_100, 1_100, 1_100, 1_100),
+    ]
+
+    with caplog.at_level(logging.DEBUG):
+        result = BacktestEngine().run(strategy, candles, _margin_config())
+
+    assert len(result.trades) == 1
+    assert result.trades[0].direction is Direction.SHORT
+    assert result.trades[0].exit_date == candles[3].timestamp
+    assert result.trades[0].exit_price == 1_100.0
+
+    lifecycle = [
+        (index, getattr(record, "event", None), getattr(record, "event_fields", {}))
+        for index, record in enumerate(caplog.records)
+    ]
+
+    def event_index(event: str, **expected_fields: object) -> int:
+        return next(
+            index
+            for index, actual_event, fields in lifecycle
+            if actual_event == event
+            and isinstance(fields, dict)
+            and all(fields.get(name) == value for name, value in expected_fields.items())
+        )
+
+    untriggered = event_index("order.untriggered", order_type="LIMIT", direction="LONG")
+    replaced = event_index(
+        "order.replaced",
+        order_type="LIMIT",
+        direction="LONG",
+        replacement_order_type="MARKET",
+        replacement_direction="LONG",
+        replacement_quantity=1,
+    )
+    forced_queued = event_index("order.queued", order_type="MARKET", direction="LONG")
+    margin_queued = event_index("margin.call_queued", symbol="X", quantity=1)
+    forced_filled = event_index("order.filled", order_type="MARKET", direction="LONG")
+
+    assert untriggered < replaced < forced_queued < margin_queued < forced_filled
+    events = [event for _, event, _ in lifecycle]
+    assert "margin.call_unresolved" not in events
+    assert "order.cancelled_end_of_data" not in events
+
+
 class _ScheduledSignals:
     name = "scheduled"
     parameters: dict[str, object] = {}
