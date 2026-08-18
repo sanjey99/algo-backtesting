@@ -315,3 +315,43 @@ def test_configure_logging_falls_back_to_info_for_unsupported_level() -> None:
         for handler in created_handlers:
             handler.close()
         root.setLevel(before_level)
+
+
+@pytest.mark.parametrize(
+    ("level", "expected_level"),
+    [("", logging.INFO), (None, logging.DEBUG)],
+    ids=("explicit-empty-falls-back-to-info", "none-inherits-environment"),
+)
+def test_configure_logging_distinguishes_empty_override_from_none(
+    level: str | None,
+    expected_level: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only ``None`` delegates logging-level selection to the environment."""
+    root = logging.getLogger()
+    before_handlers = list(root.handlers)
+    before_level = root.level
+    created_handlers: list[logging.Handler] = []
+    try:
+        root.handlers[:] = [
+            handler
+            for handler in before_handlers
+            if not getattr(handler, "_algo_json_handler", False)
+        ]
+        root.setLevel(logging.WARNING)
+        monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+
+        configure_logging(level)
+
+        marked_handlers = [
+            handler for handler in root.handlers if getattr(handler, "_algo_json_handler", False)
+        ]
+        created_handlers = [handler for handler in root.handlers if handler not in before_handlers]
+
+        assert len(marked_handlers) == 1
+        assert root.level == expected_level
+    finally:
+        root.handlers[:] = before_handlers
+        for handler in created_handlers:
+            handler.close()
+        root.setLevel(before_level)

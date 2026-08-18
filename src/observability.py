@@ -154,7 +154,7 @@ def configure_logging(level: str | None = None) -> None:
     if any(getattr(handler, "_algo_json_handler", False) for handler in root.handlers):
         return
 
-    selected = (level or os.environ.get("LOG_LEVEL", "INFO")).upper()
+    selected = (os.environ.get("LOG_LEVEL", "INFO") if level is None else level).upper()
     numeric_level = logging.getLevelNamesMapping().get(selected, logging.INFO)
     handler = logging.StreamHandler()
     handler.setFormatter(JsonFormatter())
