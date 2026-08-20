@@ -23,6 +23,7 @@
 │                     APPLICATION ENTRY PATHS                            │
 │  Streamlit handlers               FastAPI REST routes                   │
 │  Shared canonical AcquisitionService                                    │
+│  GET  /api/backtest?limit={1..50}                                       │
 │  GET  /api/backtest/{id}/trades                                         │
 │  GET  /api/backtest/{id}/equity-curve                                   │
 │  POST /api/backtest/walk-forward                                        │
@@ -256,6 +257,7 @@ keeps a future PostgreSQL migration feasible, but backend portability is not cur
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `POST` | `/backtest` | Run a backtest, persist, return metrics |
+| `GET` | `/backtest?limit={limit}` | List recent runs (`limit` defaults to and cannot exceed 50) |
 | `GET` | `/backtest/{run_id}` | Retrieve a saved run |
 | `GET` | `/backtest/{run_id}/trades` | Full trade list |
 | `GET` | `/backtest/{run_id}/equity-curve` | Full equity curve as JSON |
@@ -314,6 +316,9 @@ their mathematical semantics internally, including an infinite profit factor whe
 profits but no losses. Because JSON has no portable representation for non-finite numbers, API
 response fields declare those metric values as nullable and serialize a non-finite result as
 `null`.
+
+The recent-runs endpoint accepts a `limit` from 1 through 50 and defaults to 50. Values outside
+that range return `422 Unprocessable Entity` before querying SQLite.
 
 ---
 

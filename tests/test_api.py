@@ -200,6 +200,18 @@ class TestHealth:
 
 
 class TestOpenAPIContract:
+    def test_backtest_list_limit_is_bounded(self, client: TestClient) -> None:
+        operation = client.get("/openapi.json").json()["paths"]["/api/backtest"]["get"]
+        limit_parameter = next(
+            parameter for parameter in operation["parameters"] if parameter["name"] == "limit"
+        )
+
+        schema = limit_parameter["schema"]
+        assert schema["type"] == "integer"
+        assert schema["minimum"] == 1
+        assert schema["maximum"] == 50
+        assert schema["default"] == 50
+
     def test_non_finite_analytics_are_declared_as_nullable_numbers(
         self, client: TestClient
     ) -> None:
@@ -438,6 +450,56 @@ class TestListBacktests:
         r = client.get("/api/backtest")
         assert r.status_code == 200
         assert isinstance(r.json(), list)
+
+    def test_list_honors_valid_limit(self, client: TestClient) -> None:
+        with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
+            for symbol in ("AAPL", "MSFT"):
+                response = client.post("/api/backtest", json={
+                    "strategy": "ma_crossover",
+                    "symbol": symbol,
+                    "start": "2020-01-01",
+                    "end": "2022-12-31",
+                })
+                assert response.status_code == 201
+
+        for limit in (1, 2):
+            response = client.get("/api/backtest", params={"limit": limit})
+
+            assert response.status_code == 200
+            assert len(response.json()) == limit
+
+    def test_list_rejects_invalid_limit_without_querying(self, client: TestClient) -> None:
+        statements: list[str] = []
+
+        def record_statement(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: bool,
+        ) -> None:
+            statements.append(statement)
+
+        event.listen(_engine, "before_cursor_execute", record_statement)
+        try:
+            response = client.get("/api/backtest", params={"limit": -1})
+        finally:
+            event.remove(_engine, "before_cursor_execute", record_statement)
+
+        assert response.status_code == 422
+        assert statements == []
+
+    @pytest.mark.parametrize(
+        ("limit", "expected_status"),
+        [(1, 200), (50, 200), (0, 422), (-1, 422), (51, 422), ("invalid", 422)],
+    )
+    def test_list_enforces_bounded_limit(
+        self, client: TestClient, limit: int | str, expected_status: int
+    ) -> None:
+        response = client.get("/api/backtest", params={"limit": limit})
+
+        assert response.status_code == expected_status
 
 
 # ---------------------------------------------------------------------------
