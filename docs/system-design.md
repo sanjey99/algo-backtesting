@@ -17,12 +17,12 @@
 │  │ MaxDD)   │ │ Overlay  │ │  exits)   │ │        │ │              │  │
 │  └──────────┘ └──────────┘ └───────────┘ └────────┘ └──────────────┘  │
 └──────────────────────────────┬──────────────────────────────────────────┘
-                               │ HTTP (localhost:8000)
+                               │ in-process calls
                                ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                         FASTAPI REST API                                │
-│  POST /api/backtest          GET /api/strategies                        │
-│  GET  /api/backtest/{id}     POST /api/data/fetch                       │
+│                     APPLICATION ENTRY PATHS                            │
+│  Streamlit handlers               FastAPI REST routes                   │
+│  Shared canonical AcquisitionService                                    │
 │  GET  /api/backtest/{id}/trades                                         │
 │  GET  /api/backtest/{id}/equity-curve                                   │
 │  POST /api/backtest/walk-forward                                        │
@@ -36,9 +36,9 @@
 │  BacktestEngine.run(strategy, data, config)                               │
 │    │                                                                      │
 │    │  ┌─────────────┐    ┌─────────────┐    ┌──────────────┐              │
-│    ├──► DataFetcher  │    │  Strategy    │    │ PositionSizer│              │
-│    │  │ (YFinance /  │    │ (MA Cross /  │    │ (Kelly /     │              │
-│    │  │  AlphaVant.) │    │  RSI / Brkot)│    │  FixedFrac)  │              │
+│    ├──► Candle Input │    │  Strategy    │    │ PositionSizer│              │
+│    │  │ (validated   │    │ (MA Cross /  │    │ (Kelly /     │              │
+│    │  │ daily OHLCV) │    │  RSI / Brkot)│    │  FixedFrac)  │              │
 │    │  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘              │
 │    │         │                   │                    │                     │
 │    │         ▼                   ▼                    ▼                     │
@@ -97,11 +97,15 @@
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
+The dashboard executes acquisition, engine, and analytics calls in-process; it does not call the
+FastAPI application over HTTP. Both entry points use the same canonical `AcquisitionService` and
+engine boundaries.
+
 ### Component Responsibilities
 
 | Component | Responsibility | Key Abstraction |
 |-----------|---------------|-----------------|
-| **DataFetcher** | Fetch, cache (parquet), and adjust historical OHLCV data | `DataFetcher` ABC with `YFinanceFetcher` and `AlphaVantageFetcher` |
+| **AcquisitionService** | Admit, fetch, normalize, quality-check, cache, and record historical OHLCV data | Capability-aware providers, immutable `DataStore` generations, and acquisition manifests |
 | **BacktestEngine** | Orchestrate bar-by-bar event loop; wire strategy, broker, portfolio | `BacktestEngine.run()` returns `BacktestResult` |
 | **Strategy** | Consume a candle plus immutable execution context and emit `SignalEvent` based on indicator logic | `BaseStrategy` ABC with `on_candle(candle, context)` and `parameter_space` |
 | **SimulatedBroker** | Convert `OrderEvent` to `FillEvent` with realistic slippage and commission | Models MARKET, LIMIT, STOP order types |
@@ -119,14 +123,13 @@
 ### Single Backtest Request: Step-by-Step
 
 ```
-Client (Dashboard / curl)
-  │
-  │  POST /api/backtest
-  │  { strategy: "ma_crossover", symbol: "SPY", ... }
-  │
-  ▼
-Step 1: API Layer — validate BacktestRequest schema, resolve strategy class
-Step 2: DataFetcher — check parquet cache; if miss, fetch + adjust + validate + cache
+API client ──HTTP──► FastAPI route ──┐
+                                      ├──► shared application flow
+Dashboard user ────► Streamlit handler ─┘
+
+Step 1: Entry point — validate inputs and resolve the strategy class
+Step 2: AcquisitionService — validate the request; verify/reuse canonical cache ranges; fetch,
+        normalize, quality-check, publish, and record any missing or stale sessions
 Step 3: BacktestEngine.run() — initialize Portfolio, Strategy, Broker, PositionSizer
 Step 4: Bar-by-bar Event Loop
   ├── 4a. Accrue short borrow from the previous mark to this candle
@@ -140,8 +143,8 @@ Step 4: Bar-by-bar Event Loop
   └── 4g. Size and enqueue the signal's order for execution on a later bar
 Step 5: Engine returns BacktestResult { trades, equity_curve, final_equity }
 Step 6: Analytics — compute_all_metrics(result) → dict[str, float]
-Step 7: DB — save_backtest_run() in single transaction (runs + trades + curve + metrics)
-Step 8: API Response — BacktestResponse with run_id, metrics, sub-resource links
+Step 7: API only — save_backtest_run() in one transaction; dashboard retains session state
+Step 8: API serializes the response; dashboard renders the in-process result
 ```
 
 A signal generated on bar N cannot execute on bar N. Its first eligible execution is a later bar;

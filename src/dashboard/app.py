@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import date
-from typing import TypedDict, cast
+from typing import TYPE_CHECKING, TypedDict, cast
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -34,6 +34,9 @@ from src.models.portfolio import EquityPoint
 from src.models.trade import Trade
 from src.observability import configure_logging
 from src.strategies import STRATEGY_REGISTRY
+
+if TYPE_CHECKING:
+    from src.data.acquisition import AcquisitionService
 
 type Metrics = dict[str, float]
 
@@ -62,25 +65,30 @@ st.set_page_config(
 
 
 # ---------------------------------------------------------------------------
-# Helper — run backtest inline (no API dependency for dashboard)
+# Helper — run backtest inline (no HTTP dependency for dashboard)
 # ---------------------------------------------------------------------------
 
-def _fetch_candles(symbol: str, start: str, end: str) -> list[Candle]:
-    from datetime import datetime
-
+def _fetch_candles(
+    symbol: str,
+    start: str,
+    end: str,
+    *,
+    service: AcquisitionService | None = None,
+) -> list[Candle]:
     from src.data import df_to_candles
-    from src.data.fetcher import YFinanceFetcher
-    from src.data.store import DataStore
+    from src.data.contracts import AcquisitionRequest
 
-    fetcher = YFinanceFetcher()
-    store = DataStore()
-    df = store.fetch_or_cache(
+    if service is None:
+        from src.data.wiring import get_acquisition_service
+
+        service = get_acquisition_service()
+    request = AcquisitionRequest(
         symbol,
-        datetime.fromisoformat(start),
-        datetime.fromisoformat(end),
-        fetcher,
+        date.fromisoformat(start),
+        date.fromisoformat(end),
     )
-    return df_to_candles(df)
+    result = service.acquire(request)
+    return df_to_candles(result.frame)
 
 
 def _run_backtest(

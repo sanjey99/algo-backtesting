@@ -15,7 +15,6 @@ from typing import Any, NoReturn
 
 import pandas as pd
 
-from src.api.deps import create_acquisition_service
 from src.data.acquisition import AcquisitionService
 from src.data.benchmark import run_deterministic_benchmark
 from src.data.contracts import (
@@ -32,6 +31,7 @@ from src.data.contracts import (
     QualityError,
     json_safe,
 )
+from src.data.wiring import create_acquisition_service
 from src.observability import configure_logging
 
 EXIT_OK = 0
