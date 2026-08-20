@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Annotated, Any
+from typing import Annotated, Any, Final
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from src.analytics.metrics import compute_all_metrics
@@ -50,6 +50,7 @@ router = APIRouter(prefix="/api/backtest", tags=["backtest"])
 
 DBDep = Annotated[Session, Depends(get_db)]
 AcquisitionDep = Annotated[AcquisitionService, Depends(get_acquisition_service)]
+MAX_BACKTEST_LIST_LIMIT: Final = 50
 
 
 def _fetch_candles(
@@ -167,7 +168,10 @@ def run_backtest(
 
 
 @router.get("", response_model=list[BacktestSummary])
-def list_runs(db: DBDep, limit: int = 50) -> list[BacktestSummary]:
+def list_runs(
+    db: DBDep,
+    limit: Annotated[int, Query(ge=1, le=MAX_BACKTEST_LIST_LIMIT)] = MAX_BACKTEST_LIST_LIMIT,
+) -> list[BacktestSummary]:
     runs = list_backtest_runs(db, limit=limit)
     result = []
     for run in runs:
