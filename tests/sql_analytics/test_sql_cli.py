@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 from sqlalchemy import inspect, update
@@ -243,7 +244,8 @@ def test_compare_converts_database_path_and_writes_exact_metadata(
 
     assert code == 0
     expected_database = str(_database_path(analytics_db).resolve())
-    assert calls == [f"sqlite:///file:{expected_database}?uri=true"]
+    encoded_database = quote(expected_database, safe="/")
+    assert calls == [f"sqlite:///file:{encoded_database}?uri=true"]
     rows = csv_path.read_text(encoding="utf-8").splitlines()
     assert rows[0].startswith("run_id,strategy_name,symbol,start_date,end_date,")
     assert len(rows) == 3
@@ -274,8 +276,8 @@ def test_compare_converts_database_path_and_writes_exact_metadata(
 def test_compare_escapes_sqlite_filename_url_metacharacters(
     analytics_db: Engine, tmp_path: Path
 ) -> None:
-    """A question mark in a valid filename must not become a SQLAlchemy URL query."""
-    database = tmp_path / "analytics?copy.db"
+    """A URL fragment marker in a valid filename must stay part of the SQLite path."""
+    database = tmp_path / "analytics#copy.db"
     shutil.copyfile(_database_path(analytics_db), database)
     csv_path = tmp_path / "escaped.csv"
     metadata_path = tmp_path / "escaped.json"
@@ -283,6 +285,13 @@ def test_compare_escapes_sqlite_filename_url_metacharacters(
     assert sql_cli.main(_compare_args(database, csv_path, metadata_path)) == 0
     assert json.loads(metadata_path.read_text(encoding="utf-8"))["database_identifier"] == str(
         database.resolve()
+    )
+
+
+def test_sqlite_url_escapes_query_delimiter_without_platform_filesystem_assumptions() -> None:
+    """A filename question mark must not become SQLAlchemy's URI query delimiter."""
+    assert sql_cli._sqlite_url(Path("analytics?copy.db")) == (
+        "sqlite:///file:analytics%3Fcopy.db?uri=true"
     )
 
 

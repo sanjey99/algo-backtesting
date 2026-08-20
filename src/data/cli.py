@@ -31,6 +31,7 @@ from src.data.contracts import (
     QualityError,
     json_safe,
 )
+from src.data.durability import fsync_directory
 from src.data.wiring import create_acquisition_service
 from src.observability import configure_logging
 
@@ -219,11 +220,7 @@ def _atomic_write(destination: Path, writer: Callable[[Path], None]) -> None:
         finally:
             os.close(descriptor)
         os.replace(temporary, destination)
-        directory = os.open(destination.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        fsync_directory(destination.parent)
     except ArtifactError:
         raise
     except (OSError, ValueError, TypeError) as error:

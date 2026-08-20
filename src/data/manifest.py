@@ -21,6 +21,7 @@ from src.data.contracts import (
     ManifestError,
     json_safe,
 )
+from src.data.durability import fsync_directory
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -80,7 +81,7 @@ class ManifestRepository:
         return AcquisitionAdmission(acquisition_id, request, admitted_at)
 
     def archive(self, manifest: AcquisitionManifest) -> Path:
-        """Atomically append a complete report, rejecting identifier reuse."""
+        """Namespace-atomically append a complete report, rejecting identifier reuse."""
         if manifest.started_at is None or manifest.completed_at is None:
             raise ArtifactError("admitted reports require started_at and completed_at")
         return self.archive_document(manifest.acquisition_id, manifest.to_dict())
@@ -125,7 +126,7 @@ class ManifestRepository:
                         ) from None
             finally:
                 temporary.unlink(missing_ok=True)
-            _fsync_directory(destination.parent)
+            fsync_directory(destination.parent)
         except ArtifactError:
             raise
         except OSError as error:
@@ -164,7 +165,7 @@ class ManifestRepository:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, target)
-            _fsync_directory(target.parent)
+            fsync_directory(target.parent)
         except OSError:
             return "optional manifest copy failed"
         return None
@@ -192,11 +193,3 @@ def _json_bytes(value: Mapping[str, Any]) -> bytes:
         return f"{serialized}\n".encode()
     except (TypeError, ValueError) as error:
         raise ArtifactError("manifest is not deterministic JSON") from error
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)

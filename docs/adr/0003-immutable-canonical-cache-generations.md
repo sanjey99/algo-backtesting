@@ -29,3 +29,9 @@ embedded publication manifest has been archived.
 - Failed refreshes preserve the last valid data.
 - Locking, rebasing, hashing, pointer validation, and old-generation cleanup require focused tests.
 - A bounded number of prior generations may consume temporary extra disk space.
+- POSIX publication fsyncs files and leaf publication directories, providing stronger crash
+  ordering when the ancestor hierarchy is already durable; recursively created ancestors are not
+  individually fsynced. Windows fsyncs file contents and preserves namespace-atomic visibility
+  during normal operation, but its directory metadata durability across sudden power loss is
+  best-effort because Python does not expose a supported directory-fsync descriptor. Readers fail
+  closed on incomplete evidence on either platform.

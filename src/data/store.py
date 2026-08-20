@@ -30,6 +30,7 @@ from src.data.contracts import (
     ContractViolationError,
     json_safe,
 )
+from src.data.durability import fsync_directory
 from src.data.fetcher import DataFetcher
 from src.data.manifest import ManifestRepository
 from src.data.store_artifacts import (
@@ -271,7 +272,7 @@ class DataStore:
                 warnings.append(f"cleanup failed for generation {path.name}")
         if removed:
             try:
-                _fsync_directory(generations)
+                fsync_directory(generations)
             except OSError:
                 warnings.append("generation cleanup directory sync failed")
         return CleanupResult(tuple(sorted(removed)), tuple(warnings))
@@ -312,7 +313,7 @@ class DataStore:
                 document = self._pinned_embedded_manifest(namespace, generation_id, acquisition_id)
                 self._manifest_repository.archive_document(acquisition_id, document)
                 pin_path.unlink()
-                _fsync_directory(pin_path.parent)
+                fsync_directory(pin_path.parent)
             except Exception as error:
                 # Artifact exceptions are intentionally secondary during maintenance.
                 warnings.append(f"manifest archival retry failed: {type(error).__name__}")
@@ -392,8 +393,8 @@ class DataStore:
                 }
                 for name in _ARTIFACT_NAMES
             }
-            _fsync_directory(generation)
-            _fsync_directory(generation.parent)
+            fsync_directory(generation)
+            fsync_directory(generation.parent)
             pointer = {
                 "schema_version": _POINTER_SCHEMA_VERSION,
                 "contract_version": CONTRACT_VERSION,
@@ -405,7 +406,7 @@ class DataStore:
             temporary_pointer = namespace / f".CURRENT.{uuid.uuid4().hex}.tmp"
             _write_json(temporary_pointer, pointer)
             self._replace_file(temporary_pointer, namespace / "CURRENT.json")
-            _fsync_directory(namespace)
+            fsync_directory(namespace)
             return GenerationPublication(
                 generation_id,
                 frame.copy(deep=True),
@@ -449,7 +450,7 @@ class DataStore:
                 "acquisition_id": acquisition_id,
             },
         )
-        _fsync_directory(pins)
+        fsync_directory(pins)
 
     def _pin_paths(self) -> Iterator[tuple[Path, Path]]:
         pattern = f"{CONTRACT_VERSION}/*/*/*/pins/*.json"
@@ -771,14 +772,6 @@ def _is_sha256(value: object) -> bool:
 
 
 def _fsync_file(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
