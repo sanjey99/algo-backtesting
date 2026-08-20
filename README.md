@@ -5,16 +5,16 @@ An event-driven algorithmic trading backtester with Walk-Forward Analysis and st
 ## Architecture
 
 ```
-Data Layer          Engine Layer         Analytics Layer      API / Dashboard
-───────────         ────────────         ───────────────      ───────────────
-DataFetcher ──→  BacktestEngine       WalkForwardAnalyzer   FastAPI REST API
-  YFinance        event queue:          parameter sweep       Streamlit UI
-  AlphaVantage    MarketEvent     ──→  PermutationTester     HTML Report
-DataStore         SignalEvent          compute_all_metrics
-  parquet cache   OrderEvent
-                  FillEvent
-                  SimulatedBroker
-                  PositionSizer
+Data Layer             Engine Layer         Analytics Layer      Entry Points
+──────────             ────────────         ───────────────      ────────────
+AcquisitionService ──→ BacktestEngine       WalkForwardAnalyzer   FastAPI REST API
+  YFinanceProvider      event queue:          parameter sweep       Streamlit UI
+  AlphaVantageProvider  MarketEvent     ──→  PermutationTester     HTML Report
+DataStore generations   SignalEvent          compute_all_metrics
+  canonical parquet     OrderEvent
+                        FillEvent
+                        SimulatedBroker
+                        PositionSizer
 ```
 
 ## Features
@@ -105,7 +105,7 @@ Short positions use the Global Constraints defaults: initial margin `1.50`, main
 
 The daily acquisition boundary normalizes provider data, applies XNYS-session-aware quality rules,
 uses immutable cache generations, and produces redacted manifests for both successes and admitted
-failures. The API and CLI share that service.
+failures. The API, CLI, and dashboard share that service.
 
 ```bash
 # Write canonical Parquet plus a redacted request report.
@@ -170,4 +170,4 @@ Permutation test uses `p = (count_gte + 1) / (n + 1)` (Monte Carlo standard) to 
 All order types (MARKET, LIMIT, STOP) are added to a pending queue and executed at the next bar's open. This eliminates look-ahead bias and correctly models real execution latency.
 
 ### ADR-005: Parquet Caching
-`DataStore` uses exact (symbol, start, end) matching for cache keys. Cache is stored in `data/raw/` (gitignored). Trade-off: no partial-range cache hits; full re-fetch if date range changes.
+`DataStore` publishes immutable canonical generations under contract/calendar/interval/symbol namespaces. Requests can reuse valid partial ranges and fetch only missing or stale exchange sessions; cache artifacts remain under `data/raw/` (gitignored).

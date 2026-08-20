@@ -4,21 +4,20 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Generator
-from datetime import UTC, datetime
-from functools import lru_cache
-from pathlib import Path
 
 from sqlalchemy.orm import Session
 
 from src.api.schemas import AsyncJobOut
-from src.data.acquisition import AcquisitionService
-from src.data.calendars import get_market_calendar
-from src.data.contracts import Provider
-from src.data.manifest import ManifestRepository
-from src.data.providers import AlphaVantageProvider, YFinanceProvider
-from src.data.retry import RetryExecutor
-from src.data.store import DataStore
+from src.data.wiring import create_acquisition_service, get_acquisition_service
 from src.db.database import _SessionLocal
+
+__all__ = (
+    "create_acquisition_service",
+    "get_acquisition_service",
+    "get_db",
+    "get_job",
+    "set_job",
+)
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -31,53 +30,6 @@ def get_db() -> Generator[Session, None, None]:
         raise
     finally:
         db.close()
-
-
-@lru_cache(maxsize=1)
-def get_acquisition_service() -> AcquisitionService:
-    """Return the process-shared acquisition service used by every API route."""
-    return create_acquisition_service()
-
-
-def create_acquisition_service(
-    *,
-    cache_dir: str | Path = "data/raw",
-    manifest_dir: str | Path = "data/acquisition-reports",
-) -> AcquisitionService:
-    """Wire the production acquisition effects behind one injectable dependency."""
-    import os
-
-    calendar = get_market_calendar()
-    repository = ManifestRepository(manifest_dir)
-    store = DataStore(
-        cache_dir,
-        calendar_versions=calendar.version_evidence(),
-        manifest_repository=repository,
-    )
-
-    def clock() -> datetime:
-        return datetime.now(UTC)
-
-    key = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
-    entitled = os.environ.get("ALPHA_VANTAGE_ADJUSTED_DAILY_ENTITLED", "").lower() in {
-        "1",
-        "true",
-        "yes",
-    }
-    return AcquisitionService(
-        store=store,
-        manifest_repository=repository,
-        calendar=calendar,
-        provider_factories={
-            Provider.YFINANCE: YFinanceProvider,
-            Provider.ALPHA_VANTAGE: lambda: AlphaVantageProvider(
-                api_key=key,
-                adjusted_daily_entitled=entitled,
-            ),
-        },
-        retry_executor=RetryExecutor(clock=clock),
-        clock=clock,
-    )
 
 
 # ---------------------------------------------------------------------------
