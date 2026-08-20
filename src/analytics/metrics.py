@@ -6,6 +6,8 @@ and penalizes idle capital. Trade-by-trade Sharpe has too few data points.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
+from enum import StrEnum
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -15,6 +17,38 @@ from src.models.trade import Trade
 
 if TYPE_CHECKING:
     from src.engine.backtest import BacktestResult
+
+
+class MetricName(StrEnum):
+    """Metrics that may be used as permutation-test statistics."""
+
+    SHARPE_RATIO = "sharpe_ratio"
+    SORTINO_RATIO = "sortino_ratio"
+    CAGR = "cagr"
+    MAX_DRAWDOWN = "max_drawdown"
+    MAX_DRAWDOWN_DURATION = "max_drawdown_duration"
+    WIN_RATE = "win_rate"
+    PROFIT_FACTOR = "profit_factor"
+    CALMAR_RATIO = "calmar_ratio"
+    TOTAL_TRADES = "total_trades"
+    TOTAL_RETURN = "total_return"
+
+
+def parse_metric_name(metric: MetricName | str) -> MetricName:
+    """Return a supported metric name or fail closed on unknown input."""
+    try:
+        return MetricName(metric)
+    except ValueError as error:
+        raise ValueError(f"Unsupported permutation metric: {metric!r}") from error
+
+
+def require_metric(metrics: Mapping[str, float], metric: MetricName) -> float:
+    """Read a declared metric without converting contract drift into zero."""
+    try:
+        return metrics[metric.value]
+    except KeyError as error:
+        message = f"Declared permutation metric {metric.value!r} is missing"
+        raise RuntimeError(message) from error
 
 
 def equity_curve_to_returns(equity_curve: list[EquityPoint]) -> list[float]:
@@ -158,14 +192,16 @@ def compute_all_metrics(result: BacktestResult) -> dict[str, float]:
     )
 
     return {
-        "sharpe_ratio": sharpe_ratio(returns),
-        "sortino_ratio": sortino_ratio(returns),
-        "cagr": cagr(result.equity_curve),
-        "max_drawdown": max_drawdown(result.equity_curve),
-        "max_drawdown_duration": float(max_drawdown_duration(result.equity_curve)),
-        "win_rate": win_rate(result.trades),
-        "profit_factor": profit_factor(result.trades),
-        "calmar_ratio": calmar_ratio(result.equity_curve),
-        "total_trades": float(len(closed_trades)),
-        "total_return": total_return,
+        MetricName.SHARPE_RATIO.value: sharpe_ratio(returns),
+        MetricName.SORTINO_RATIO.value: sortino_ratio(returns),
+        MetricName.CAGR.value: cagr(result.equity_curve),
+        MetricName.MAX_DRAWDOWN.value: max_drawdown(result.equity_curve),
+        MetricName.MAX_DRAWDOWN_DURATION.value: float(
+            max_drawdown_duration(result.equity_curve)
+        ),
+        MetricName.WIN_RATE.value: win_rate(result.trades),
+        MetricName.PROFIT_FACTOR.value: profit_factor(result.trades),
+        MetricName.CALMAR_RATIO.value: calmar_ratio(result.equity_curve),
+        MetricName.TOTAL_TRADES.value: float(len(closed_trades)),
+        MetricName.TOTAL_RETURN.value: total_return,
     }

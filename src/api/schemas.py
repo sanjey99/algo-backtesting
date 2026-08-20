@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+from src.analytics.metrics import MetricName
+
 # ---------------------------------------------------------------------------
 # Requests
 # ---------------------------------------------------------------------------
@@ -64,7 +66,7 @@ class PermutationRequest(BaseModel):
     end: str
     params: dict[str, Any] = Field(default_factory=dict)
     n_permutations: int = Field(200, gt=0)
-    metric: str = Field("sharpe_ratio")
+    metric: MetricName = Field(MetricName.SHARPE_RATIO)
     initial_capital: float = Field(100_000.0, gt=0)
 
     @model_validator(mode="after")

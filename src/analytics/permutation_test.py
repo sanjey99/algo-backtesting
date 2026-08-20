@@ -18,7 +18,12 @@ from typing import Any
 
 import numpy as np
 
-from src.analytics.metrics import compute_all_metrics
+from src.analytics.metrics import (
+    MetricName,
+    compute_all_metrics,
+    parse_metric_name,
+    require_metric,
+)
 from src.engine.backtest import BacktestConfig, BacktestEngine
 from src.models.candle import Candle
 from src.observability import log_event
@@ -86,12 +91,13 @@ def _run_single_permutation(
     log_returns: list[float],
     original_prices: list[float],
     timestamps: list[Any],
-    metric: str,
+    metric: MetricName | str,
     config_dict: dict[str, float],
     seed: int,
     symbol: str | None = None,
 ) -> float:
     """Run one permutation — designed to run in a subprocess (no shared state)."""
+    metric_name = parse_metric_name(metric)
     import importlib
     import math
 
@@ -143,7 +149,7 @@ def _run_single_permutation(
     engine = BacktestEngine()
     result = engine.run(strategy, candles, config, symbol=symbol)
     metrics = compute_all_metrics(result)
-    return metrics.get(metric, 0.0)
+    return require_metric(metrics, metric_name)
 
 
 class PermutationTester:
@@ -160,7 +166,7 @@ class PermutationTester:
         strategy: BaseStrategy,
         candles: list[Candle],
         n_permutations: int = 1000,
-        metric: str = "sharpe_ratio",
+        metric: MetricName | str = MetricName.SHARPE_RATIO,
         seed: int = 42,
         config: BacktestConfig | None = None,
         max_workers: int | None = None,
@@ -169,7 +175,7 @@ class PermutationTester:
         self.strategy = strategy
         self.candles = candles
         self.n_permutations = n_permutations
-        self.metric = metric
+        self.metric = parse_metric_name(metric)
         self.seed = seed
         self.config = config or BacktestConfig()
         self.max_workers = max_workers or max(1, (cpu_count() or 2) - 1)
@@ -186,7 +192,7 @@ class PermutationTester:
         actual_result = engine.run(self.strategy, self.candles, self.config, symbol=self.symbol)
         self.strategy.reset()
         actual_metrics = compute_all_metrics(actual_result)
-        actual_metric = actual_metrics.get(self.metric, 0.0)
+        actual_metric = require_metric(actual_metrics, self.metric)
 
         # 2. Build log-returns and original prices for subprocess
         log_returns = self._compute_log_returns().tolist()

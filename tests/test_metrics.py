@@ -7,6 +7,7 @@ from datetime import datetime
 
 import pytest
 
+import src.analytics.metrics as metrics_module
 from src.analytics.metrics import (
     cagr,
     calmar_ratio,
@@ -441,6 +442,14 @@ class TestComputeAllMetrics:
         result = make_backtest_result([100.0, 105.0, 102.0, 108.0, 95.0, 110.0])
         metrics = compute_all_metrics(result)
         assert self.REQUIRED_KEYS == set(metrics.keys())
+
+    def test_declared_permutation_metrics_match_emitted_contract(self) -> None:
+        result = make_backtest_result([100.0, 105.0, 102.0, 108.0])
+        metric_type = getattr(metrics_module, "MetricName", ())
+        declared = {metric.value for metric in metric_type}
+
+        assert declared == self.REQUIRED_KEYS
+        assert set(compute_all_metrics(result)) == declared
 
     def test_all_values_are_float(self):
         result = make_backtest_result([100.0, 105.0, 102.0, 108.0])

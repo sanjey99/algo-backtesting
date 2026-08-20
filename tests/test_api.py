@@ -370,6 +370,21 @@ class TestListBacktests:
 # ---------------------------------------------------------------------------
 
 class TestPermutationEndpoint:
+    def test_rejects_unsupported_metric_before_accepting_job(
+        self, client: TestClient
+    ) -> None:
+        with patch("src.api.routes.backtest._run_permutation_bg"):
+            response = client.post("/api/backtest/permutation-test", json={
+                "strategy": "ma_crossover",
+                "symbol": "SPY",
+                "start": "2020-01-01",
+                "end": "2022-12-31",
+                "n_permutations": 1,
+                "metric": "sharp_ratio_typo",
+            })
+
+        assert response.status_code == 422
+
     def test_returns_202_and_job_id(self, client: TestClient) -> None:
         with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
             r = client.post("/api/backtest/permutation-test", json={

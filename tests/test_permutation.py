@@ -135,6 +135,44 @@ class TestPermutationTester:
                 42,
             )
 
+    def test_permutation_worker_rejects_unsupported_metric(self) -> None:
+        with pytest.raises(ValueError, match="Unsupported permutation metric"):
+            _run_single_permutation(
+                "src.strategies.ma_crossover.MACrossoverStrategy",
+                {"fast_period": 2, "slow_period": 3},
+                [0.01, -0.01, 0.02],
+                [100.0, 101.0, 100.0, 102.0],
+                [datetime(2023, 1, day) for day in range(1, 5)],
+                "sharp_ratio_typo",
+                asdict(BacktestConfig()),
+                42,
+            )
+
+    def test_tester_rejects_unsupported_metric_before_running(self) -> None:
+        with pytest.raises(ValueError, match="Unsupported permutation metric"):
+            PermutationTester(
+                MACrossoverStrategy(fast_period=5, slow_period=20),
+                make_candles(20),
+                n_permutations=1,
+                metric="sharp_ratio_typo",
+            )
+
+    def test_declared_metric_missing_from_results_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "src.analytics.permutation_test.compute_all_metrics",
+            lambda _: {},
+        )
+        tester = PermutationTester(
+            MACrossoverStrategy(fast_period=5, slow_period=20),
+            make_candles(20),
+            n_permutations=1,
+        )
+
+        with pytest.raises(RuntimeError, match="Declared permutation metric .* is missing"):
+            tester.run()
+
     def test_instantiation(self) -> None:
         strategy = MACrossoverStrategy(fast_period=5, slow_period=20)
         candles = make_candles(100)
