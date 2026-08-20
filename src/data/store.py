@@ -30,7 +30,7 @@ from src.data.contracts import (
     ContractViolationError,
     json_safe,
 )
-from src.data.durability import fsync_directory
+from src.data.durability import fsync_directory, fsync_file
 from src.data.fetcher import DataFetcher
 from src.data.manifest import ManifestRepository
 from src.data.store_artifacts import (
@@ -359,7 +359,7 @@ class DataStore:
         try:
             bars_path = generation / "bars.parquet"
             frame.copy(deep=True).to_parquet(bars_path, index=False)
-            _fsync_file(bars_path)
+            fsync_file(bars_path)
             bars_hash = _sha256_file(bars_path)
             cache_key = str(namespace.relative_to(self._cache_dir))
             final_manifest = replace(
@@ -769,14 +769,6 @@ def _sha256_file(path: Path) -> str:
 
 def _is_sha256(value: object) -> bool:
     return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{64}", value))
-
-
-def _fsync_file(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _safe_reason(error: BaseException) -> str:

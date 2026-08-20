@@ -7,6 +7,38 @@ import pytest
 from src.data import durability
 
 
+def test_file_sync_uses_writable_descriptor_for_windows_compatibility(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows rejects ``fsync`` when a completed file is reopened read-only."""
+    artifact = tmp_path / "artifact.bin"
+    artifact.write_bytes(b"complete")
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        durability.os,
+        "open",
+        lambda path, flags: calls.append(("open", (path, flags))) or 41,
+    )
+    monkeypatch.setattr(
+        durability.os,
+        "fsync",
+        lambda descriptor: calls.append(("fsync", descriptor)),
+    )
+    monkeypatch.setattr(
+        durability.os,
+        "close",
+        lambda descriptor: calls.append(("close", descriptor)),
+    )
+
+    durability.fsync_file(artifact)
+
+    assert calls == [
+        ("open", (artifact, durability.os.O_WRONLY)),
+        ("fsync", 41),
+        ("close", 41),
+    ]
+
+
 def test_windows_directory_sync_skips_unsupported_descriptor_operation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

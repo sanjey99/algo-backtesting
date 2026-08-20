@@ -63,7 +63,7 @@ def test_benchmark_writes_report_preserves_database_and_prints_compare_filters(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Dropping the hardened database or guessed cohort filters breaks the CLI handoff."""
-    database = tmp_path / "benchmark?copy.db"
+    database = tmp_path / "benchmark#copy.db"
     report_path = tmp_path / "benchmark.json"
 
     code = sql_cli.main(

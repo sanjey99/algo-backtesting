@@ -8,6 +8,15 @@ from pathlib import Path
 _WINDOWS = os.name == "nt"
 
 
+def fsync_file(path: Path) -> None:
+    """Flush a completed artifact through a descriptor writable on every platform."""
+    descriptor = os.open(path, os.O_WRONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def fsync_directory(path: Path) -> None:
     """Flush directory metadata on platforms with a usable file-descriptor API.
 
