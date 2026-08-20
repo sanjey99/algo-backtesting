@@ -309,6 +309,12 @@ for up to 24 hours, with at most 100 terminal jobs held at once. Pending and run
 evicted. Terminal worker failures return a generic client error and emit a structured,
 non-sensitive `permutation.failed` diagnostic event.
 
+Capital, commission, and slippage inputs must be finite numbers. Analytical calculations retain
+their mathematical semantics internally, including an infinite profit factor when a strategy has
+profits but no losses. Because JSON has no portable representation for non-finite numbers, API
+response fields declare those metric values as nullable and serialize a non-finite result as
+`null`.
+
 ---
 
 ## 5. Scalability Considerations

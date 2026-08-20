@@ -14,15 +14,22 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from src.api import main as api_main
-from src.api.deps import get_db, get_job
+from src.api.deps import get_db, get_job, set_job
 from src.api.main import app
 from src.api.routes.backtest import _run_permutation_bg
-from src.api.schemas import PermutationRequest
+from src.api.schemas import (
+    AsyncJobOut,
+    BacktestRequest,
+    PermutationOut,
+    PermutationRequest,
+    WalkForwardRequest,
+)
 from src.data.contracts import (
     AcquisitionManifest,
     AcquisitionRequest,
@@ -126,6 +133,13 @@ def client() -> Generator[TestClient, None, None]:
             yield c
 
 
+@pytest.fixture()
+def non_raising_client() -> Generator[TestClient, None, None]:
+    with patch("src.api.main.init_db"):
+        with TestClient(app, raise_server_exceptions=False) as c:
+            yield c
+
+
 def test_lifespan_rejects_unmigrated_real_engine(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -185,6 +199,30 @@ class TestHealth:
         assert r.json()["status"] == "ok"
 
 
+class TestOpenAPIContract:
+    def test_non_finite_analytics_are_declared_as_nullable_numbers(
+        self, client: TestClient
+    ) -> None:
+        schemas = client.get("/openapi.json").json()["components"]["schemas"]
+        nullable_locations = (
+            schemas["BacktestSummary"]["properties"]["metrics"]["additionalProperties"],
+            schemas["WalkForwardOut"]["properties"]["optimization_stability"],
+            schemas["WalkForwardOut"]["properties"]["combined_metrics"][
+                "additionalProperties"
+            ],
+            schemas["PermutationOut"]["properties"]["actual_metric"],
+            schemas["PermutationOut"]["properties"]["permuted_metrics"]["items"],
+        )
+
+        for location in nullable_locations:
+            if reference := location.get("$ref"):
+                location = schemas[reference.rsplit("/", 1)[-1]]
+            assert {branch["type"] for branch in location["anyOf"]} == {
+                "number",
+                "null",
+            }
+
+
 # ---------------------------------------------------------------------------
 # GET /api/strategies
 # ---------------------------------------------------------------------------
@@ -213,6 +251,39 @@ PATCH_TARGET = "src.api.routes.backtest._fetch_candles"
 
 
 class TestRunBacktest:
+    @pytest.mark.parametrize(
+        ("request_type", "field", "value"),
+        [
+            (request_type, field, value)
+            for request_type, field in (
+                (BacktestRequest, "initial_capital"),
+                (BacktestRequest, "commission_pct"),
+                (BacktestRequest, "slippage_pct"),
+                (WalkForwardRequest, "initial_capital"),
+                (PermutationRequest, "initial_capital"),
+            )
+            for value in (float("nan"), float("inf"), float("-inf"))
+        ],
+    )
+    def test_requests_reject_non_finite_numbers(
+        self,
+        request_type: type[BacktestRequest]
+        | type[WalkForwardRequest]
+        | type[PermutationRequest],
+        field: str,
+        value: float,
+    ) -> None:
+        payload = {
+            "strategy": "ma_crossover",
+            "symbol": "SPY",
+            "start": "2020-01-01",
+            "end": "2022-12-31",
+            field: value,
+        }
+
+        with pytest.raises(ValidationError):
+            request_type(**payload)  # type: ignore[arg-type]
+
     def test_returns_and_persists_the_requested_symbol(self, client: TestClient) -> None:
         with patch(PATCH_TARGET, return_value=FAKE_CANDLES):
             r = client.post("/api/backtest", json={
@@ -374,6 +445,63 @@ class TestListBacktests:
 # ---------------------------------------------------------------------------
 
 class TestPermutationEndpoint:
+    def test_model_validation_errors_remain_json_serializable(
+        self, non_raising_client: TestClient
+    ) -> None:
+        response = non_raising_client.post(
+            "/api/backtest/permutation-test",
+            json={
+                "strategy": "ma_crossover",
+                "symbol": "SPY",
+                "start": "not-a-date",
+                "end": "2022-12-31",
+            },
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["type"] == "value_error"
+
+    def test_poll_serializes_unbounded_metrics_as_null(self, client: TestClient) -> None:
+        job_id = "unbounded-metric-job"
+        set_job(
+            job_id,
+            AsyncJobOut(
+                job_id=job_id,
+                status="done",
+                result=PermutationOut(
+                    actual_metric=float("inf"),
+                    permuted_metrics=[1.0, float("inf")],
+                    p_value=0.5,
+                    is_significant=False,
+                    percentile=50.0,
+                ),
+            ),
+        )
+
+        response = client.get(f"/api/backtest/permutation-test/{job_id}")
+
+        assert response.status_code == 200
+        result = response.json()["result"]
+        assert result["actual_metric"] is None
+        assert result["permuted_metrics"] == [1.0, None]
+
+    def test_rejects_non_finite_capital_before_accepting_job(
+        self, client: TestClient
+    ) -> None:
+        with patch("src.api.routes.backtest._run_permutation_bg"):
+            response = client.post(
+                "/api/backtest/permutation-test",
+                content=(
+                    '{"strategy":"ma_crossover","symbol":"SPY",'
+                    '"start":"2020-01-01","end":"2022-12-31",'
+                    '"initial_capital":1e309}'
+                ),
+                headers={"content-type": "application/json"},
+            )
+
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["input"] is None
+
     def test_enforces_permutation_workload_ceiling(self, client: TestClient) -> None:
         payload = {
             "strategy": "ma_crossover",

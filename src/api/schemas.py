@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from typing import Any, Final
 
@@ -11,6 +12,7 @@ from src.analytics.metrics import MetricName
 
 MAX_OPTIMIZATION_TRIALS: Final = 200
 MAX_PERMUTATIONS: Final = 1_000
+type MetricValueOut = float | None
 
 # ---------------------------------------------------------------------------
 # Requests
@@ -23,9 +25,9 @@ class BacktestRequest(BaseModel):
     start: str = Field(..., description="ISO date, e.g. '2020-01-01'")
     end: str = Field(..., description="ISO date, e.g. '2023-12-31'")
     params: dict[str, Any] = Field(default_factory=dict, description="Strategy parameters")
-    initial_capital: float = Field(100_000.0, gt=0)
-    commission_pct: float = Field(0.001, ge=0)
-    slippage_pct: float = Field(0.0005, ge=0)
+    initial_capital: float = Field(100_000.0, gt=0, allow_inf_nan=False)
+    commission_pct: float = Field(0.001, ge=0, allow_inf_nan=False)
+    slippage_pct: float = Field(0.0005, ge=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _validate_dates(self) -> BacktestRequest:
@@ -48,7 +50,7 @@ class WalkForwardRequest(BaseModel):
     out_of_sample_days: int = Field(63, gt=0)
     step_days: int = Field(63, gt=0)
     n_optimization_trials: int = Field(50, gt=0, le=MAX_OPTIMIZATION_TRIALS)
-    initial_capital: float = Field(100_000.0, gt=0)
+    initial_capital: float = Field(100_000.0, gt=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _validate_dates(self) -> WalkForwardRequest:
@@ -70,7 +72,7 @@ class PermutationRequest(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     n_permutations: int = Field(200, gt=0, le=MAX_PERMUTATIONS)
     metric: MetricName = Field(MetricName.SHARPE_RATIO)
-    initial_capital: float = Field(100_000.0, gt=0)
+    initial_capital: float = Field(100_000.0, gt=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _validate_dates(self) -> PermutationRequest:
@@ -125,7 +127,7 @@ class BacktestSummary(BaseModel):
     end_date: datetime
     final_equity: float
     initial_capital: float
-    metrics: dict[str, float]
+    metrics: Mapping[str, MetricValueOut]
 
 
 class BacktestDetail(BacktestSummary):
@@ -147,13 +149,13 @@ class WindowOut(BaseModel):
 class WalkForwardOut(BaseModel):
     windows: list[WindowOut]
     combined_sharpe: float
-    optimization_stability: float
-    combined_metrics: dict[str, float]
+    optimization_stability: MetricValueOut
+    combined_metrics: Mapping[str, MetricValueOut]
 
 
 class PermutationOut(BaseModel):
-    actual_metric: float
-    permuted_metrics: list[float]
+    actual_metric: MetricValueOut
+    permuted_metrics: Sequence[MetricValueOut]
     p_value: float
     is_significant: bool
     percentile: float
