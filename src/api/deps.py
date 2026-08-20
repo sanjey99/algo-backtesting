@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import threading
 from collections.abc import Generator
 
 from sqlalchemy.orm import Session
 
+from src.api.jobs import InMemoryJobStore
 from src.api.schemas import AsyncJobOut
 from src.data.wiring import create_acquisition_service, get_acquisition_service
 from src.db.database import _SessionLocal
@@ -36,15 +36,12 @@ def get_db() -> Generator[Session, None, None]:
 # In-memory job store for background permutation tasks
 # ---------------------------------------------------------------------------
 
-_jobs: dict[str, AsyncJobOut] = {}
-_jobs_lock = threading.Lock()
+_job_store = InMemoryJobStore()
 
 
 def get_job(job_id: str) -> AsyncJobOut | None:
-    with _jobs_lock:
-        return _jobs.get(job_id)
+    return _job_store.get(job_id)
 
 
 def set_job(job_id: str, job: AsyncJobOut) -> None:
-    with _jobs_lock:
-        _jobs[job_id] = job
+    _job_store.set(job_id, job)

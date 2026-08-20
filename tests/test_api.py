@@ -4,9 +4,11 @@ Uses TestClient with an in-memory SQLite DB and patched data fetching.
 """
 from __future__ import annotations
 
+import logging
 from collections.abc import Generator
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
@@ -17,8 +19,10 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from src.api import main as api_main
-from src.api.deps import get_db
+from src.api.deps import get_db, get_job
 from src.api.main import app
+from src.api.routes.backtest import _run_permutation_bg
+from src.api.schemas import PermutationRequest
 from src.data.contracts import (
     AcquisitionManifest,
     AcquisitionRequest,
@@ -370,6 +374,26 @@ class TestListBacktests:
 # ---------------------------------------------------------------------------
 
 class TestPermutationEndpoint:
+    def test_enforces_permutation_workload_ceiling(self, client: TestClient) -> None:
+        payload = {
+            "strategy": "ma_crossover",
+            "symbol": "SPY",
+            "start": "2020-01-01",
+            "end": "2022-12-31",
+        }
+        with patch("src.api.routes.backtest._run_permutation_bg"):
+            accepted = client.post(
+                "/api/backtest/permutation-test",
+                json={**payload, "n_permutations": 1_000},
+            )
+            rejected = client.post(
+                "/api/backtest/permutation-test",
+                json={**payload, "n_permutations": 1_001},
+            )
+
+        assert accepted.status_code == 202
+        assert rejected.status_code == 422
+
     def test_rejects_unsupported_metric_before_accepting_job(
         self, client: TestClient
     ) -> None:
@@ -414,6 +438,68 @@ class TestPermutationEndpoint:
     def test_poll_missing_job_404(self, client: TestClient) -> None:
         r = client.get("/api/backtest/permutation-test/no-such-job")
         assert r.status_code == 404
+
+    def test_background_failure_records_structured_diagnostic(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        job_id = "failed-permutation-job"
+        request = PermutationRequest(
+            strategy="does_not_exist",
+            symbol="SPY",
+            start="2020-01-01",
+            end="2022-12-31",
+            n_permutations=5,
+        )
+
+        with caplog.at_level(logging.ERROR, logger="src.api.routes.backtest"):
+            _run_permutation_bg(job_id, request, object())  # type: ignore[arg-type]
+
+        job = get_job(job_id)
+        assert job is not None
+        assert job.status == "error"
+        assert job.error == "Permutation test failed"
+        record = next(record for record in caplog.records if record.msg == "permutation.failed")
+        assert record.event == "permutation.failed"  # type: ignore[attr-defined]
+        assert record.event_fields == {  # type: ignore[attr-defined]
+            "job_id": job_id,
+            "metric": "sharpe_ratio",
+            "error_type": "HTTPException",
+        }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/backtest/walk-forward
+# ---------------------------------------------------------------------------
+
+class TestWalkForwardEndpoint:
+    def test_enforces_optimization_workload_ceiling(self, client: TestClient) -> None:
+        payload = {
+            "strategy": "ma_crossover",
+            "symbol": "SPY",
+            "start": "2020-01-01",
+            "end": "2022-12-31",
+        }
+        result = SimpleNamespace(
+            windows=[],
+            combined_sharpe=0.0,
+            optimization_stability=0.0,
+            combined_metrics={},
+        )
+        with (
+            patch(PATCH_TARGET, return_value=FAKE_CANDLES),
+            patch("src.api.routes.backtest.WalkForwardAnalyzer.run", return_value=result),
+        ):
+            accepted = client.post(
+                "/api/backtest/walk-forward",
+                json={**payload, "n_optimization_trials": 200},
+            )
+            rejected = client.post(
+                "/api/backtest/walk-forward",
+                json={**payload, "n_optimization_trials": 201},
+            )
+
+        assert accepted.status_code == 200
+        assert rejected.status_code == 422
 
 
 # ---------------------------------------------------------------------------

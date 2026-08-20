@@ -5,14 +5,14 @@ Do not list ordinary defects, missing tests, design decisions, or optional platf
 
 ## Active blockers
 
+None.
+
+## Resolved verification evidence
+
 ### Native Windows verification of repaired Make targets
 
-- **Why macOS cannot close it:** Simulating `OS=Windows_NT` verifies GNU Make expansion, but cannot
-  execute Windows virtual-environment paths or validate Windows temporary-directory behavior.
-- **Required environment:** A native Windows host with GNU Make, Python 3.12, and the project
-  dependencies installed in `.venv`.
-- **Exit criteria:** `make test`, `make lint`, and `make verify-warnings` exit successfully, and
-  representative SQL target dry-runs plus a smoke command use `.venv/Scripts` and the native
-  temporary directory without path errors.
-- **Current evidence:** `make -n OS=Windows_NT ...` is useful simulated evidence only; it is not
-  native verification.
+- **Verified:** 2026-08-20 on GitHub Actions `windows-2025` with Python 3.12 and GNU Make 4.4.1.
+- **Commit:** `3ca2df45be8ca1acdafede2ddaac3d1d0a6437a9`.
+- **Evidence:** [CI run 32342372884](https://github.com/sanjey99/algo-backtesting/actions/runs/32342372884).
+- **Result:** The full 725-test coverage suite, warning gates, Ruff, strict mypy, lock check, native
+  `.venv/Scripts` Make expansion, and SQL migration/validation smoke all passed.

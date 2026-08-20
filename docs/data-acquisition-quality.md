@@ -43,6 +43,23 @@ policy snapshots, dependency/calendar evidence, cache state, provider attempts, 
 findings, rejection and reconciliation counters, coverage, lineage hashes, output hash, and timing.
 Credentials and credential-bearing values are redacted at the boundary.
 
+## Publication and platform durability
+
+Cache generations, pointers, report archives, and caller-selected artifacts are published through
+same-filesystem namespace operations, so readers do not observe partially written file contents
+during normal operation. Every file is flushed before publication. POSIX systems additionally
+flush leaf publication directories, providing stronger crash ordering when the ancestor hierarchy
+is already durable. Recursively created ancestor directories are not individually flushed, so the
+system does not claim end-to-end power-loss durability for a first publication into a fresh tree.
+
+Windows does not expose a supported directory descriptor through Python's `os.open`, so directory
+metadata persistence across sudden power loss is best-effort even though file contents are flushed
+and normal-operation publication remains namespace-atomic. After restart, readers verify the
+pointer, referenced files, schemas, and hashes and fail closed rather than returning incomplete or
+unverified market data. Prefer a pre-created POSIX hierarchy when stronger crash-ordering guarantees
+are required, and use external transactional storage when end-to-end power-loss durability is a hard
+requirement.
+
 ## Operator commands
 
 Acquire canonical data and write caller-owned copies explicitly:

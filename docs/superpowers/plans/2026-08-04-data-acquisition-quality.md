@@ -209,6 +209,12 @@ status. Recursively scan output to prove known secret values and `apikey` query 
 absent. Test full-hit report persistence, indefinite request-report lookup after generation cleanup,
 archive failure with embedded-manifest fallback/pinning, and successful maintenance archival/unpin.
 
+**Platform note (2026-08-20):** POSIX fsyncs files and leaf publication directories, providing
+stronger crash ordering when the ancestor hierarchy is already durable; recursively created
+ancestors are not individually fsynced. Windows rejects directory descriptors through Python's
+`os.open`; there publication is namespace-atomic during normal operation, file contents are fsynced,
+and sudden-power-loss durability of directory metadata is best-effort.
+
 ### Implement
 
 Refactor `DataStore` behind a canonical generation-store interface while preserving legacy
@@ -225,6 +231,9 @@ that archive fails, pin the generation against cleanup, let lookup fall back to 
 manifest, return a secondary warning, and retry archival during maintenance. For a full hit or
 failure, archive failure is a typed artifact error. Invalid input rejected before admission receives
 no acquisition ID. A caller-selected copy remains an optional post-commit artifact.
+
+The platform note above also qualifies the archive's indefinite-retention guarantee across sudden
+power loss; normal-operation lookup, pinning, and maintenance semantics are unchanged.
 
 Run tests and commit:
 

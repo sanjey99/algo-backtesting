@@ -272,8 +272,13 @@ and contains hashes for all three artifacts.
 A writer records the base generation, prepares network results without a lock, then acquires a
 cross-process `filelock` publication lock. If `CURRENT` changed, it rebases the accepted ranges onto
 the latest generation and revalidates; after three conflicting rebases it fails without publishing.
-It stages and fsyncs data, metadata, success manifest, and directories before replacing the pointer.
-A reader follows only the pointer and verifies schema version, file existence, and every hash.
+It stages and fsyncs data, metadata, and the success manifest before replacing the pointer. On
+POSIX systems it also fsyncs the leaf publication directories, providing stronger crash ordering
+when the ancestor hierarchy is already durable. Recursively created ancestors are not individually
+fsynced. On Windows, Python does not expose a supported directory-fsync descriptor, so replacement
+remains namespace-atomic during normal operation but directory metadata durability across sudden
+power loss is best-effort. A reader follows only the pointer and verifies schema version, file
+existence, and every hash, failing closed if a persisted pointer is incomplete.
 
 For partial hits, derive missing sessions, group them into contiguous ranges, acquire and validate
 each, let validated refreshed rows replace overlap, merge unchanged cached rows, and validate the
@@ -290,13 +295,14 @@ invalidates compatibility.
 
 Assign an acquisition ID only after syntactic request validation admits the request. The success
 publication manifest is part of an atomic cache generation, while a separate immutable request-
-report archive records every admitted request, including full hits and failures. For cache writes,
-publish the generation first and then atomically archive the identical report. If archival fails,
-the committed generation is pinned against cleanup, lookup falls back to its embedded manifest, and
-maintenance retries archival; the acquisition returns a secondary artifact warning rather than
-pretending cache publication failed. Full-hit/failure report-write failure is a typed artifact
-error because no new cache mutation needs protection. Report retention is independent of generation
-cleanup and indefinite in V1. Caller-selected copies are optional post-commit artifacts.
+report archive records every admitted request during normal operation, including full hits and
+failures. For cache writes, publish the generation first and then namespace-atomically archive the
+identical report. If archival fails, the committed generation is pinned against cleanup, lookup
+falls back to its embedded manifest, and maintenance retries archival; the acquisition returns a
+secondary artifact warning rather than pretending cache publication failed. Full-hit/failure
+report-write failure is a typed artifact error because no new cache mutation needs protection.
+Report retention is independent of generation cleanup and indefinite in V1, subject to the platform
+durability limitations above. Caller-selected copies are optional post-commit artifacts.
 
 ## 10. Interfaces and Error Handling
 

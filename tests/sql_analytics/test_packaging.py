@@ -34,7 +34,9 @@ def test_installed_wheel_migrates_and_executes_every_packaged_query(tmp_path: Pa
         [sys.executable, "-m", "venv", str(environment_directory)],
         cwd=tmp_path,
     )
-    python = environment_directory / "bin" / "python"
+    python = environment_directory / (
+        "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    )
     _run(
         ["uv", "pip", "install", "--python", str(python), str(wheels[0])],
         cwd=tmp_path,

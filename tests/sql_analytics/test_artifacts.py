@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -14,6 +15,12 @@ from src.analytics.sql_artifacts import (
     write_json_artifact,
 )
 from src.analytics.sql_contracts import ComparisonMetadata, QueryId
+
+
+def _normalized_link_target(path: Path) -> str:
+    """Normalize pathlib's Windows extended-path spelling for lexical comparison."""
+    normalized = os.path.normcase(os.path.normpath(str(path)))
+    return normalized.removeprefix("\\\\?\\")
 
 
 def _metadata(
@@ -155,7 +162,7 @@ def test_bundle_refuses_broken_symlink_destinations_without_force(
         )
 
     assert blocked.is_symlink()
-    assert blocked.readlink() == missing_target
+    assert _normalized_link_target(blocked.readlink()) == _normalized_link_target(missing_target)
     other = metadata_path if blocked == csv_path else csv_path
     assert not other.exists()
 
@@ -170,7 +177,7 @@ def test_json_writer_refuses_broken_symlink_destination_without_force(tmp_path: 
         write_json_artifact({"schema_version": "1.0"}, out, force=False)
 
     assert out.is_symlink()
-    assert out.readlink() == missing_target
+    assert _normalized_link_target(out.readlink()) == _normalized_link_target(missing_target)
 
 
 def test_force_replaces_both_existing_artifacts(tmp_path: Path) -> None:
@@ -321,5 +328,5 @@ def test_force_rollback_restores_broken_symlink_original(
         )
 
     assert csv_path.is_symlink()
-    assert csv_path.readlink() == missing_target
+    assert _normalized_link_target(csv_path.readlink()) == _normalized_link_target(missing_target)
     assert metadata_path.read_bytes() == b"original metadata\n"

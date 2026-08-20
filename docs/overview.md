@@ -50,7 +50,7 @@ Demonstrates: financial domain knowledge, data pipeline work, API integration, s
 - [x] Blueprint
 - [x] System design
 - [x] Core implementation
-- [ ] Native Windows verification (see `BLOCKERS.md`)
+- [x] Native Windows verification (see `BLOCKERS.md`)
 
 ## Resources
 
