@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any
+from typing import Any, Final
 
 from pydantic import BaseModel, Field, model_validator
 
 from src.analytics.metrics import MetricName
+
+MAX_OPTIMIZATION_TRIALS: Final = 200
+MAX_PERMUTATIONS: Final = 1_000
 
 # ---------------------------------------------------------------------------
 # Requests
@@ -44,7 +47,7 @@ class WalkForwardRequest(BaseModel):
     in_sample_days: int = Field(252, gt=0)
     out_of_sample_days: int = Field(63, gt=0)
     step_days: int = Field(63, gt=0)
-    n_optimization_trials: int = Field(50, gt=0)
+    n_optimization_trials: int = Field(50, gt=0, le=MAX_OPTIMIZATION_TRIALS)
     initial_capital: float = Field(100_000.0, gt=0)
 
     @model_validator(mode="after")
@@ -65,7 +68,7 @@ class PermutationRequest(BaseModel):
     start: str
     end: str
     params: dict[str, Any] = Field(default_factory=dict)
-    n_permutations: int = Field(200, gt=0)
+    n_permutations: int = Field(200, gt=0, le=MAX_PERMUTATIONS)
     metric: MetricName = Field(MetricName.SHARPE_RATIO)
     initial_capital: float = Field(100_000.0, gt=0)
 

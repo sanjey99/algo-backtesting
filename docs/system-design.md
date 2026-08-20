@@ -257,39 +257,57 @@ keeps a future PostgreSQL migration feasible, but backend portability is not cur
 |--------|----------|-------------|
 | `POST` | `/backtest` | Run a backtest, persist, return metrics |
 | `GET` | `/backtest/{run_id}` | Retrieve a saved run |
-| `GET` | `/backtest/{run_id}/trades` | Paginated trade list |
+| `GET` | `/backtest/{run_id}/trades` | Full trade list |
 | `GET` | `/backtest/{run_id}/equity-curve` | Full equity curve as JSON |
 | `POST` | `/backtest/walk-forward` | Run walk-forward analysis |
 | `POST` | `/backtest/permutation-test` | Start permutation test (202 Accepted) |
-| `GET` | `/backtest/permutation-test/{task_id}` | Poll permutation test result |
+| `GET` | `/backtest/permutation-test/{job_id}` | Poll permutation test result |
 | `GET` | `/strategies` | List strategies with `parameter_space` |
 | `POST` | `/data/fetch` | Fetch and cache market data |
+| `GET` | `/data/reports/{acquisition_id}` | Retrieve a redacted acquisition manifest |
 
 **Key response schemas:**
 
 ```json
-// POST /backtest → 200
+// POST /backtest → 201
 {
   "run_id": "a1b2c3d4-...",
+  "strategy_name": "ma_crossover",
+  "symbol": "SPY",
+  "start_date": "2020-01-02T00:00:00",
+  "end_date": "2023-12-29T00:00:00",
+  "initial_capital": 100000.0,
+  "final_equity": 118742.30,
   "metrics": {
     "sharpe_ratio": 1.24, "cagr": 0.087, "max_drawdown": -0.1532,
     "max_drawdown_duration": 47, "win_rate": 0.58, "profit_factor": 1.73,
     "sortino_ratio": 1.61, "calmar_ratio": 0.567, "total_trades": 42
-  },
-  "final_equity": 118742.30,
-  "links": { "trades": "/api/backtest/{id}/trades", "equity_curve": "..." }
+  }
 }
 
 // POST /backtest/permutation-test → 202
-{ "task_id": "perm-xyz-...", "status": "running", "estimated_seconds": 15 }
+{ "job_id": "perm-xyz-...", "status": "pending", "result": null, "error": null }
 
-// GET /backtest/permutation-test/{task_id} → 200 (complete)
+// GET /backtest/permutation-test/{job_id} → 200 (complete)
 {
-  "actual_metric": 1.24,
-  "permuted_metrics_summary": { "mean": 0.03, "std": 0.41, "percentile_95": 0.72 },
-  "p_value": 0.012, "is_significant": true, "percentile": 98.8
+  "job_id": "perm-xyz-...",
+  "status": "done",
+  "result": {
+    "actual_metric": 1.24,
+    "permuted_metrics": [0.03, 0.41, 0.72],
+    "p_value": 0.012,
+    "is_significant": true,
+    "percentile": 98.8
+  },
+  "error": null
 }
 ```
+
+The API admits at most 1,000 permutations per permutation job and 200 optimization trials per
+walk-forward request. Completed and failed permutation jobs remain process-local and are retained
+for up to 24 hours, with at most 100 terminal jobs held at once. Pending and running jobs are not
+evicted. Terminal worker failures return a generic client error and emit a structured,
+non-sensitive `permutation.failed` diagnostic event.
 
 ---
 

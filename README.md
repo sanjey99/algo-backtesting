@@ -67,6 +67,10 @@ make verify-warnings
 `make verify-warnings` is a compatibility release gate: it treats Starlette transport deprecations
 and naive-UTC persistence deprecations as errors in their affected test scopes.
 
+GitHub Actions runs the full test, coverage, warning, lint, strict type, and lock matrix on Linux
+and native Windows. The Linux job also audits the locked dependency set; the Windows job exercises
+the platform-specific Make paths and SQL smoke workflow.
+
 ## Structured operational logs
 
 The API lifespan, data CLI, and Streamlit dashboard each configure one process-wide JSON logging

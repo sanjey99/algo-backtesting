@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Annotated, Any
 
@@ -39,8 +40,11 @@ from src.db.crud import (
 )
 from src.engine.backtest import BacktestConfig, BacktestEngine
 from src.models.candle import Candle
+from src.observability import log_event
 from src.strategies import STRATEGY_REGISTRY
 from src.strategies.base import BaseStrategy
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
 
@@ -360,10 +364,18 @@ def _run_permutation_bg(
                 ),
             ),
         )
-    except Exception:
+    except Exception as error:
         set_job(
             job_id,
             AsyncJobOut(job_id=job_id, status="error", error="Permutation test failed"),
+        )
+        log_event(
+            logger,
+            logging.ERROR,
+            "permutation.failed",
+            job_id=job_id,
+            metric=req.metric,
+            error_type=type(error).__name__,
         )
 
 

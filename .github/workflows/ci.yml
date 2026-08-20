@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  linux-quality:
+    name: Linux quality and security
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.12"
+          version: "0.11.29"
+
+      - name: Install locked dependencies
+        run: uv sync --locked --extra dev
+
+      - name: Run full test suite with coverage
+        run: make test
+
+      - name: Enforce warning gates
+        run: make verify-warnings
+
+      - name: Run lint and strict type checks
+        run: make lint
+
+      - name: Verify lockfile
+        run: uv lock --check
+
+      - name: Audit locked dependencies
+        shell: bash
+        run: |
+          uvx --python 3.12 --from pip-audit==2.10.1 pip-audit --strict \
+            -r <(uv export --locked --extra dev --no-hashes --format requirements-txt \
+              | rg -v '^-e \.$')
+
+  windows-quality:
+    name: Native Windows quality
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.12"
+          version: "0.11.29"
+
+      - name: Install GNU Make
+        shell: pwsh
+        run: choco install make --version=4.4.1 --yes --no-progress
+
+      - name: Install locked dependencies
+        shell: pwsh
+        run: uv sync --locked --extra dev
+
+      - name: Run full test suite with coverage
+        shell: pwsh
+        run: make test
+
+      - name: Enforce warning gates
+        shell: pwsh
+        run: make verify-warnings
+
+      - name: Run lint and strict type checks
+        shell: pwsh
+        run: make lint
+
+      - name: Verify lockfile
+        shell: pwsh
+        run: uv lock --check
+
+      - name: Verify native SQL target expansion
+        shell: pwsh
+        run: |
+          make -n sql-validate
+          make -n sql-compare SQL_SYMBOL=SPY SQL_START=2024-01-02 SQL_END=2024-01-10
+
+      - name: Run native SQL smoke
+        shell: pwsh
+        run: make sql-benchmark-smoke
