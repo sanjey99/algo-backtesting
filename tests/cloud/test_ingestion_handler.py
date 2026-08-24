@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import logging
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -9,7 +10,12 @@ import pytest
 from pydantic import ValidationError
 
 from src.cloud.contracts import canonical_json_bytes, sha256_hex
-from src.cloud.ingestion_handler import AcquisitionFailedError, handle_ingestion
+from src.cloud.ingestion_handler import (
+    AcquisitionFailedError,
+    ArtifactPublicationError,
+    handle_ingestion,
+)
+from src.cloud.storage import StoredObject
 from src.data.contracts import (
     AcquisitionManifest,
     AcquisitionRequest,
@@ -21,29 +27,47 @@ from tests.cloud.fakes import FakeObjectStore
 
 NOW = datetime(2024, 3, 29, 12, 0, tzinfo=UTC)
 SECRET_VALUE = "provider-response-secret-value"
+RAW_PROVIDER_TEXT = "raw-provider-response-text"
+RAW_EVENT_TEXT = "workflow-event-text"
+
+
+class FakeProviderServiceError(Exception):
+    """A provider-style error whose text must never cross the handler boundary."""
 
 
 class FakeAcquisitionService:
-    def __init__(self, result: AcquisitionResult) -> None:
-        self._result = result
+    def __init__(self, outcome: AcquisitionResult | Exception) -> None:
+        self._outcome = outcome
         self.requests: list[AcquisitionRequest] = []
 
     def acquire(self, request: AcquisitionRequest) -> AcquisitionResult:
         self.requests.append(request)
-        return self._result
+        if isinstance(self._outcome, Exception):
+            raise self._outcome
+        return self._outcome
 
 
 class FakeServiceFactory:
-    def __init__(self, result: AcquisitionResult) -> None:
-        self._result = result
+    def __init__(self, outcome: AcquisitionResult | Exception) -> None:
+        self._outcome = outcome
         self.calls: list[tuple[Path, Path]] = []
         self.services: list[FakeAcquisitionService] = []
 
     def __call__(self, *, cache_dir: Path, manifest_dir: Path) -> FakeAcquisitionService:
         self.calls.append((cache_dir, manifest_dir))
-        service = FakeAcquisitionService(self._result)
+        service = FakeAcquisitionService(self._outcome)
         self.services.append(service)
         return service
+
+
+class SecretFailingObjectStore(FakeObjectStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.put_attempts = 0
+
+    def put(self, key: str, body: bytes, content_type: str) -> StoredObject:
+        self.put_attempts += 1
+        raise RuntimeError(f"{RAW_PROVIDER_TEXT}: token={SECRET_VALUE}; event={RAW_EVENT_TEXT}")
 
 
 def request_payload(**overrides: object) -> dict[str, object]:
@@ -202,4 +226,87 @@ def test_handle_ingestion_validates_event_before_creating_acquisition_service() 
         )
 
     assert factory.calls == []
+    assert store.put_calls == ()
+
+
+@pytest.mark.parametrize("routing_field", ["bucket", "key", "prefix"])
+def test_handle_ingestion_rejects_event_supplied_storage_routing_before_effects(
+    routing_field: str,
+) -> None:
+    factory = FakeServiceFactory(acquisition_result())
+    store = FakeObjectStore()
+
+    with pytest.raises(ValidationError):
+        handle_ingestion(
+            {**request_payload(), routing_field: "untrusted-storage-location"},
+            service_factory=factory,
+            object_store=store,
+            bucket="research-artifacts",
+            clock=fixed_clock,
+        )
+
+    assert factory.calls == []
+    assert store.put_calls == ()
+
+
+def test_handle_ingestion_closes_secret_bearing_provider_errors(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    factory = FakeServiceFactory(
+        FakeProviderServiceError(
+            f"{RAW_PROVIDER_TEXT}: token={SECRET_VALUE}; event={RAW_EVENT_TEXT}"
+        )
+    )
+    store = FakeObjectStore()
+    caplog.set_level(logging.INFO, logger="src.cloud.ingestion_handler")
+
+    with pytest.raises(AcquisitionFailedError, match="^acquisition failed$") as error:
+        handle_ingestion(
+            request_payload(),
+            service_factory=factory,
+            object_store=store,
+            bucket="research-artifacts",
+            clock=fixed_clock,
+        )
+
+    assert SECRET_VALUE not in str(error.value)
+    assert RAW_PROVIDER_TEXT not in str(error.value)
+    assert RAW_EVENT_TEXT not in str(error.value)
+    assert SECRET_VALUE not in caplog.text
+    assert RAW_PROVIDER_TEXT not in caplog.text
+    assert RAW_EVENT_TEXT not in caplog.text
+    assert [getattr(record, "event_fields") for record in caplog.records] == [
+        {"symbol": "SPY", "started_at": "2024-03-29T12:00:00Z"},
+        {"failure_code": "ACQUISITION_FAILED"},
+    ]
+    assert store.put_calls == ()
+
+
+def test_handle_ingestion_closes_secret_bearing_object_store_errors(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    factory = FakeServiceFactory(acquisition_result())
+    store = SecretFailingObjectStore()
+    caplog.set_level(logging.INFO, logger="src.cloud.ingestion_handler")
+
+    with pytest.raises(ArtifactPublicationError, match="^artifact publication failed$") as error:
+        handle_ingestion(
+            request_payload(),
+            service_factory=factory,
+            object_store=store,
+            bucket="research-artifacts",
+            clock=fixed_clock,
+        )
+
+    assert SECRET_VALUE not in str(error.value)
+    assert RAW_PROVIDER_TEXT not in str(error.value)
+    assert RAW_EVENT_TEXT not in str(error.value)
+    assert SECRET_VALUE not in caplog.text
+    assert RAW_PROVIDER_TEXT not in caplog.text
+    assert RAW_EVENT_TEXT not in caplog.text
+    assert [getattr(record, "event_fields") for record in caplog.records] == [
+        {"symbol": "SPY", "started_at": "2024-03-29T12:00:00Z"},
+        {"failure_code": "ACQUISITION_FAILED"},
+    ]
+    assert store.put_attempts == 1
     assert store.put_calls == ()
