@@ -52,6 +52,20 @@ def test_research_request_admits_every_registered_strategy(
     assert request.visibility is Visibility.PRIVATE
 
 
+def test_research_request_freezes_omitted_strategy_parameters() -> None:
+    request = ResearchRequest.model_validate(
+        {
+            "symbol": "SPY",
+            "start": "2024-01-02",
+            "end": "2024-03-28",
+            "strategy_key": "breakout",
+        }
+    )
+
+    with pytest.raises(TypeError):
+        request.strategy_parameters["lookback"] = 20  # type: ignore[index]
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -114,6 +128,7 @@ def dataset_payload(**overrides: object) -> dict[str, object]:
         dataset_payload(key="datasets/v1/acquisition-1\\spy.parquet"),
         dataset_payload(key="runs/v1/acquisition-1/spy.parquet"),
         dataset_payload(bucket="Invalid bucket"),
+        dataset_payload(bucket="a..b"),
         dataset_payload(sha256="A" * 64),
         dataset_payload(manifest_sha256="short"),
         dataset_payload(completed_at="2024-03-29T12:00:00+01:00"),

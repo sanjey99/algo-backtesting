@@ -30,7 +30,7 @@ REQUIRED_ARTIFACTS = frozenset(
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
 _CONTROL_CHARACTER_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
-_BUCKET_PATTERN = re.compile(r"^(?=.{3,63}$)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
+_BUCKET_PATTERN = re.compile(r"^(?=.{3,63}$)(?!.*\.\.)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
 
 
 class Visibility(StrEnum):
@@ -142,7 +142,9 @@ class ResearchRequest(_Contract):
     start: date
     end: date
     strategy_key: str
-    strategy_parameters: Mapping[str, int | float] = Field(default_factory=dict)
+    strategy_parameters: Mapping[str, int | float] = Field(
+        default_factory=dict, validate_default=True
+    )
     initial_capital: float = 100_000.0
     commission_pct: float = 0.001
     slippage_pct: float = 0.0005
