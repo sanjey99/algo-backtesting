@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from datetime import UTC, datetime, timedelta
 from types import ModuleType
@@ -32,6 +33,11 @@ REQUIRED_BODIES = {
 
 def fixed_clock() -> datetime:
     return NOW
+
+
+def advancing_clock() -> object:
+    values = iter((NOW, NOW + timedelta(seconds=1)))
+    return lambda: next(values)
 
 
 def record(*, status: RunStatus = RunStatus.RUNNING) -> RunRecord:
@@ -78,6 +84,20 @@ def seed_artifacts(
         ]
         manifest_body = canonical_json_bytes({"schema_version": "1", "artifacts": manifest_entries})
     store.put(f"{prefix}checksums.json", manifest_body, "application/json")
+
+
+def noncanonical_manifest_body() -> bytes:
+    canonical = canonical_json_bytes(
+        {
+            "schema_version": "1",
+            "artifacts": [
+                {"name": name, "byte_length": len(body), "sha256": sha256_hex(body)}
+                for name, body in REQUIRED_BODIES.items()
+            ],
+        }
+    )
+    artifacts = canonical.removeprefix(b'{"artifacts":').removesuffix(b',"schema_version":"1"}')
+    return b'{"schema_version":"1","artifacts":' + artifacts + b"}"
 
 
 def test_finalize_success_verifies_exact_artifacts_before_marking_succeeded() -> None:
@@ -305,15 +325,12 @@ def test_finalize_success_returns_existing_canonical_success_on_replay() -> None
     store = FakeObjectStore()
     repository = seed_repository()
     seed_artifacts(store)
-    first = finalize_success(
-        RUN_ID, object_store=store, run_repository=repository, clock=fixed_clock
-    )
-    replay = finalize_success(
-        RUN_ID, object_store=store, run_repository=repository, clock=fixed_clock
-    )
+    clock = advancing_clock()
+    first = finalize_success(RUN_ID, object_store=store, run_repository=repository, clock=clock)
+    replay = finalize_success(RUN_ID, object_store=store, run_repository=repository, clock=clock)
 
     assert replay == first
-    assert len(repository.mark_succeeded_calls) == 2
+    assert len(repository.mark_succeeded_calls) == 1
 
 
 def test_finalize_success_rejects_a_conflicting_terminal_run() -> None:
@@ -326,6 +343,33 @@ def test_finalize_success_rejects_a_conflicting_terminal_run() -> None:
 
     with pytest.raises(StateTransitionError):
         finalize_success(RUN_ID, object_store=store, run_repository=repository, clock=fixed_clock)
+
+
+def test_finalize_success_rejects_pending_after_artifact_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.cloud.finalize_handler import finalize_success
+
+    store = FakeObjectStore()
+    repository = seed_repository(status=RunStatus.PENDING)
+    seed_artifacts(store)
+    get_calls: list[str] = []
+    original_get = store.get
+
+    def record_get(key: str, maximum_bytes: int) -> bytes:
+        get_calls.append(key)
+        return original_get(key, maximum_bytes)
+
+    monkeypatch.setattr(store, "get", record_get)
+
+    with pytest.raises(StateTransitionError):
+        finalize_success(RUN_ID, object_store=store, run_repository=repository, clock=fixed_clock)
+
+    assert repository.mark_succeeded_calls == ()
+    assert set(get_calls) == {
+        f"runs/v1/{RUN_ID}/checksums.json",
+        *{f"runs/v1/{RUN_ID}/{name}" for name in REQUIRED_BODIES},
+    }
 
 
 @pytest.mark.parametrize("status", [RunStatus.PENDING, RunStatus.RUNNING])
@@ -352,11 +396,12 @@ def test_finalize_failure_replays_only_the_same_closed_failure() -> None:
     from src.cloud.finalize_handler import finalize_failure
 
     repository = seed_repository()
+    clock = advancing_clock()
     first = finalize_failure(
-        RUN_ID, FailureCode.WORKER_FAILED, run_repository=repository, clock=fixed_clock
+        RUN_ID, FailureCode.WORKER_FAILED, run_repository=repository, clock=clock
     )
     replay = finalize_failure(
-        RUN_ID, FailureCode.WORKER_FAILED, run_repository=repository, clock=fixed_clock
+        RUN_ID, FailureCode.WORKER_FAILED, run_repository=repository, clock=clock
     )
 
     assert replay == first
@@ -367,6 +412,124 @@ def test_finalize_failure_replays_only_the_same_closed_failure() -> None:
             run_repository=repository,
             clock=fixed_clock,
         )
+
+
+def test_finalize_failure_rejects_an_existing_success() -> None:
+    from src.cloud.finalize_handler import finalize_failure
+
+    repository = seed_repository()
+    repository.mark_succeeded(RUN_ID, NOW)
+
+    with pytest.raises(StateTransitionError):
+        finalize_failure(
+            RUN_ID,
+            FailureCode.WORKER_FAILED,
+            run_repository=repository,
+            clock=fixed_clock,
+        )
+
+
+def test_finalize_success_closes_missing_manifest_and_physical_artifact() -> None:
+    from src.cloud.finalize_handler import ArtifactVerificationError, finalize_success
+
+    for missing_key in (f"runs/v1/{RUN_ID}/checksums.json", f"runs/v1/{RUN_ID}/report.html"):
+        store = FakeObjectStore()
+        repository = seed_repository()
+        seed_artifacts(store)
+        del store._objects[missing_key]
+
+        with pytest.raises(ArtifactVerificationError):
+            finalize_success(
+                RUN_ID, object_store=store, run_repository=repository, clock=fixed_clock
+            )
+
+        assert repository.mark_succeeded_calls == ()
+
+
+@pytest.mark.parametrize(
+    "manifest_body",
+    [
+        b'{"schema_version":"1","schema_version":"1","artifacts":[]}',
+        b"[]",
+        noncanonical_manifest_body(),
+        b'{"schema_version":"1","artifacts":[{"name":"report.html","byte_length":1,"sha256":"A"}]}',
+    ],
+)
+def test_finalize_success_rejects_strict_raw_manifest_forms_before_transition(
+    manifest_body: bytes,
+) -> None:
+    from src.cloud.finalize_handler import ArtifactVerificationError, finalize_success
+
+    store = FakeObjectStore()
+    repository = seed_repository()
+    seed_artifacts(store, manifest_body=manifest_body)
+
+    with pytest.raises(ArtifactVerificationError):
+        finalize_success(RUN_ID, object_store=store, run_repository=repository, clock=fixed_clock)
+
+    assert repository.mark_succeeded_calls == ()
+
+
+@pytest.mark.parametrize(
+    "entry_change",
+    [
+        {"unexpected": True},
+        {"sha256": "A" * 64},
+        {"sha256": "a" * 63},
+        {"byte_length": True},
+        {"byte_length": 1.0},
+        {"byte_length": "1"},
+        {"byte_length": -1},
+    ],
+)
+def test_finalize_success_rejects_strict_manifest_entry_forms_before_transition(
+    entry_change: dict[str, object],
+) -> None:
+    from src.cloud.finalize_handler import ArtifactVerificationError, finalize_success
+
+    store = FakeObjectStore()
+    repository = seed_repository()
+    entries = [
+        {"name": name, "byte_length": len(body), "sha256": sha256_hex(body)}
+        for name, body in REQUIRED_BODIES.items()
+    ]
+    entries[0].update(entry_change)
+    seed_artifacts(store, entries=entries)
+
+    with pytest.raises(ArtifactVerificationError):
+        finalize_success(RUN_ID, object_store=store, run_repository=repository, clock=fixed_clock)
+
+    assert repository.mark_succeeded_calls == ()
+
+
+@pytest.mark.parametrize(
+    "result_body",
+    [
+        b'{"run_id":"123e4567-e89b-12d3-a456-426614174000","run_id":"123e4567-e89b-12d3-a456-426614174000"}',
+        b'{"run_id":',
+        b"[]",
+        b'{"schema_version":"1"}',
+        b'{"schema_version":"1","run_id":"123e4567-e89b-12d3-a456-426614174000"}',
+        b'{"run_id":1}',
+        b'{"run_id":"123E4567-E89B-12D3-A456-426614174000"}',
+        b'{"run_id":"123e4567-e89b-12d3-a456-426614174000", "schema_version":"1"}',
+    ],
+)
+def test_finalize_success_rejects_strict_raw_result_forms_before_transition(
+    result_body: bytes,
+) -> None:
+    from src.cloud.finalize_handler import ArtifactVerificationError, finalize_success
+
+    store = FakeObjectStore()
+    repository = seed_repository()
+    bodies = dict(REQUIRED_BODIES)
+    bodies["result.json"] = result_body
+    seed_artifacts(store, bodies=bodies)
+
+    with pytest.raises(ArtifactVerificationError):
+        finalize_success(RUN_ID, object_store=store, run_repository=repository, clock=fixed_clock)
+
+    assert repository.mark_succeeded_calls == ()
 
 
 def test_handle_finalization_accepts_only_closed_routing_shapes() -> None:
@@ -398,6 +561,40 @@ def test_handle_finalization_accepts_only_closed_routing_shapes() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "event",
+    [
+        [],
+        {"run_id": 1, "outcome": "SUCCEEDED"},
+        {"run_id": RUN_ID, "outcome": "FAILED", "failure_code": "unknown"},
+        {"run_id": RUN_ID, "outcome": "SUCCEEDED", "failure_code": "WORKER_FAILED"},
+        {"run_id": RUN_ID, "outcome": "FAILED", "failure_code": "WORKER_FAILED", "Error": "x"},
+        {"run_id": RUN_ID, "outcome": "FAILED", "failure_code": "WORKER_FAILED", "Cause": "secret"},
+        {"run_id": RUN_ID, "outcome": "FAILED", "failure_code": "WORKER_FAILED", "bucket": "x"},
+        {"run_id": RUN_ID, "outcome": "FAILED", "failure_code": "WORKER_FAILED", "key": "x"},
+        {"run_id": RUN_ID, "outcome": "FAILED", "failure_code": "WORKER_FAILED", "prefix": "x"},
+        {"run_id": RUN_ID, "outcome": "FAILED", "failure_code": "WORKER_FAILED", "table": "x"},
+        {"run_id": RUN_ID, "outcome": "FAILED", "failure_code": "WORKER_FAILED", "routing": "x"},
+    ],
+)
+def test_handle_finalization_rejects_untrusted_event_routing_without_transition(
+    event: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    from src.cloud.finalize_handler import handle_finalization
+
+    store = FakeObjectStore()
+    repository = seed_repository()
+    seed_artifacts(store)
+    caplog.set_level(logging.ERROR, logger="src.cloud.finalize_handler")
+
+    with pytest.raises(ValueError):
+        handle_finalization(event, object_store=store, run_repository=repository, clock=fixed_clock)
+
+    assert repository.mark_succeeded_calls == ()
+    assert repository.mark_failed_calls == ()
+    assert "secret" not in caplog.text
+
+
 class RecordingBoto3(ModuleType):
     def __init__(self) -> None:
         super().__init__("boto3")
@@ -421,6 +618,26 @@ def test_lambda_handler_defers_boto_and_rejects_invalid_environment_before_clien
     monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
     monkeypatch.setenv("ARTIFACT_BUCKET", "not valid bucket!")
     monkeypatch.setenv("RUN_TABLE", "research-runs")
+
+    with pytest.raises(ValueError):
+        lambda_handler(
+            {"run_id": RUN_ID, "outcome": "FAILED", "failure_code": "WORKER_FAILED"},
+            object(),
+        )
+
+    assert fake_boto3.calls == []
+
+
+@pytest.mark.parametrize("table_name", [" ", "bad name", "x" * 256])
+def test_lambda_handler_rejects_invalid_table_before_client_construction(
+    monkeypatch: pytest.MonkeyPatch, table_name: str
+) -> None:
+    from src.cloud.finalize_handler import lambda_handler
+
+    fake_boto3 = RecordingBoto3()
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+    monkeypatch.setenv("ARTIFACT_BUCKET", "research-artifacts")
+    monkeypatch.setenv("RUN_TABLE", table_name)
 
     with pytest.raises(ValueError):
         lambda_handler(

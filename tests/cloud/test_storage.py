@@ -11,6 +11,7 @@ from src.cloud.contracts import FailureCode, RunRecord, RunStatus, Visibility, s
 from src.cloud.storage import (
     DynamoRunRepository,
     ImmutableObjectConflict,
+    ObjectNotFoundError,
     ObjectSizeLimitError,
     S3ObjectStore,
     StateTransitionError,
@@ -104,6 +105,14 @@ def precondition_failure() -> ClientError:
     return ClientError(
         {"Error": {"Code": "PreconditionFailed", "Message": "AWS internals"}}, "PutObject"
     )
+
+
+def not_found_failure(operation: str) -> ClientError:
+    return ClientError({"Error": {"Code": "NoSuchKey", "Message": "missing"}}, operation)
+
+
+def service_failure(operation: str) -> ClientError:
+    return ClientError({"Error": {"Code": "SlowDown", "Message": "retry later"}}, operation)
 
 
 def record(**overrides: object) -> RunRecord:
@@ -207,6 +216,36 @@ def test_s3_get_bounds_before_read_and_verifies_returned_length() -> None:
     assert client.head_calls == [{"Bucket": "research-artifacts", "Key": DATASET_KEY}]
 
 
+@pytest.mark.parametrize("operation", ["head", "get"])
+def test_s3_get_translates_only_s3_not_found_conditions(
+    operation: str,
+) -> None:
+    client = RecordingS3Client(
+        objects={DATASET_KEY: b"safe"},
+        fail_head_with=not_found_failure("HeadObject") if operation == "head" else None,
+        fail_get_with=not_found_failure("GetObject") if operation == "get" else None,
+    )
+    store = S3ObjectStore(client=client, bucket="research-artifacts")
+
+    with pytest.raises(ObjectNotFoundError) as error:
+        store.get(DATASET_KEY, maximum_bytes=4)
+
+    assert isinstance(error.value.__cause__, ClientError)
+
+
+@pytest.mark.parametrize("operation", ["head", "get"])
+def test_s3_get_preserves_non_not_found_client_errors(operation: str) -> None:
+    client = RecordingS3Client(
+        objects={DATASET_KEY: b"safe"},
+        fail_head_with=service_failure("HeadObject") if operation == "head" else None,
+        fail_get_with=service_failure("GetObject") if operation == "get" else None,
+    )
+    store = S3ObjectStore(client=client, bucket="research-artifacts")
+
+    with pytest.raises(ClientError, match="retry later"):
+        store.get(DATASET_KEY, maximum_bytes=4)
+
+
 @pytest.mark.parametrize("value", [1.5, True])
 def test_s3_get_rejects_non_integer_maximum_bytes_before_head(value: object) -> None:
     client = RecordingS3Client(objects={DATASET_KEY: b"safe"})
@@ -291,8 +330,7 @@ def test_dynamo_create_pending_writes_derived_key_and_exact_condition() -> None:
             {
                 "UpdateExpression": "SET #status = :succeeded, completed_at = :completed",
                 "ConditionExpression": (
-                    "#status = :running OR "
-                    "(#status = :succeeded AND completed_at = :completed)"
+                    "#status = :running OR (#status = :succeeded AND completed_at = :completed)"
                 ),
                 "ExpressionAttributeNames": {"#status": "status"},
                 "ExpressionAttributeValues": {

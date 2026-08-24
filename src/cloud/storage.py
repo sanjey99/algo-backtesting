@@ -1,4 +1,5 @@
 """Injectable, offline-safe S3 artifact and DynamoDB run-state adapters."""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -38,6 +39,10 @@ class ObjectSizeLimitError(StorageError):
 
 class ObjectIntegrityError(StorageError):
     """An object response does not match its immutable metadata."""
+
+
+class ObjectNotFoundError(StorageError):
+    """An immutable object is absent from the fixed artifact bucket."""
 
 
 class StateTransitionError(StorageError):
@@ -145,6 +150,12 @@ def _is_conditional_failure(error: ClientError) -> bool:
     return isinstance(details, Mapping) and details.get("Code") == "ConditionalCheckFailedException"
 
 
+def _is_object_not_found(error: ClientError) -> bool:
+    response = error.response
+    details = response.get("Error")
+    return isinstance(details, Mapping) and details.get("Code") in {"404", "NoSuchKey", "NotFound"}
+
+
 class S3ObjectStore:
     """S3 object store with fixed bucket, immutable writes, and bounded reads."""
 
@@ -198,9 +209,13 @@ class S3ObjectStore:
         stored = self.head(admitted_key)
         if stored.byte_length > maximum_bytes:
             raise ObjectSizeLimitError("object exceeds the requested download limit")
-        response = _response_mapping(
-            self._client.get_object(Bucket=self._bucket, Key=admitted_key), operation="get_object"
-        )
+        try:
+            raw_response = self._client.get_object(Bucket=self._bucket, Key=admitted_key)
+        except ClientError as error:
+            if _is_object_not_found(error):
+                raise ObjectNotFoundError("immutable object was not found") from error
+            raise
+        response = _response_mapping(raw_response, operation="get_object")
         raw_body = response.get("Body")
         if not isinstance(raw_body, _ReadableBody):
             raise ObjectIntegrityError("get_object returned a non-readable body")
@@ -214,9 +229,13 @@ class S3ObjectStore:
 
     def head(self, key: str) -> StoredObject:
         admitted_key = _validate_storage_key(key)
-        response = _response_mapping(
-            self._client.head_object(Bucket=self._bucket, Key=admitted_key), operation="head_object"
-        )
+        try:
+            raw_response = self._client.head_object(Bucket=self._bucket, Key=admitted_key)
+        except ClientError as error:
+            if _is_object_not_found(error):
+                raise ObjectNotFoundError("immutable object was not found") from error
+            raise
+        response = _response_mapping(raw_response, operation="head_object")
         byte_length = response.get("ContentLength")
         if isinstance(byte_length, bool) or not isinstance(byte_length, int) or byte_length < 0:
             raise ObjectIntegrityError("head_object returned an invalid content length")

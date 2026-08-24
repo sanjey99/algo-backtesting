@@ -1,4 +1,5 @@
 """Immutable in-memory cloud adapters for offline handler tests."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,6 +8,7 @@ from datetime import datetime
 from src.cloud.contracts import FailureCode, RunRecord, RunStatus, sha256_hex
 from src.cloud.storage import (
     ImmutableObjectConflict,
+    ObjectNotFoundError,
     ObjectSizeLimitError,
     StateTransitionError,
     StoredObject,
@@ -89,7 +91,10 @@ class FakeObjectStore:
 
     def head(self, key: str) -> StoredObject:
         admitted_key = _validate_storage_key(key)
-        body = self._objects[admitted_key]
+        try:
+            body = self._objects[admitted_key]
+        except KeyError as error:
+            raise ObjectNotFoundError("immutable object was not found") from error
         return StoredObject(admitted_key, len(body), sha256_hex(body))
 
     def presign_get(self, key: str, expires_seconds: int) -> str:
