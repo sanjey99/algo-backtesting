@@ -113,9 +113,6 @@ def test_prepare_run_publishes_canonical_pinned_spec_then_creates_private_pendin
     assert record.image_digest == IMAGE_DIGEST
     assert record.created_at == NOW
     assert record.expires_at == 1_715_601_600
-    assert record.started_at is None
-    assert record.completed_at is None
-    assert record.failure_code is None
 
 
 @pytest.mark.parametrize(
@@ -286,6 +283,7 @@ def test_lambda_handler_builds_aws_adapters_only_after_validating_runtime_config
     assert item["status"] == "PENDING"
     assert item["visibility"] == "PRIVATE"
     assert item["image_digest"] == IMAGE_DIGEST
+    assert {"started_at", "completed_at", "failure_code"}.isdisjoint(item)
     assert fake_boto3.table.put_calls[0]["ConditionExpression"] == "attribute_not_exists(PK)"
 
 

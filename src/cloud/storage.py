@@ -263,7 +263,7 @@ class DynamoRunRepository:
     def create_pending(self, record: RunRecord) -> None:
         if record.status is not RunStatus.PENDING:
             raise ValueError("only PENDING run records may be created")
-        item = record.model_dump(mode="json")
+        item = record.model_dump(mode="json", exclude_none=True)
         item.pop("run_id")
         item = {"PK": _run_key(record.run_id)["PK"], **item}
         try:
