@@ -81,6 +81,12 @@ def test_plotly_chart_json_cannot_break_out_of_its_script_element() -> None:
     assert "\\u003c\\u002fscript\\u003e" in chart
 
 
+def test_html_report_accepts_a_deterministic_chart_div_id() -> None:
+    report = generate_html_report(_result(), chart_div_id="cloud-run-123e4567")
+
+    assert 'id="cloud-run-123e4567"' in report
+
+
 def test_chart_has_clear_empty_and_missing_dependency_fallbacks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
