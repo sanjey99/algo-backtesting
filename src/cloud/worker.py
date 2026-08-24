@@ -10,6 +10,8 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from pydantic import ValidationError
 
 from src.analytics.metrics import compute_all_metrics
@@ -26,6 +28,7 @@ from src.cloud.contracts import (
 from src.cloud.storage import DynamoRunRepository, ObjectStore, RunRepository, S3ObjectStore
 from src.data import df_to_candles
 from src.engine.backtest import BacktestConfig, BacktestEngine, BacktestResult
+from src.models.candle import Candle
 from src.models.trade import Trade
 from src.observability import configure_logging, log_event
 from src.strategies import STRATEGY_REGISTRY
@@ -48,6 +51,46 @@ _TRADE_COLUMNS = (
     "pnl_pct",
 )
 _EQUITY_COLUMNS = ("timestamp", "equity", "drawdown_pct")
+_TRADE_DTYPES = {
+    "trade_id": "string",
+    "symbol": "string",
+    "direction": "string",
+    "entry_timestamp": "datetime64[ns, UTC]",
+    "exit_timestamp": "datetime64[ns, UTC]",
+    "entry_price": "float64",
+    "exit_price": "float64",
+    "quantity": "int64",
+    "commission": "float64",
+    "pnl": "float64",
+    "pnl_pct": "float64",
+}
+_EQUITY_DTYPES = {
+    "timestamp": "datetime64[ns, UTC]",
+    "equity": "float64",
+    "drawdown_pct": "float64",
+}
+_TRADE_ARROW_SCHEMA = pa.schema(
+    [
+        pa.field("trade_id", pa.string()),
+        pa.field("symbol", pa.string()),
+        pa.field("direction", pa.string()),
+        pa.field("entry_timestamp", pa.timestamp("ns", tz="UTC")),
+        pa.field("exit_timestamp", pa.timestamp("ns", tz="UTC")),
+        pa.field("entry_price", pa.float64()),
+        pa.field("exit_price", pa.float64()),
+        pa.field("quantity", pa.int64()),
+        pa.field("commission", pa.float64()),
+        pa.field("pnl", pa.float64()),
+        pa.field("pnl_pct", pa.float64()),
+    ]
+)
+_EQUITY_ARROW_SCHEMA = pa.schema(
+    [
+        pa.field("timestamp", pa.timestamp("ns", tz="UTC")),
+        pa.field("equity", pa.float64()),
+        pa.field("drawdown_pct", pa.float64()),
+    ]
+)
 
 Clock = Callable[[], datetime]
 
@@ -136,6 +179,12 @@ def _admit_run_spec(run_spec_key: str, body: bytes) -> RunSpec:
         raise WorkerError("run specification key mismatch")
     if body != _canonical_run_spec_bytes(run_spec):
         raise WorkerError("run specification admission failed")
+    if (
+        run_spec.dataset.symbol != run_spec.request.symbol
+        or run_spec.dataset.start != run_spec.request.start
+        or run_spec.dataset.end != run_spec.request.end
+    ):
+        raise WorkerError("dataset and request do not agree")
     return run_spec
 
 
@@ -168,6 +217,17 @@ def _timestamp_text(value: datetime) -> str:
     return _utc_timestamp(value).isoformat().replace("+00:00", "Z")
 
 
+def _typed_frame(
+    rows: list[dict[str, object]], columns: tuple[str, ...], dtypes: Mapping[str, str]
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            column: pd.Series([row[column] for row in rows], dtype=dtypes[column])
+            for column in columns
+        }
+    )
+
+
 def trade_frame(result: BacktestResult) -> pd.DataFrame:
     """Return completed trade artifacts with cloud-run-derived stable IDs."""
     rows: list[dict[str, object]] = []
@@ -189,7 +249,7 @@ def trade_frame(result: BacktestResult) -> pd.DataFrame:
                 "pnl_pct": trade.pnl_pct,
             }
         )
-    return pd.DataFrame(rows, columns=_TRADE_COLUMNS)
+    return _typed_frame(rows, _TRADE_COLUMNS, _TRADE_DTYPES)
 
 
 def equity_frame(result: BacktestResult) -> pd.DataFrame:
@@ -202,7 +262,14 @@ def equity_frame(result: BacktestResult) -> pd.DataFrame:
         }
         for point in result.equity_curve
     ]
-    return pd.DataFrame(rows, columns=_EQUITY_COLUMNS)
+    return _typed_frame(rows, _EQUITY_COLUMNS, _EQUITY_DTYPES)
+
+
+def _require_candle_range(run_spec: RunSpec, candles: list[Candle]) -> None:
+    for candle in candles:
+        candle_date = candle.timestamp.date()
+        if not run_spec.dataset.start <= candle_date <= run_spec.dataset.end:
+            raise WorkerError("dataset contains an out-of-range candle")
 
 
 def _json_metric(value: float) -> float | None:
@@ -226,8 +293,15 @@ def result_summary(result: BacktestResult, metrics: Mapping[str, float]) -> dict
 
 
 def _parquet_bytes(frame: pd.DataFrame) -> bytes:
+    columns = tuple(frame.columns)
+    if columns == _TRADE_COLUMNS:
+        schema = _TRADE_ARROW_SCHEMA
+    elif columns == _EQUITY_COLUMNS:
+        schema = _EQUITY_ARROW_SCHEMA
+    else:
+        raise ValueError("unsupported artifact parquet schema")
     buffer = io.BytesIO()
-    frame.to_parquet(buffer, index=False)
+    pq.write_table(pa.Table.from_pandas(frame, schema=schema, preserve_index=False), buffer)
     return buffer.getvalue()
 
 
@@ -259,6 +333,7 @@ def execute_run(
         candles = df_to_candles(dataset_frame)
     except Exception:
         raise WorkerError("dataset parquet is invalid") from None
+    _require_candle_range(run_spec, candles)
 
     try:
         strategy_type = STRATEGY_REGISTRY[run_spec.request.strategy_key]

@@ -12,6 +12,8 @@ from types import ModuleType
 from uuid import UUID
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from src.cloud.contracts import (
@@ -27,7 +29,7 @@ from src.cloud.contracts import (
 )
 from src.cloud.prepare_handler import _run_spec_payload
 from src.cloud.storage import ObjectSizeLimitError, StateTransitionError
-from src.engine.backtest import BacktestResult
+from src.engine.backtest import BacktestEngine, BacktestResult
 from src.models.portfolio import EquityPoint
 from tests.cloud.fakes import FakeObjectStore, FakeRunRepository
 
@@ -37,6 +39,28 @@ FIXTURE_SHA256 = "f9fa01d03f257c361de21c5cb77cb9ac7c4982783383b9e2be4039d6aeb20a
 NOW = datetime(2024, 3, 29, 12, 0, tzinfo=UTC)
 RUN_ID = UUID("123e4567-e89b-12d3-a456-426614174000")
 IMAGE_DIGEST = "sha256:" + "c" * 64
+EXPECTED_TRADE_SCHEMA = pa.schema(
+    [
+        pa.field("trade_id", pa.string()),
+        pa.field("symbol", pa.string()),
+        pa.field("direction", pa.string()),
+        pa.field("entry_timestamp", pa.timestamp("ns", tz="UTC")),
+        pa.field("exit_timestamp", pa.timestamp("ns", tz="UTC")),
+        pa.field("entry_price", pa.float64()),
+        pa.field("exit_price", pa.float64()),
+        pa.field("quantity", pa.int64()),
+        pa.field("commission", pa.float64()),
+        pa.field("pnl", pa.float64()),
+        pa.field("pnl_pct", pa.float64()),
+    ]
+)
+EXPECTED_EQUITY_SCHEMA = pa.schema(
+    [
+        pa.field("timestamp", pa.timestamp("ns", tz="UTC")),
+        pa.field("equity", pa.float64()),
+        pa.field("drawdown_pct", pa.float64()),
+    ]
+)
 
 
 def fixed_clock() -> datetime:
@@ -54,7 +78,7 @@ def dataset_ref(body: bytes) -> DatasetRef:
         calendar="XNYS",
         interval="1d",
         start=date(2024, 1, 2),
-        end=date(2024, 3, 28),
+        end=date(2024, 3, 29),
         acquisition_id="acquisition-1",
         completed_at=NOW,
     )
@@ -64,7 +88,7 @@ def request(**changes: object) -> ResearchRequest:
     values: dict[str, object] = {
         "symbol": "SPY",
         "start": "2024-01-02",
-        "end": "2024-03-28",
+        "end": "2024-03-29",
         "strategy_key": "ma_crossover",
         "strategy_parameters": {"fast_period": 3, "slow_period": 7},
         "initial_capital": 100_000.0,
@@ -164,6 +188,8 @@ def test_execute_run_admits_exact_inputs_runs_real_engine_and_publishes_manifest
     }
     assert summary["run_id"] == spec.run_id
     assert summary["dataset_sha256"] == spec.dataset.sha256
+    assert summary["start_date"] == "2024-01-02"
+    assert summary["end_date"] == "2024-03-29"
     assert not {"bars", "trades", "equity_curve"} & summary.keys()
     assert pd.read_parquet(io.BytesIO(artifacts["trades.parquet"])).columns.tolist() == [
         "trade_id", "symbol", "direction", "entry_timestamp", "exit_timestamp", "entry_price",
@@ -172,6 +198,12 @@ def test_execute_run_admits_exact_inputs_runs_real_engine_and_publishes_manifest
     assert pd.read_parquet(io.BytesIO(artifacts["equity-curve.parquet"])).columns.tolist() == [
         "timestamp", "equity", "drawdown_pct"
     ]
+    assert pq.ParquetFile(io.BytesIO(artifacts["trades.parquet"])).schema_arrow == (
+        EXPECTED_TRADE_SCHEMA
+    )
+    assert pq.ParquetFile(io.BytesIO(artifacts["equity-curve.parquet"])).schema_arrow == (
+        EXPECTED_EQUITY_SCHEMA
+    )
     assert 'id="cloud-run-123e4567-e89b-12d3-a456-426614174000"' in (
         artifacts["report.html"].decode()
     )
@@ -203,6 +235,102 @@ def test_execute_run_rejects_dataset_checksum_before_engine_or_artifacts() -> No
         (spec.run_id, NOW)
     ]
     assert artifact_bodies(store, spec) == {}
+
+
+@pytest.mark.parametrize(
+    ("component", "value"),
+    [
+        pytest.param("dataset", "QQQ", id="symbol"),
+        pytest.param("request", "2024-03-28", id="range"),
+    ],
+)
+def test_execute_run_rejects_dataset_request_identity_mismatch_before_running(
+    component: str,
+    value: str,
+) -> None:
+    from src.cloud.worker import WorkerError, execute_run
+
+    store = FakeObjectStore()
+    repository = FakeRunRepository()
+    spec = seed_run(store, repository)
+    payload = json.loads(store.get(spec.run_spec_key, 1_000_000))
+    if component == "dataset":
+        payload["dataset"]["symbol"] = value
+    else:
+        payload["request"]["end"] = value
+    store._objects[spec.run_spec_key] = canonical_json_bytes(payload)
+
+    with pytest.raises(WorkerError, match="dataset and request do not agree"):
+        execute_run(
+            spec.run_spec_key,
+            object_store=store,
+            run_repository=repository,
+            clock=fixed_clock,
+        )
+
+    assert repository.mark_running_calls == ()
+    assert artifact_bodies(store, spec) == {}
+
+
+def test_execute_run_rejects_out_of_range_candle_before_engine_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.cloud import worker
+
+    store = FakeObjectStore()
+    repository = FakeRunRepository()
+    frame = pd.read_parquet(FIXTURE_PATH)
+    out_of_range = frame.iloc[[-1]].assign(timestamp=pd.Timestamp("2024-04-01"))
+    body_buffer = io.BytesIO()
+    pd.concat([frame, out_of_range], ignore_index=True).to_parquet(body_buffer, index=False)
+    spec = seed_run(store, repository, dataset_body=body_buffer.getvalue())
+    engine_called = False
+
+    def fail_if_called(*args: object, **kwargs: object) -> BacktestResult:
+        nonlocal engine_called
+        del args, kwargs
+        engine_called = True
+        raise AssertionError("engine must not receive an out-of-range candle")
+
+    monkeypatch.setattr(BacktestEngine, "run", fail_if_called)
+
+    with pytest.raises(worker.WorkerError, match="dataset contains an out-of-range candle"):
+        worker.execute_run(
+            spec.run_spec_key,
+            object_store=store,
+            run_repository=repository,
+            clock=fixed_clock,
+        )
+
+    assert engine_called is False
+    assert artifact_bodies(store, spec) == {}
+
+
+def _empty_result() -> BacktestResult:
+    return BacktestResult(
+        strategy_name="ma_crossover",
+        symbol="SPY",
+        start_date=NOW,
+        end_date=NOW,
+        parameters={"fast_period": 3, "slow_period": 7},
+        trades=[],
+        equity_curve=[],
+        final_equity=100_000.0,
+        initial_capital=100_000.0,
+        run_id=str(RUN_ID),
+    )
+
+
+def test_empty_artifact_parquet_schemas_are_typed_and_deterministic() -> None:
+    from src.cloud.worker import _parquet_bytes, equity_frame, trade_frame
+
+    result = _empty_result()
+    empty_trade_bytes = _parquet_bytes(trade_frame(result))
+    empty_equity_bytes = _parquet_bytes(equity_frame(result))
+    assert pq.ParquetFile(io.BytesIO(empty_trade_bytes)).schema_arrow == EXPECTED_TRADE_SCHEMA
+    assert pq.ParquetFile(io.BytesIO(empty_equity_bytes)).schema_arrow == EXPECTED_EQUITY_SCHEMA
+    assert empty_trade_bytes == _parquet_bytes(trade_frame(_empty_result()))
+    assert empty_equity_bytes == _parquet_bytes(equity_frame(_empty_result()))
 
 
 @pytest.mark.parametrize(
