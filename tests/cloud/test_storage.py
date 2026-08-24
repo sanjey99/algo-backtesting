@@ -31,6 +31,8 @@ class RecordingS3Client:
     objects: dict[str, bytes] = field(default_factory=dict)
     content_types: dict[str, str] = field(default_factory=dict)
     fail_put_with: ClientError | None = None
+    fail_head_with: ClientError | None = None
+    fail_get_with: ClientError | None = None
 
     def put_object(self, **kwargs: object) -> None:
         self.put_calls.append(dict(kwargs))
@@ -43,6 +45,8 @@ class RecordingS3Client:
 
     def head_object(self, **kwargs: object) -> dict[str, object]:
         self.head_calls.append(dict(kwargs))
+        if self.fail_head_with is not None:
+            raise self.fail_head_with
         key = str(kwargs["Key"])
         body = self.objects[key]
         return {
@@ -53,6 +57,8 @@ class RecordingS3Client:
 
     def get_object(self, **kwargs: object) -> dict[str, object]:
         self.get_calls.append(dict(kwargs))
+        if self.fail_get_with is not None:
+            raise self.fail_get_with
         return {"Body": BytesIO(self.objects[str(kwargs["Key"])])}
 
     def generate_presigned_url(self, client_method: str, **kwargs: object) -> str:
@@ -170,6 +176,24 @@ def test_s3_put_maps_an_oversized_preexisting_object_to_immutable_conflict() -> 
     assert client.get_calls == []
 
 
+@pytest.mark.parametrize("failure_location", ["head", "get"])
+def test_s3_put_closes_replay_client_errors_as_immutable_conflicts(
+    failure_location: str,
+) -> None:
+    client = RecordingS3Client(
+        objects={DATASET_KEY: b"same"},
+        fail_put_with=precondition_failure(),
+        fail_head_with=conditional_failure() if failure_location == "head" else None,
+        fail_get_with=conditional_failure() if failure_location == "get" else None,
+    )
+    store = S3ObjectStore(client=client, bucket="research-artifacts")
+
+    with pytest.raises(ImmutableObjectConflict) as error:
+        store.put(DATASET_KEY, b"same", "application/octet-stream")
+
+    assert "AWS internals" not in str(error.value)
+
+
 def test_s3_get_bounds_before_read_and_verifies_returned_length() -> None:
     client = RecordingS3Client(objects={DATASET_KEY: b"oversized"})
     store = S3ObjectStore(client=client, bucket="research-artifacts")
@@ -181,6 +205,17 @@ def test_s3_get_bounds_before_read_and_verifies_returned_length() -> None:
 
     assert client.get_calls == []
     assert client.head_calls == [{"Bucket": "research-artifacts", "Key": DATASET_KEY}]
+
+
+@pytest.mark.parametrize("value", [1.5, True])
+def test_s3_get_rejects_non_integer_maximum_bytes_before_head(value: object) -> None:
+    client = RecordingS3Client(objects={DATASET_KEY: b"safe"})
+    store = S3ObjectStore(client=client, bucket="research-artifacts")
+
+    with pytest.raises(ValueError):
+        store.get(DATASET_KEY, maximum_bytes=value)  # type: ignore[arg-type]
+
+    assert client.head_calls == []
 
 
 def test_s3_head_and_presign_validate_fixed_key_and_five_minute_ceiling() -> None:
@@ -197,6 +232,17 @@ def test_s3_head_and_presign_validate_fixed_key_and_five_minute_ceiling() -> Non
     assert client.presign_calls == [
         ("get_object", {"Bucket": "research-artifacts", "Key": DATASET_KEY}, 300)
     ]
+
+
+@pytest.mark.parametrize("value", [1.5, True])
+def test_s3_presign_rejects_non_integer_expiries(value: object) -> None:
+    client = RecordingS3Client()
+    store = S3ObjectStore(client=client, bucket="research-artifacts")
+
+    with pytest.raises(ValueError):
+        store.presign_get(DATASET_KEY, expires_seconds=value)  # type: ignore[arg-type]
+
+    assert client.presign_calls == []
 
 
 def test_dynamo_create_pending_writes_derived_key_and_exact_condition() -> None:

@@ -177,7 +177,7 @@ class S3ObjectStore:
                 raise
             try:
                 existing = self.get(admitted_key, maximum_bytes=len(copied_body))
-            except (ObjectIntegrityError, ObjectSizeLimitError):
+            except (ClientError, StorageError):
                 raise ImmutableObjectConflict(
                     "immutable object key cannot be verified as byte-identical"
                 ) from None
@@ -189,7 +189,11 @@ class S3ObjectStore:
 
     def get(self, key: str, maximum_bytes: int) -> bytes:
         admitted_key = _validate_storage_key(key)
-        if isinstance(maximum_bytes, bool) or maximum_bytes < 0:
+        if (
+            isinstance(maximum_bytes, bool)
+            or not isinstance(maximum_bytes, int)
+            or maximum_bytes < 0
+        ):
             raise ValueError("maximum_bytes must be a non-negative integer")
         stored = self.head(admitted_key)
         if stored.byte_length > maximum_bytes:
@@ -231,7 +235,11 @@ class S3ObjectStore:
 
     def presign_get(self, key: str, expires_seconds: int) -> str:
         admitted_key = _validate_storage_key(key)
-        if isinstance(expires_seconds, bool) or not 0 < expires_seconds <= _MAXIMUM_PRESIGN_SECONDS:
+        if (
+            isinstance(expires_seconds, bool)
+            or not isinstance(expires_seconds, int)
+            or not 0 < expires_seconds <= _MAXIMUM_PRESIGN_SECONDS
+        ):
             raise ValueError("expires_seconds must be between 1 and 300")
         return self._client.generate_presigned_url(
             "get_object",
