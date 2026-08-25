@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from types import ModuleType
 
@@ -24,6 +25,12 @@ NOW = datetime(2024, 3, 29, 12, 0, tzinfo=UTC)
 RUN_ID = "123e4567-e89b-12d3-a456-426614174000"
 OTHER_RUN_ID = "123e4567-e89b-12d3-a456-426614174001"
 PREFIX = f"runs/v1/{RUN_ID}/"
+EXPECTED_NOT_FOUND_STATUS = 404
+EXPECTED_NOT_FOUND_HEADERS = {
+    "content-type": "application/json",
+    "cache-control": "no-store",
+}
+EXPECTED_NOT_FOUND_BODY = b'{"error":"run_not_found"}'
 
 
 def result_payload(
@@ -118,22 +125,121 @@ def seed_artifacts(
     return body
 
 
-def result_call(run_id: str, store: FakeObjectStore, repository: FakeRunRepository) -> object:
+def valid_manifest_body(result_body: bytes | None = None) -> bytes:
+    body = canonical_json_bytes(result_payload()) if result_body is None else result_body
+    artifacts = {
+        "run-spec.json": b'{"schema_version":"1"}',
+        "result.json": body,
+        "trades.parquet": b"parquet-trades",
+        "equity-curve.parquet": b"parquet-equity",
+        "report.html": b"<html><body>report</body></html>",
+    }
+    return canonical_json_bytes(
+        {
+            "schema_version": "1",
+            "artifacts": [
+                {"name": name, "byte_length": len(value), "sha256": sha256_hex(value)}
+                for name, value in artifacts.items()
+            ],
+        }
+    )
+
+
+def duplicate_key_manifest_body() -> bytes:
+    valid = valid_manifest_body()
+    artifacts = valid.removeprefix(b'{"artifacts":').removesuffix(b',"schema_version":"1"}')
+    return b'{"artifacts":' + artifacts + b',"schema_version":"1","schema_version":"1"}'
+
+
+def noncanonical_manifest_body() -> bytes:
+    valid = valid_manifest_body()
+    artifacts = valid.removeprefix(b'{"artifacts":').removesuffix(b',"schema_version":"1"}')
+    return b'{"schema_version":"1","artifacts":' + artifacts + b"}"
+
+
+def duplicate_key_result_body() -> bytes:
+    valid = canonical_json_bytes(result_payload())
+    return valid.removesuffix(b"}") + b',"schema_version":"1"}'
+
+
+def noncanonical_result_body() -> bytes:
+    return json.dumps(
+        result_payload(),
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def result_call(run_id: str, store: object, repository: object) -> object:
     from src.cloud.results_handler import get_public_result
 
     return get_public_result(run_id, object_store=store, run_repository=repository)
 
 
-def not_found() -> object:
-    from src.cloud.results_handler import NOT_FOUND
+def assert_not_found(response: object) -> None:
+    assert response.status_code == EXPECTED_NOT_FOUND_STATUS
+    assert dict(response.headers) == EXPECTED_NOT_FOUND_HEADERS
+    assert response.body == EXPECTED_NOT_FOUND_BODY
 
-    return NOT_FOUND
+
+@dataclass(frozen=True, slots=True)
+class StorageCall:
+    operation: str
+    key: str
+    bound: int | None
+
+
+class RecordingObjectStore:
+    """Record read-path calls without changing the accepted shared test fake."""
+
+    def __init__(
+        self,
+        delegate: FakeObjectStore,
+        *,
+        get_error: Exception | None = None,
+        head_error: Exception | None = None,
+        presign_error: Exception | None = None,
+    ) -> None:
+        self._delegate = delegate
+        self._get_error = get_error
+        self._head_error = head_error
+        self._presign_error = presign_error
+        self.calls: list[StorageCall] = []
+
+    def get(self, key: str, maximum_bytes: int) -> bytes:
+        self.calls.append(StorageCall("get", key, maximum_bytes))
+        if self._get_error is not None:
+            raise self._get_error
+        return self._delegate.get(key, maximum_bytes)
+
+    def head(self, key: str) -> object:
+        self.calls.append(StorageCall("head", key, None))
+        if self._head_error is not None:
+            raise self._head_error
+        return self._delegate.head(key)
+
+    def presign_get(self, key: str, expires_seconds: int) -> str:
+        self.calls.append(StorageCall("presign_get", key, expires_seconds))
+        if self._presign_error is not None:
+            raise self._presign_error
+        return self._delegate.presign_get(key, expires_seconds)
+
+
+def expected_success_calls() -> list[StorageCall]:
+    return [
+        StorageCall("get", f"{PREFIX}checksums.json", 32 * 1024),
+        StorageCall("get", f"{PREFIX}result.json", 64 * 1024),
+        StorageCall("head", f"{PREFIX}report.html", None),
+        StorageCall("presign_get", f"{PREFIX}report.html", 300),
+    ]
 
 
 def test_public_result_returns_only_verified_summary_and_five_minute_report_url() -> None:
-    store = FakeObjectStore()
+    raw_store = FakeObjectStore()
     repository = seed_repository(public_record())
-    original_result = seed_artifacts(store)
+    original_result = seed_artifacts(raw_store)
+    store = RecordingObjectStore(raw_store)
 
     response = result_call(RUN_ID, store, repository)
 
@@ -146,10 +252,32 @@ def test_public_result_returns_only_verified_summary_and_five_minute_report_url(
         "report_url_expires_seconds": 300,
     }
     assert b"parquet" not in response.body
-    assert store._objects[f"{PREFIX}result.json"] == original_result
+    assert raw_store._objects[f"{PREFIX}result.json"] == original_result
     assert [(call.run_id, call.consistent) for call in repository.get_calls[-1:]] == [
         (RUN_ID, True)
     ]
+    assert store.calls == expected_success_calls()
+
+
+def test_hidden_response_headers_and_wire_outputs_cannot_alias_or_mutate_each_other() -> None:
+    first = result_call("not-a-uuid", RecordingObjectStore(FakeObjectStore()), FakeRunRepository())
+    second = result_call(
+        "also-not-a-uuid",
+        RecordingObjectStore(FakeObjectStore()),
+        FakeRunRepository(),
+    )
+    assert_not_found(first)
+    assert_not_found(second)
+
+    with pytest.raises(TypeError):
+        first.headers["untrusted"] = "value"
+    first_wire = first.to_wire()
+    second_wire = second.to_wire()
+    first_wire["headers"]["untrusted"] = "value"
+
+    assert dict(first.headers) == EXPECTED_NOT_FOUND_HEADERS
+    assert second_wire["headers"] == EXPECTED_NOT_FOUND_HEADERS
+    assert first_wire["headers"] is not second_wire["headers"]
 
 
 @pytest.mark.parametrize(
@@ -157,11 +285,12 @@ def test_public_result_returns_only_verified_summary_and_five_minute_report_url(
     ["not-a-uuid", RUN_ID.upper(), "123e4567-e89b-12d3-a456-426614174000/extra"],
 )
 def test_invalid_uuid_returns_not_found_without_repository_or_storage_calls(run_id: str) -> None:
-    store = FakeObjectStore()
+    store = RecordingObjectStore(FakeObjectStore())
     repository = FakeRunRepository()
 
-    assert result_call(run_id, store, repository) == not_found()
+    assert_not_found(result_call(run_id, store, repository))
     assert repository.get_calls == ()
+    assert store.calls == []
 
 
 @pytest.mark.parametrize(
@@ -180,13 +309,13 @@ def test_invalid_uuid_returns_not_found_without_repository_or_storage_calls(run_
     ],
 )
 def test_non_public_or_nonterminal_records_are_byte_identical_not_found(record: RunRecord) -> None:
-    store = FakeObjectStore()
+    store = RecordingObjectStore(FakeObjectStore())
     repository = seed_repository(record)
 
     response = result_call(RUN_ID, store, repository)
 
-    assert response == not_found()
-    assert store._objects == {}
+    assert_not_found(response)
+    assert store.calls == []
 
 
 class RawRepository:
@@ -215,33 +344,32 @@ class RawRepository:
     ],
 )
 def test_absent_or_malformed_record_is_not_found(value: object) -> None:
-    store = FakeObjectStore()
+    store = RecordingObjectStore(FakeObjectStore())
     repository = RawRepository(value)
 
-    assert result_call(RUN_ID, store, repository) == not_found()
+    assert_not_found(result_call(RUN_ID, store, repository))
     assert repository.calls == [(RUN_ID, True)]
-    assert store._objects == {}
+    assert store.calls == []
 
 
 def test_incomplete_succeeded_record_is_hidden_before_artifact_reads() -> None:
-    store = FakeObjectStore()
-    seed_artifacts(store)
+    raw_store = FakeObjectStore()
+    seed_artifacts(raw_store)
+    store = RecordingObjectStore(raw_store)
     incomplete = {**public_record().model_dump(mode="json"), "completed_at": None}
     repository = RawRepository(incomplete)
 
-    assert result_call(RUN_ID, store, repository) == not_found()
+    assert_not_found(result_call(RUN_ID, store, repository))
     assert repository.calls == [(RUN_ID, True)]
+    assert store.calls == []
 
 
 @pytest.mark.parametrize(
     "manifest_body",
     [
         pytest.param(b"not-json", id="malformed"),
-        pytest.param(
-            b'{"schema_version":"1","schema_version":"1","artifacts":[]}',
-            id="duplicate-key",
-        ),
-        pytest.param(b'{"artifacts":[],"schema_version":"1"}', id="noncanonical"),
+        pytest.param(duplicate_key_manifest_body(), id="duplicate-key-only"),
+        pytest.param(noncanonical_manifest_body(), id="noncanonical-order-only"),
         pytest.param(
             canonical_json_bytes({"schema_version": "1", "artifacts": []}),
             id="wrong-set",
@@ -253,17 +381,35 @@ def test_invalid_or_noncanonical_manifest_is_not_found(manifest_body: bytes) -> 
     repository = seed_repository(public_record())
     seed_artifacts(store, manifest_body=manifest_body)
 
-    assert result_call(RUN_ID, store, repository) == not_found()
+    assert_not_found(result_call(RUN_ID, store, repository))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("extra", "forbidden", id="entry-extra"),
+        pytest.param("byte_length", "1", id="entry-wrong-type"),
+        pytest.param("sha256", "not-a-digest", id="entry-bad-digest"),
+    ],
+)
+def test_manifest_entry_defects_are_independently_hidden(field: str, value: object) -> None:
+    payload = json.loads(valid_manifest_body())
+    entry = next(item for item in payload["artifacts"] if item["name"] == "result.json")
+    entry[field] = value
+    raw_store = FakeObjectStore()
+    seed_artifacts(raw_store, manifest_body=canonical_json_bytes(payload))
+    store = RecordingObjectStore(raw_store)
+
+    assert_not_found(result_call(RUN_ID, store, seed_repository(public_record())))
+    assert store.calls == [StorageCall("get", f"{PREFIX}checksums.json", 32 * 1024)]
 
 
 @pytest.mark.parametrize(
     "result_body",
     [
         pytest.param(b"not-json", id="malformed"),
-        pytest.param(
-            b'{"run_id":"123e4567-e89b-12d3-a456-426614174000","run_id":"123e4567-e89b-12d3-a456-426614174000"}',
-            id="duplicate-key",
-        ),
+        pytest.param(duplicate_key_result_body(), id="duplicate-key-only"),
+        pytest.param(noncanonical_result_body(), id="noncanonical-order-only"),
         pytest.param(
             canonical_json_bytes(result_payload(run_id=OTHER_RUN_ID)), id="wrong-run-id"
         ),
@@ -278,7 +424,7 @@ def test_malformed_or_wrong_result_is_not_found(result_body: bytes) -> None:
     repository = seed_repository(public_record())
     seed_artifacts(store, result_body=result_body)
 
-    assert result_call(RUN_ID, store, repository) == not_found()
+    assert_not_found(result_call(RUN_ID, store, repository))
 
 
 @pytest.mark.parametrize(
@@ -293,7 +439,7 @@ def test_manifest_result_length_or_digest_mismatch_is_not_found(field: str, valu
     entry[field] = value
     seed_artifacts(store, result_entry=entry)
 
-    assert result_call(RUN_ID, store, repository) == not_found()
+    assert_not_found(result_call(RUN_ID, store, repository))
 
 
 def test_tampered_result_or_report_entry_is_not_found() -> None:
@@ -302,7 +448,7 @@ def test_tampered_result_or_report_entry_is_not_found() -> None:
     seed_artifacts(store)
     store._objects[f"{PREFIX}result.json"] = b'{"tampered":true}'
 
-    assert result_call(RUN_ID, store, repository) == not_found()
+    assert_not_found(result_call(RUN_ID, store, repository))
 
     store = FakeObjectStore()
     repository = seed_repository(public_record())
@@ -325,30 +471,64 @@ def test_tampered_result_or_report_entry_is_not_found() -> None:
         manifest_body=canonical_json_bytes({"schema_version": "1", "artifacts": entries}),
     )
 
-    assert result_call(RUN_ID, store, repository) == not_found()
+    assert_not_found(result_call(RUN_ID, store, repository))
 
 
-def test_missing_or_oversized_manifest_or_result_is_not_found() -> None:
-    store = FakeObjectStore()
-    repository = seed_repository(public_record())
-    seed_artifacts(store)
-    del store._objects[f"{PREFIX}checksums.json"]
+def test_missing_and_oversized_artifacts_are_hidden_with_exact_call_prefixes() -> None:
+    raw_store = FakeObjectStore()
+    seed_artifacts(raw_store)
+    del raw_store._objects[f"{PREFIX}checksums.json"]
+    store = RecordingObjectStore(raw_store)
+    assert_not_found(result_call(RUN_ID, store, seed_repository(public_record())))
+    assert store.calls == [StorageCall("get", f"{PREFIX}checksums.json", 32 * 1024)]
 
-    assert result_call(RUN_ID, store, repository) == not_found()
+    raw_store = FakeObjectStore()
+    seed_artifacts(raw_store)
+    raw_store._objects[f"{PREFIX}checksums.json"] = b"x" * (32 * 1024 + 1)
+    store = RecordingObjectStore(raw_store)
+    assert_not_found(result_call(RUN_ID, store, seed_repository(public_record())))
+    assert store.calls == [StorageCall("get", f"{PREFIX}checksums.json", 32 * 1024)]
 
-    store = FakeObjectStore()
-    repository = seed_repository(public_record())
-    seed_artifacts(store, result_body=b"x" * (64 * 1024 + 1))
-    assert result_call(RUN_ID, store, repository) == not_found()
+    raw_store = FakeObjectStore()
+    seed_artifacts(raw_store)
+    del raw_store._objects[f"{PREFIX}result.json"]
+    store = RecordingObjectStore(raw_store)
+    assert_not_found(result_call(RUN_ID, store, seed_repository(public_record())))
+    assert store.calls == expected_success_calls()[:2]
+
+    raw_store = FakeObjectStore()
+    seed_artifacts(raw_store, result_body=b"x" * (64 * 1024 + 1))
+    store = RecordingObjectStore(raw_store)
+    assert_not_found(result_call(RUN_ID, store, seed_repository(public_record())))
+    assert store.calls == expected_success_calls()[:2]
+
+    raw_store = FakeObjectStore()
+    seed_artifacts(raw_store)
+    del raw_store._objects[f"{PREFIX}report.html"]
+    store = RecordingObjectStore(raw_store)
+    assert_not_found(result_call(RUN_ID, store, seed_repository(public_record())))
+    assert store.calls == expected_success_calls()[:3]
 
 
-class BrokenObjectStore(FakeObjectStore):
-    def get(self, key: str, maximum_bytes: int) -> bytes:
-        raise ObjectIntegrityError("untrusted storage details")
+def test_object_store_head_and_presign_failures_are_hidden_after_derived_calls() -> None:
+    raw_store = FakeObjectStore()
+    seed_artifacts(raw_store)
+    store = RecordingObjectStore(raw_store, head_error=ObjectIntegrityError("untrusted"))
+    assert_not_found(result_call(RUN_ID, store, seed_repository(public_record())))
+    assert store.calls == expected_success_calls()[:3]
+
+    raw_store = FakeObjectStore()
+    seed_artifacts(raw_store)
+    store = RecordingObjectStore(raw_store, presign_error=ObjectIntegrityError("untrusted"))
+    assert_not_found(result_call(RUN_ID, store, seed_repository(public_record())))
+    assert store.calls == expected_success_calls()
 
 
-def test_storage_verification_failure_is_not_found() -> None:
-    assert result_call(RUN_ID, BrokenObjectStore(), seed_repository(public_record())) == not_found()
+def test_storage_get_failure_is_hidden_at_the_first_derived_key() -> None:
+    store = RecordingObjectStore(FakeObjectStore(), get_error=ObjectIntegrityError("untrusted"))
+
+    assert_not_found(result_call(RUN_ID, store, seed_repository(public_record())))
+    assert store.calls == [StorageCall("get", f"{PREFIX}checksums.json", 32 * 1024)]
 
 
 class RecordingPresignStore(FakeObjectStore):
@@ -380,7 +560,7 @@ def test_response_limit_is_enforced_after_adding_presigned_url() -> None:
     repository = seed_repository(public_record())
     seed_artifacts(store)
 
-    assert result_call(RUN_ID, store, repository) == not_found()
+    assert_not_found(result_call(RUN_ID, store, repository))
 
 
 def event(*, method: str = "GET", run_id: object = RUN_ID, **changes: object) -> dict[str, object]:
@@ -480,8 +660,15 @@ class RecordingBoto3(ModuleType):
         raise AssertionError("resource construction was not expected")
 
 
+@pytest.mark.parametrize(
+    ("bucket", "table_name"),
+    [
+        pytest.param("not valid bucket!", "research-runs", id="invalid-bucket"),
+        pytest.param("research-artifacts", "bad table name", id="invalid-table"),
+    ],
+)
 def test_lambda_handler_is_import_inert_and_validates_environment_before_boto(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, bucket: str, table_name: str
 ) -> None:
     monkeypatch.delitem(sys.modules, "src.cloud.results_handler", raising=False)
     monkeypatch.delitem(sys.modules, "boto3", raising=False)
@@ -492,8 +679,8 @@ def test_lambda_handler_is_import_inert_and_validates_environment_before_boto(
 
     fake_boto3 = RecordingBoto3()
     monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
-    monkeypatch.setenv("ARTIFACT_BUCKET", "not valid bucket!")
-    monkeypatch.setenv("RUN_TABLE", "research-runs")
+    monkeypatch.setenv("ARTIFACT_BUCKET", bucket)
+    monkeypatch.setenv("RUN_TABLE", table_name)
 
     with pytest.raises(ValueError):
         lambda_handler(event(), object())
