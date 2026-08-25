@@ -17,7 +17,7 @@ ENV PATH="/opt/venv/bin:$PATH" \
     HOME=/tmp
 RUN groupadd --gid 10001 app \
     && useradd --uid 10001 --gid 10001 --no-create-home app \
-    && mkdir -p /app /tmp \
+    && mkdir -p /app /tmp /harness/fixtures \
     && chmod 1777 /tmp
 COPY --from=build /opt/venv /opt/venv
 COPY src /app/src

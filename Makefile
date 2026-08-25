@@ -20,8 +20,9 @@ SQL_BENCHMARK_DATABASE ?= $(TEMP_DIR)/algo-sql-smoke.db
 SQL_BENCHMARK_REPORT ?= $(TEMP_DIR)/algo-sql-smoke.json
 DATA_ARTIFACT_DIR ?= artifacts/data-demo
 DATA_ACQUISITION_ID ?=
+CLOUD_IMAGE ?= algo-backtester-aws:local
 
-.PHONY: test lint verify-warnings serve dashboard report install sql-validate sql-compare sql-benchmark-smoke data-acquire-demo data-inspect-demo cloud-test cloud-smoke cloud-verify
+.PHONY: test lint verify-warnings serve dashboard report install sql-validate sql-compare sql-benchmark-smoke data-acquire-demo data-inspect-demo cloud-test cloud-smoke cloud-verify cloud-container-smoke
 
 install:
 	$(PYTHON) -m pip install -e ".[dev]" -q
@@ -77,9 +78,35 @@ data-inspect-demo:
 	$(PYTHON) -m src.data.cli inspect --acquisition-id $(DATA_ACQUISITION_ID) --cache-dir $(DATA_ARTIFACT_DIR)/cache --manifest-dir $(DATA_ARTIFACT_DIR)/reports
 
 cloud-test:
-	uv run --extra dev --extra cloud pytest tests/cloud/test_packaging.py -q
+	uv run --frozen --extra dev --extra cloud pytest tests/cloud/test_packaging.py -q
 
 cloud-smoke:
-	uv run --extra dev --extra cloud python tests/cloud/test_packaging.py --smoke
+	uv run --frozen --extra dev --extra cloud python tests/cloud/test_packaging.py --smoke
 
 cloud-verify: cloud-test cloud-smoke
+
+cloud-container-smoke: cloud-verify
+	@set -eu; \
+		smoke_dir="$$(mktemp -d "$${TMPDIR:-/tmp}/algo-cloud-container-smoke.XXXXXX")"; \
+		container_name="algo-cloud-container-smoke-$$(date +%s)-$$$$"; \
+		cleanup() { docker rm -f "$$container_name" >/dev/null 2>&1 || true; rm -rf "$$smoke_dir"; }; \
+		trap cleanup EXIT HUP INT TERM; \
+		docker build --platform linux/amd64 -t $(CLOUD_IMAGE) .; \
+		image_id="$$(docker image inspect $(CLOUD_IMAGE) --format '{{.Id}}')"; \
+		container_id="$$(docker run --detach --name "$$container_name" --platform linux/amd64 --network none --read-only --user 10001:10001 --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m --mount type=bind,src="$$(pwd)/tests/cloud/test_packaging.py",dst=/harness/test_packaging.py,readonly --mount type=bind,src="$$(pwd)/tests/cloud/fixtures/spy-daily.parquet",dst=/harness/fixtures/spy-daily.parquet,readonly --entrypoint /opt/venv/bin/python -e PYTHONPATH=/harness:/app $(CLOUD_IMAGE) /harness/test_packaging.py --container-smoke --output-directory /tmp/artifacts)"; \
+		echo "image_id=$$image_id container_name=$$container_name container_id=$$container_id"; \
+		ready=0; attempts=0; \
+		while [ "$$attempts" -lt 60 ]; do \
+			if docker logs "$$container_name" 2>&1 | grep -q '"ready_for_copy": true'; then ready=1; break; fi; \
+			if [ "$$(docker inspect "$$container_name" --format '{{.State.Running}}')" != true ]; then docker logs "$$container_name"; exit 1; fi; \
+			attempts=$$((attempts + 1)); sleep 1; \
+		done; \
+		test "$$ready" = 1; \
+		docker logs "$$container_name"; \
+		docker exec "$$container_name" /opt/venv/bin/python -c 'import sys, tarfile; archive = tarfile.open(fileobj=sys.stdout.buffer, mode="w|"); archive.add("/tmp/artifacts", arcname="artifacts"); archive.close()' > "$$smoke_dir/artifacts.tar"; \
+		tar -C "$$smoke_dir" -xf "$$smoke_dir/artifacts.tar"; \
+		rm -f "$$smoke_dir/artifacts.tar"; \
+		docker exec "$$container_name" /opt/venv/bin/python -c 'from pathlib import Path; Path("/tmp/release").touch()'; \
+		test "$$(docker wait "$$container_name")" = 0; \
+		docker logs "$$container_name"; \
+		uv run --frozen --extra dev --extra cloud python tests/cloud/test_packaging.py --verify-container-artifacts "$$smoke_dir/artifacts"
