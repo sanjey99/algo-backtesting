@@ -21,7 +21,7 @@ SQL_BENCHMARK_REPORT ?= $(TEMP_DIR)/algo-sql-smoke.json
 DATA_ARTIFACT_DIR ?= artifacts/data-demo
 DATA_ACQUISITION_ID ?=
 
-.PHONY: test lint verify-warnings serve dashboard report install sql-validate sql-compare sql-benchmark-smoke data-acquire-demo data-inspect-demo
+.PHONY: test lint verify-warnings serve dashboard report install sql-validate sql-compare sql-benchmark-smoke data-acquire-demo data-inspect-demo cloud-test cloud-smoke cloud-verify
 
 install:
 	$(PYTHON) -m pip install -e ".[dev]" -q
@@ -75,3 +75,11 @@ data-acquire-demo:
 
 data-inspect-demo:
 	$(PYTHON) -m src.data.cli inspect --acquisition-id $(DATA_ACQUISITION_ID) --cache-dir $(DATA_ARTIFACT_DIR)/cache --manifest-dir $(DATA_ARTIFACT_DIR)/reports
+
+cloud-test:
+	uv run --extra dev --extra cloud pytest tests/cloud/test_packaging.py -q
+
+cloud-smoke:
+	uv run --extra dev --extra cloud python tests/cloud/test_packaging.py --smoke
+
+cloud-verify: cloud-test cloud-smoke
