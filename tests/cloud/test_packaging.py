@@ -502,9 +502,12 @@ def _extract_container_archive(
             member_path = PurePosixPath(member.name)
             assert not member_path.is_absolute(), "archive contains an absolute member path"
             assert ".." not in member_path.parts, "archive contains a traversal member path"
-        assert members and members[0].isdir() and not members[0].linkname, (
-            "archive root must be artifacts/"
-        )
+        assert (
+            members
+            and members[0].name == "artifacts"
+            and members[0].isdir()
+            and not members[0].linkname
+        ), "archive root must be artifacts/"
         for member in members[1:]:
             assert member.isreg(), "archive artifact members must be regular files, not links"
             assert not member.linkname, "archive artifact members must not link elsewhere"
@@ -579,6 +582,26 @@ def test_safe_archive_extractor_accepts_the_exact_receipt_in_tar_order(tmp_path:
         archive.add(source_directory, arcname="artifacts")
 
     assert _extract_container_archive(archive_path, tmp_path / "output") == expected_inventory
+
+
+def test_safe_archive_extractor_rejects_a_wrong_directory_root_before_creating_output(
+    tmp_path: Path,
+) -> None:
+    """The transport schema requires the canonical artifacts/ directory root."""
+    source_directory = tmp_path / "source"
+    _run_offline_smoke(source_directory)
+    archive_path = tmp_path / "wrong-root.tar"
+    with tarfile.open(archive_path, "w") as archive:
+        root = tarfile.TarInfo("unexpected-root")
+        root.type = tarfile.DIRTYPE
+        archive.addfile(root)
+        for source in sorted(source_directory.iterdir()):
+            archive.add(source, arcname=f"artifacts/{source.name}")
+    output_directory = tmp_path / "output"
+
+    with pytest.raises(AssertionError, match="archive root"):
+        _extract_container_archive(archive_path, output_directory)
+    assert not output_directory.exists()
 
 
 def _runtime_worker_path() -> str:
