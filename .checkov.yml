@@ -1,0 +1,10 @@
+framework:
+  - terraform
+compact: true
+skip-download: true
+quiet: true
+download-external-modules: false
+evaluate-variables: true
+skip-path:
+  - infra/.terraform
+  - infra/bootstrap/.terraform
