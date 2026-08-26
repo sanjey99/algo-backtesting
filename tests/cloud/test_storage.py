@@ -11,6 +11,7 @@ from src.cloud.contracts import FailureCode, RunRecord, RunStatus, Visibility, s
 from src.cloud.storage import (
     DynamoRunRepository,
     ImmutableObjectConflict,
+    LifecycleClass,
     ObjectNotFoundError,
     ObjectSizeLimitError,
     S3ObjectStore,
@@ -149,9 +150,36 @@ def test_s3_put_is_fixed_bucket_private_encrypted_and_digest_bearing() -> None:
             "ContentType": "application/x-parquet",
             "ServerSideEncryption": "AES256",
             "Metadata": {"sha256": sha256_hex(b"parquet")},
+            "Tagging": "LifecycleClass=transient",
             "IfNoneMatch": "*",
         }
     ]
+
+
+def test_s3_put_rejects_non_enum_lifecycle_class() -> None:
+    client = RecordingS3Client()
+    store = S3ObjectStore(client=client, bucket="research-artifacts")
+
+    with pytest.raises(TypeError, match="lifecycle_class must be a LifecycleClass"):
+        store.put(DATASET_KEY, b"parquet", "application/x-parquet", lifecycle_class="transient")  # type: ignore[arg-type]
+
+    assert client.put_calls == []
+
+
+def test_s3_put_accepts_transient_and_selected_public_lifecycle_tags() -> None:
+    client = RecordingS3Client()
+    store = S3ObjectStore(client=client, bucket="research-artifacts")
+
+    store.put(DATASET_KEY, b"parquet", "application/x-parquet")
+    store.put(
+        DATASET_KEY.replace("spy", "selected"),
+        b"parquet",
+        "application/x-parquet",
+        lifecycle_class=LifecycleClass.SELECTED_PUBLIC,
+    )
+
+    assert client.put_calls[0]["Tagging"] == "LifecycleClass=transient"
+    assert client.put_calls[1]["Tagging"] == "LifecycleClass=selected-public"
 
 
 def test_s3_put_only_accepts_byte_identical_immutable_replays() -> None:

@@ -8,6 +8,7 @@ from datetime import datetime
 from src.cloud.contracts import FailureCode, RunRecord, RunStatus, sha256_hex
 from src.cloud.storage import (
     ImmutableObjectConflict,
+    LifecycleClass,
     ObjectNotFoundError,
     ObjectSizeLimitError,
     StateTransitionError,
@@ -22,6 +23,7 @@ class PutCall:
     key: str
     body: bytes
     content_type: str
+    lifecycle_class: LifecycleClass
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,20 +67,37 @@ class FakeObjectStore:
     @property
     def put_calls(self) -> tuple[PutCall, ...]:
         return tuple(
-            PutCall(call.key, _copy_bytes(call.body), call.content_type) for call in self._put_calls
+            PutCall(
+                call.key,
+                _copy_bytes(call.body),
+                call.content_type,
+                call.lifecycle_class,
+            )
+            for call in self._put_calls
         )
 
-    def put(self, key: str, body: bytes, content_type: str) -> StoredObject:
+    def put(
+        self,
+        key: str,
+        body: bytes,
+        content_type: str,
+        *,
+        lifecycle_class: LifecycleClass = LifecycleClass.TRANSIENT,
+    ) -> StoredObject:
         admitted_key = _validate_storage_key(key)
         copied_body = _copy_bytes(body)
         if not isinstance(content_type, str) or not content_type:
             raise ValueError("content_type must be a non-empty string")
+        if not isinstance(lifecycle_class, LifecycleClass):
+            raise TypeError("lifecycle_class must be a LifecycleClass")
         existing = self._objects.get(admitted_key)
         if existing is not None and existing != copied_body:
             raise ImmutableObjectConflict("immutable object key contains different content")
         self._objects.setdefault(admitted_key, copied_body)
         self._content_types.setdefault(admitted_key, content_type)
-        self._put_calls.append(PutCall(admitted_key, _copy_bytes(copied_body), content_type))
+        self._put_calls.append(
+            PutCall(admitted_key, _copy_bytes(copied_body), content_type, lifecycle_class)
+        )
         return StoredObject(admitted_key, len(copied_body), sha256_hex(copied_body))
 
     def get(self, key: str, maximum_bytes: int) -> bytes:

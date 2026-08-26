@@ -15,7 +15,7 @@ from src.cloud.ingestion_handler import (
     ArtifactPublicationError,
     handle_ingestion,
 )
-from src.cloud.storage import StoredObject
+from src.cloud.storage import LifecycleClass, StoredObject
 from src.data.contracts import (
     AcquisitionManifest,
     AcquisitionRequest,
@@ -65,7 +65,14 @@ class SecretFailingObjectStore(FakeObjectStore):
         super().__init__()
         self.put_attempts = 0
 
-    def put(self, key: str, body: bytes, content_type: str) -> StoredObject:
+    def put(
+        self,
+        key: str,
+        body: bytes,
+        content_type: str,
+        *,
+        lifecycle_class: LifecycleClass = LifecycleClass.TRANSIENT,
+    ) -> StoredObject:
         self.put_attempts += 1
         raise RuntimeError(f"{RAW_PROVIDER_TEXT}: token={SECRET_VALUE}; event={RAW_EVENT_TEXT}")
 
@@ -155,6 +162,10 @@ def test_handle_ingestion_publishes_pinned_redacted_artifacts(
     }
     assert "provider_row" not in uploaded_frame.columns
     assert manifest_body == canonical_json_bytes(result.manifest.to_dict())
+    assert tuple(call.lifecycle_class for call in store.put_calls) == (
+        LifecycleClass.TRANSIENT,
+        LifecycleClass.TRANSIENT,
+    )
     assert SECRET_VALUE.encode() not in dataset_body
     assert SECRET_VALUE.encode() not in manifest_body
     assert b"raw-provider-response-must-not-publish" not in manifest_body

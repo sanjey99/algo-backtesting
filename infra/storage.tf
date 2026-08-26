@@ -64,6 +64,39 @@ resource "aws_s3_bucket_policy" "artifacts_tls_only" {
           "aws:SecureTransport" = "false"
         }
       }
+      },
+      {
+        Sid       = "DenyPutObjectWithoutLifecycleClass"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:PutObject"
+        Resource = [
+          aws_s3_bucket.artifacts.arn,
+          "${aws_s3_bucket.artifacts.arn}/*",
+        ]
+        Condition = {
+          Null = {
+            "s3:RequestObjectTag/LifecycleClass" = "true"
+          }
+        }
+      },
+      {
+        Sid       = "DenyPutObjectWithUnknownLifecycleClass"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:PutObject"
+        Resource = [
+          aws_s3_bucket.artifacts.arn,
+          "${aws_s3_bucket.artifacts.arn}/*",
+        ]
+        Condition = {
+          "Null" : {
+            "s3:RequestObjectTag/LifecycleClass" = "false"
+          },
+          StringNotEquals = {
+            "s3:RequestObjectTag/LifecycleClass" = ["transient", "selected-public"]
+          }
+        }
     }]
   })
 

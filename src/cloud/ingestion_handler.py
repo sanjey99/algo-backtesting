@@ -17,7 +17,7 @@ from src.cloud.contracts import (
     canonical_json_bytes,
     sha256_hex,
 )
-from src.cloud.storage import ObjectStore
+from src.cloud.storage import LifecycleClass, ObjectStore
 from src.data.contracts import (
     AcquisitionRequest,
     AcquisitionResult,
@@ -159,8 +159,18 @@ def acquire_dataset(
             f"datasets/v1/{result.manifest.acquisition_id}/"
             f"manifest-{manifest_digest}.json"
         )
-        object_store.put(dataset_key, dataset_body, "application/vnd.apache.parquet")
-        object_store.put(manifest_key, manifest_body, "application/json")
+        object_store.put(
+            dataset_key,
+            dataset_body,
+            "application/vnd.apache.parquet",
+            lifecycle_class=LifecycleClass.TRANSIENT,
+        )
+        object_store.put(
+            manifest_key,
+            manifest_body,
+            "application/json",
+            lifecycle_class=LifecycleClass.TRANSIENT,
+        )
         dataset = DatasetRef(
             bucket=bucket,
             key=dataset_key,

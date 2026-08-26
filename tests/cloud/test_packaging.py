@@ -43,11 +43,14 @@ try:
     from tests.cloud.fakes import FakeObjectStore, FakeRunRepository
 except ModuleNotFoundError:  # pragma: no cover - used by the mounted image harness.
 
+    from src.cloud.storage import LifecycleClass
+
     @dataclass(frozen=True, slots=True)
     class _PutCall:
         key: str
         body: bytes
         content_type: str
+        lifecycle_class: LifecycleClass = LifecycleClass.TRANSIENT
 
     class FakeObjectStore:
         """Minimal local fake bundled with the mounted smoke harness."""
@@ -60,13 +63,27 @@ except ModuleNotFoundError:  # pragma: no cover - used by the mounted image harn
         def put_calls(self) -> tuple[_PutCall, ...]:
             return tuple(self._put_calls)
 
-        def put(self, key: str, body: bytes, content_type: str) -> None:
+        def put(
+            self,
+            key: str,
+            body: bytes,
+            content_type: str,
+            *,
+            lifecycle_class: LifecycleClass = LifecycleClass.TRANSIENT,
+        ) -> None:
             copied = bytes(body)
             existing = self._objects.get(key)
             if existing is not None and existing != copied:
                 raise AssertionError("immutable smoke object collision")
             self._objects.setdefault(key, copied)
-            self._put_calls.append(_PutCall(key, copied, content_type))
+            self._put_calls.append(
+                _PutCall(
+                    key=key,
+                    body=copied,
+                    content_type=content_type,
+                    lifecycle_class=lifecycle_class,
+                )
+            )
 
         def get(self, key: str, maximum_bytes: int) -> bytes:
             body = self._objects[key]

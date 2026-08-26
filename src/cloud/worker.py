@@ -20,12 +20,19 @@ from src.cloud.contracts import (
     ArtifactDigest,
     ChecksumsManifest,
     RunSpec,
+    Visibility,
     _parse_utc_datetime,
     _validate_bucket,
     canonical_json_bytes,
     sha256_hex,
 )
-from src.cloud.storage import DynamoRunRepository, ObjectStore, RunRepository, S3ObjectStore
+from src.cloud.storage import (
+    DynamoRunRepository,
+    LifecycleClass,
+    ObjectStore,
+    RunRepository,
+    S3ObjectStore,
+)
 from src.data import df_to_candles
 from src.engine.backtest import BacktestConfig, BacktestEngine, BacktestResult
 from src.models.candle import Candle
@@ -375,14 +382,25 @@ def execute_run(
         ("report.html", report_body, "text/html; charset=utf-8"),
     )
     artifact_digests = [_artifact_digest("run-spec.json", run_spec_body)]
+    artifact_lifecycle = (
+        LifecycleClass.SELECTED_PUBLIC
+        if run_spec.request.visibility is Visibility.PUBLIC
+        else LifecycleClass.TRANSIENT
+    )
     for name, body, content_type in outputs:
-        object_store.put(f"{run_spec.result_prefix}{name}", body, content_type)
+        object_store.put(
+            f"{run_spec.result_prefix}{name}",
+            body,
+            content_type,
+            lifecycle_class=artifact_lifecycle,
+        )
         artifact_digests.append(_artifact_digest(name, body))
     manifest = ChecksumsManifest(artifacts=tuple(artifact_digests))
     object_store.put(
         f"{run_spec.result_prefix}checksums.json",
         canonical_json_bytes(manifest),
         "application/json",
+        lifecycle_class=artifact_lifecycle,
     )
     return manifest
 

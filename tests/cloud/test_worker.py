@@ -23,12 +23,11 @@ from src.cloud.contracts import (
     RunRecord,
     RunSpec,
     RunStatus,
-    Visibility,
     canonical_json_bytes,
     sha256_hex,
 )
 from src.cloud.prepare_handler import _run_spec_payload
-from src.cloud.storage import ObjectSizeLimitError, StateTransitionError
+from src.cloud.storage import LifecycleClass, ObjectSizeLimitError, StateTransitionError
 from src.engine.backtest import BacktestEngine, BacktestResult
 from src.models.portfolio import EquityPoint
 from tests.cloud.fakes import FakeObjectStore, FakeRunRepository
@@ -106,11 +105,13 @@ def seed_run(
     *,
     dataset_body: bytes | None = None,
     raw_spec: bytes | None = None,
+    request_changes: dict[str, object] | None = None,
     status: RunStatus = RunStatus.PENDING,
 ) -> RunSpec:
     body = FIXTURE_PATH.read_bytes() if dataset_body is None else dataset_body
+    request_payload = request_changes if request_changes is not None else {}
     spec = RunSpec.create(
-        request=request(),
+        request=request(**request_payload),
         dataset=dataset_ref(body),
         image_digest=IMAGE_DIGEST,
         now=NOW,
@@ -122,7 +123,7 @@ def seed_run(
     record = RunRecord(
         run_id=spec.run_id,
         status=RunStatus.PENDING,
-        visibility=Visibility.PRIVATE,
+        visibility=spec.request.visibility,
         dataset_key=spec.dataset.key,
         dataset_sha256=spec.dataset.sha256,
         run_spec_key=spec.run_spec_key,
@@ -179,6 +180,11 @@ def test_execute_run_admits_exact_inputs_runs_real_engine_and_publishes_manifest
         f"{spec.result_prefix}report.html",
         f"{spec.result_prefix}checksums.json",
     ]
+    assert all(
+        call.lifecycle_class is LifecycleClass.TRANSIENT
+        for call in store.put_calls
+        if call.key.startswith(spec.result_prefix) and call.key != spec.run_spec_key
+    )
     artifacts = artifact_bodies(store, spec)
     summary = json.loads(artifacts["result.json"])
     assert set(summary) == {
@@ -212,6 +218,31 @@ def test_execute_run_admits_exact_inputs_runs_real_engine_and_publishes_manifest
     }
     run_spec_entry = next(entry for entry in manifest.artifacts if entry.name == "run-spec.json")
     assert run_spec_entry.sha256 == sha256_hex(store.get(spec.run_spec_key, 1_000_000))
+
+
+def test_execute_run_publishes_public_artifacts_with_selected_public_lifecycle() -> None:
+    from src.cloud.worker import execute_run
+
+    store = FakeObjectStore()
+    repository = FakeRunRepository()
+    spec = seed_run(
+        store,
+        repository,
+        request_changes={"visibility": "PUBLIC"},
+    )
+
+    execute_run(
+        spec.run_spec_key,
+        object_store=store,
+        run_repository=repository,
+        clock=fixed_clock,
+    )
+
+    assert all(
+        call.lifecycle_class is LifecycleClass.SELECTED_PUBLIC
+        for call in store.put_calls
+        if call.key.startswith(spec.result_prefix) and call.key != spec.run_spec_key
+    )
 
 
 def test_execute_run_rejects_dataset_checksum_before_engine_or_artifacts() -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
 from botocore.exceptions import ClientError
@@ -49,6 +50,13 @@ class StateTransitionError(StorageError):
     """A DynamoDB conditional state transition was rejected."""
 
 
+class LifecycleClass(StrEnum):
+    """Closed lifecycle classes supported by artifact bucket tagging."""
+
+    TRANSIENT = "transient"
+    SELECTED_PUBLIC = "selected-public"
+
+
 @dataclass(frozen=True, slots=True)
 class StoredObject:
     """Verified immutable object metadata."""
@@ -67,7 +75,14 @@ class StoredObject:
 class ObjectStore(Protocol):
     """Immutable object storage required by cloud workflow handlers."""
 
-    def put(self, key: str, body: bytes, content_type: str) -> StoredObject: ...
+    def put(
+        self,
+        key: str,
+        body: bytes,
+        content_type: str,
+        *,
+        lifecycle_class: LifecycleClass = LifecycleClass.TRANSIENT,
+    ) -> StoredObject: ...
 
     def get(self, key: str, maximum_bytes: int) -> bytes: ...
 
@@ -163,11 +178,20 @@ class S3ObjectStore:
         self._client = client
         self._bucket = _validate_bucket(bucket)
 
-    def put(self, key: str, body: bytes, content_type: str) -> StoredObject:
+    def put(
+        self,
+        key: str,
+        body: bytes,
+        content_type: str,
+        *,
+        lifecycle_class: LifecycleClass = LifecycleClass.TRANSIENT,
+    ) -> StoredObject:
         admitted_key = _validate_storage_key(key)
         copied_body = _copy_bytes(body)
         if not isinstance(content_type, str) or not content_type:
             raise ValueError("content_type must be a non-empty string")
+        if not isinstance(lifecycle_class, LifecycleClass):
+            raise TypeError("lifecycle_class must be a LifecycleClass")
         stored = StoredObject(
             key=admitted_key,
             byte_length=len(copied_body),
@@ -181,6 +205,7 @@ class S3ObjectStore:
                 ContentType=content_type,
                 ServerSideEncryption="AES256",
                 Metadata={"sha256": stored.sha256},
+                Tagging=f"LifecycleClass={lifecycle_class.value}",
                 IfNoneMatch="*",
             )
         except ClientError as error:

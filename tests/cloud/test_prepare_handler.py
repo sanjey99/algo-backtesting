@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 from src.cloud.contracts import RunStatus, Visibility, canonical_json_bytes
 from src.cloud.prepare_handler import PreparedRun, RunPreparationError, lambda_handler, prepare_run
-from src.cloud.storage import StateTransitionError, StoredObject
+from src.cloud.storage import LifecycleClass, StateTransitionError, StoredObject
 from tests.cloud.fakes import FakeObjectStore, FakeRunRepository
 
 NOW = datetime(2024, 3, 29, 12, 0, tzinfo=UTC)
@@ -101,6 +101,7 @@ def test_prepare_run_publishes_canonical_pinned_spec_then_creates_private_pendin
     assert store.put_calls[0].key == run_spec_key
     assert store.put_calls[0].content_type == "application/json"
     assert store.put_calls[0].body == canonical_json_bytes(expected_spec)
+    assert store.put_calls[0].lifecycle_class == LifecycleClass.TRANSIENT
 
     record = repository.create_pending_calls[0].record
     assert record.run_id == prepared.run_id
@@ -150,9 +151,37 @@ def test_prepare_run_revalidates_complete_ingestion_shape_before_effects(event: 
 
 
 class FailingObjectStore(FakeObjectStore):
-    def put(self, key: str, body: bytes, content_type: str) -> StoredObject:
+    def put(
+        self,
+        key: str,
+        body: bytes,
+        content_type: str,
+        *,
+        lifecycle_class: LifecycleClass = LifecycleClass.TRANSIENT,
+    ) -> StoredObject:
         del key, body, content_type
+        del lifecycle_class
         raise RuntimeError("storage-token=secret-value")
+
+
+def test_prepare_run_publishes_public_run_specs_with_selected_public_lifecycle() -> None:
+    store = FakeObjectStore()
+    repository = FakeRunRepository()
+    event = ingestion_event()
+    event_request = event["request"]
+    assert isinstance(event_request, dict)
+    event_request["visibility"] = "PUBLIC"
+
+    prepare_run(
+        event,
+        object_store=store,
+        run_repository=repository,
+        image_digest=IMAGE_DIGEST,
+        clock=fixed_clock,
+        uuid_factory=fixed_uuid,
+    )
+
+    assert store.put_calls[0].lifecycle_class == LifecycleClass.SELECTED_PUBLIC
 
 
 def test_prepare_run_does_not_create_metadata_when_spec_publication_fails() -> None:

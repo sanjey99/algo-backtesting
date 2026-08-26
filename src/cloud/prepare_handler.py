@@ -17,12 +17,19 @@ from src.cloud.contracts import (
     RunRecord,
     RunSpec,
     RunStatus,
+    Visibility,
     _parse_utc_datetime,
     _validate_bucket,
     _validate_image_digest,
     canonical_json_bytes,
 )
-from src.cloud.storage import DynamoRunRepository, ObjectStore, RunRepository, StateTransitionError
+from src.cloud.storage import (
+    DynamoRunRepository,
+    LifecycleClass,
+    ObjectStore,
+    RunRepository,
+    StateTransitionError,
+)
 from src.observability import log_event
 
 logger = logging.getLogger(__name__)
@@ -162,10 +169,16 @@ def prepare_run(
     )
 
     try:
+        lifecycle_class = (
+            LifecycleClass.SELECTED_PUBLIC
+            if request.visibility is Visibility.PUBLIC
+            else LifecycleClass.TRANSIENT
+        )
         object_store.put(
             run_spec.run_spec_key,
             canonical_json_bytes(_run_spec_payload(run_spec)),
             "application/json",
+            lifecycle_class=lifecycle_class,
         )
     except Exception:
         _log_failure(run_spec.run_id)
