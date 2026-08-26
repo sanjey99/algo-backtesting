@@ -1,3 +1,7 @@
+locals {
+  results_lambda_permission_source_arn = "${aws_apigatewayv2_api.public.execution_arn}/*/GET/runs/*"
+}
+
 resource "aws_apigatewayv2_api" "public" {
   name          = "${local.name_prefix}-public-results"
   protocol_type = "HTTP"
@@ -47,5 +51,5 @@ resource "aws_lambda_permission" "api_gateway_results" {
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.results.function_name
   principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.public.execution_arn}/GET/runs/*"
+  source_arn    = local.results_lambda_permission_source_arn
 }

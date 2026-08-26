@@ -25,6 +25,7 @@ def test_state_machine_is_one_bounded_fargate_run_with_closed_failure_paths() ->
     assert '"arn:aws:states:::ecs:runTask.sync"' in source
     assert source.count("ecs:runTask.sync") == 1
     assert "TimeoutSeconds = 900" in source
+    assert "TimeoutSeconds = 600" in source
     assert "TaskDefinition = aws_ecs_task_definition.worker.arn" in source
     assert "Count          = 1" in source
     assert 'AssignPublicIp = "ENABLED"' in source
@@ -39,11 +40,14 @@ def test_state_machine_is_one_bounded_fargate_run_with_closed_failure_paths() ->
     assert "ClosedAcquireFailure" in source
     assert "ClosedPrepareFailure" in source
     assert "FailureCode = \"WORKER_FAILED\"" in source
+    assert "FailureCode = \"WORKFLOW_TIMED_OUT\"" in source
     assert "FailureCode = \"ARTIFACT_VERIFICATION_FAILED\"" in source
     assert "Lambda.ServiceException" in source
     assert "ECS.ServiceException" in source
     assert "BackoffRate = 2" in source
     assert "MaxAttempts = 3" in source
+    assert source.count("Lambda.ClientExecutionTimeoutException") == 2
+    assert "WorkerTimedOut" in source
 
 
 def test_runtime_iam_is_separate_and_excludes_wildcard_data_plane_access() -> None:
@@ -104,6 +108,8 @@ def test_public_api_has_only_the_bounded_read_route() -> None:
     assert "throttling_rate_limit  = 2" in source
     assert "throttling_burst_limit = 5" in source
     assert "cors_configuration" not in source
+    assert "results_lambda_permission_source_arn" in source
+    assert "source_arn    = local.results_lambda_permission_source_arn" in source
 
 
 def test_runtime_definitions_pin_image_and_bound_compute() -> None:
@@ -136,3 +142,12 @@ def test_ecs_stopped_task_alarm_uses_filtered_eventbridge_failures() -> None:
     assert source.count("taskDefinitionArn = [aws_ecs_task_definition.worker.arn]") == 2
     assert "?ERROR ?error" not in source
     assert "aws_cloudwatch_log_resource_policy" in source
+    assert 'Service = ["events.amazonaws.com", "delivery.logs.amazonaws.com"]' in source
+
+
+def test_scheduler_retries_are_explicitly_cost_bounded() -> None:
+    source = _source("eventbridge.tf")
+
+    assert "retry_policy" in source
+    assert "maximum_event_age_in_seconds = 60" in source
+    assert "maximum_retry_attempts       = 1" in source

@@ -47,17 +47,21 @@ resource "aws_cloudwatch_log_group" "step_functions" {
   retention_in_days = 14
 }
 
-resource "aws_cloudwatch_log_resource_policy" "eventbridge_ecs_task_failures" {
-  policy_name = "${local.name_prefix}-eventbridge-ecs-task-failures"
-  policy_document = jsonencode({
+locals {
+  eventbridge_ecs_task_failures_log_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
       Effect    = "Allow"
-      Principal = { Service = "events.amazonaws.com" }
+      Principal = { Service = ["events.amazonaws.com", "delivery.logs.amazonaws.com"] }
       Action    = ["logs:CreateLogStream", "logs:PutLogEvents"]
       Resource  = "${aws_cloudwatch_log_group.ecs_task_failures.arn}:*"
     }]
   })
+}
+
+resource "aws_cloudwatch_log_resource_policy" "eventbridge_ecs_task_failures" {
+  policy_name     = "${local.name_prefix}-eventbridge-ecs-task-failures"
+  policy_document = local.eventbridge_ecs_task_failures_log_policy
 }
 
 resource "aws_cloudwatch_event_rule" "ecs_worker_nonzero_exit" {

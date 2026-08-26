@@ -45,6 +45,18 @@ mock_provider "aws" {
     }
   }
 
+  mock_resource "aws_apigatewayv2_api" {
+    defaults = {
+      execution_arn = "arn:aws:execute-api:ap-southeast-1:111122223333:fake-api"
+    }
+  }
+
+  mock_resource "aws_cloudwatch_log_group" {
+    defaults = {
+      arn = "arn:aws:logs:ap-southeast-1:111122223333:log-group:fake"
+    }
+  }
+
   mock_resource "aws_ecs_cluster" {
     defaults = {
       arn  = "arn:aws:ecs:ap-southeast-1:111122223333:cluster/fake"
@@ -142,6 +154,7 @@ run "enforces_artifact_lifecycle_class_tagging_contract" {
     )
     error_message = "The deny statements for lifecycle enforcement must be named and present."
   }
+
 }
 
 variables {
@@ -444,5 +457,53 @@ run "runtime_preserves_bounded_safe_defaults" {
       && try(statement.Resource, "") == "arn:${data.aws_partition.current.partition}:events:${var.region}:${data.aws_caller_identity.current.account_id}:rule/StepFunctionsGetEventsForECSTaskRule"
     ]) == 1
     error_message = "The ECS .sync role must manage only Step Functions' fixed EventBridge wait rule."
+  }
+
+  assert {
+    condition     = local.results_lambda_permission_source_arn == "${aws_apigatewayv2_api.public.execution_arn}/*/GET/runs/*"
+    error_message = "API Gateway may invoke Results Lambda only through the GET run route on an explicit stage."
+  }
+
+  assert {
+    condition = toset(jsondecode(local.eventbridge_ecs_task_failures_log_policy).Statement[0].Principal.Service) == toset([
+      "events.amazonaws.com",
+      "delivery.logs.amazonaws.com",
+    ])
+    error_message = "The ECS failure-event log target needs both EventBridge and Logs delivery principals."
+  }
+
+  assert {
+    condition = (
+      jsondecode(local.research_state_machine_definition).States.RunWorker.TimeoutSeconds == 600 &&
+      jsondecode(local.research_state_machine_definition).States.RunWorker.Catch[0].ErrorEquals == ["States.Timeout"] &&
+      jsondecode(local.research_state_machine_definition).States.RunWorker.Catch[0].ResultPath == null &&
+      jsondecode(local.research_state_machine_definition).States.RunWorker.Catch[0].Next == "WorkerTimedOut" &&
+      jsondecode(local.research_state_machine_definition).States.RunWorker.Catch[1].ErrorEquals == ["States.ALL"] &&
+      jsondecode(local.research_state_machine_definition).States.RunWorker.Catch[1].ResultPath == null &&
+      jsondecode(local.research_state_machine_definition).States.WorkerTimedOut.Parameters.FailureCode == "WORKFLOW_TIMED_OUT" &&
+      jsondecode(local.research_state_machine_definition).States.WorkerFailed.Parameters.FailureCode == "WORKER_FAILED"
+    )
+    error_message = "The worker must close its 600-second timeout separately before general failures without retaining raw errors."
+  }
+
+  assert {
+    condition = alltrue([
+      for state in [
+        jsondecode(local.research_state_machine_definition).States.FinalizeSuccess,
+        jsondecode(local.research_state_machine_definition).States.FinalizeFailure,
+      ] : state.Retry[0].ErrorEquals == ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.ClientExecutionTimeoutException"]
+      && state.Retry[0].IntervalSeconds == 2
+      && state.Retry[0].BackoffRate == 2
+      && state.Retry[0].MaxAttempts == 3
+    ])
+    error_message = "Both finalization calls may retry only bounded Lambda service failures."
+  }
+
+  assert {
+    condition = (
+      aws_scheduler_schedule.research.target[0].retry_policy[0].maximum_event_age_in_seconds == 60 &&
+      aws_scheduler_schedule.research.target[0].retry_policy[0].maximum_retry_attempts == 1
+    )
+    error_message = "The opt-in schedule must have one bounded retry with a short event age."
   }
 }

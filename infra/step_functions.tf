@@ -35,8 +35,9 @@ locals {
         Cause = "Preparation failed before a durable run record was returned."
       }
       RunWorker = {
-        Type     = "Task"
-        Resource = "arn:aws:states:::ecs:runTask.sync"
+        Type           = "Task"
+        Resource       = "arn:aws:states:::ecs:runTask.sync"
+        TimeoutSeconds = 600
         Parameters = {
           Cluster        = aws_ecs_cluster.research.arn
           TaskDefinition = aws_ecs_task_definition.worker.arn
@@ -54,7 +55,10 @@ locals {
           }
         }
         Retry = [{ ErrorEquals = ["ECS.ServiceException", "ECS.AmazonECSException"], IntervalSeconds = 2, BackoffRate = 2, MaxAttempts = 3 }]
-        Catch = [{ ErrorEquals = ["States.ALL"], ResultPath = null, Next = "WorkerFailed" }]
+        Catch = [
+          { ErrorEquals = ["States.Timeout"], ResultPath = null, Next = "WorkerTimedOut" },
+          { ErrorEquals = ["States.ALL"], ResultPath = null, Next = "WorkerFailed" },
+        ]
         # Preserve only PrepareRun's run_id/key; ECS response metadata is not durable state.
         ResultPath = null
         Next       = "FinalizeSuccess"
@@ -64,11 +68,17 @@ locals {
         Parameters = { "run_id.$" = "$.run_id", Outcome = "FAILED", FailureCode = "WORKER_FAILED" }
         Next       = "FinalizeFailure"
       }
+      WorkerTimedOut = {
+        Type       = "Pass"
+        Parameters = { "run_id.$" = "$.run_id", Outcome = "FAILED", FailureCode = "WORKFLOW_TIMED_OUT" }
+        Next       = "FinalizeFailure"
+      }
       FinalizeSuccess = {
         Type       = "Task"
         Resource   = "arn:aws:states:::lambda:invoke"
         Parameters = { FunctionName = aws_lambda_function.finalization.arn, Payload = { "run_id.$" = "$.run_id", outcome = "SUCCEEDED" } }
         OutputPath = "$.Payload"
+        Retry      = [{ ErrorEquals = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.ClientExecutionTimeoutException"], IntervalSeconds = 2, BackoffRate = 2, MaxAttempts = 3 }]
         Catch      = [{ ErrorEquals = ["States.ALL"], ResultPath = null, Next = "FinalizationFailed" }]
         End        = true
       }
@@ -82,6 +92,7 @@ locals {
         Resource   = "arn:aws:states:::lambda:invoke"
         Parameters = { FunctionName = aws_lambda_function.finalization.arn, Payload = { "run_id.$" = "$.run_id", outcome = "FAILED", "failure_code.$" = "$.FailureCode" } }
         OutputPath = "$.Payload"
+        Retry      = [{ ErrorEquals = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.ClientExecutionTimeoutException"], IntervalSeconds = 2, BackoffRate = 2, MaxAttempts = 3 }]
         End        = true
       }
     }
