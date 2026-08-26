@@ -1,6 +1,14 @@
 mock_provider "aws" {
   override_during = plan
 
+  mock_resource "aws_s3_bucket" {
+    defaults = {
+      arn    = "arn:aws:s3:::fake-artifact-bucket"
+      bucket = "fake-artifact-bucket"
+      id     = "fake-artifact-bucket"
+    }
+  }
+
   mock_resource "aws_security_group" {
     defaults = {
       ingress = []
@@ -12,6 +20,59 @@ mock_provider "aws" {
       ingress = []
       egress  = []
     }
+  }
+}
+
+run "enforces_artifact_lifecycle_class_tagging_contract" {
+  command = plan
+
+  assert {
+    condition = (
+      length([
+        for statement in jsondecode(aws_s3_bucket_policy.artifacts_tls_only.policy).Statement : statement
+        if try(statement.Effect, "") == "Deny"
+        && (try(statement.Action, "") == "s3:PutObject" || contains(try(tolist(statement.Action), []), "s3:PutObject"))
+        && (try(statement.Condition["Null"]["s3:RequestObjectTag/LifecycleClass"], null) == true
+        || try(statement.Condition["Null"]["s3:RequestObjectTag/LifecycleClass"], null) == "true")
+        && try(statement.Condition["StringNotEquals"], null) == null
+      ]) == 1
+    )
+    error_message = "Exactly one s3:PutObject deny statement must require LifecycleClass tag presence."
+  }
+
+  assert {
+    condition = (
+      length([
+        for statement in jsondecode(aws_s3_bucket_policy.artifacts_tls_only.policy).Statement : statement
+        if try(statement.Effect, "") == "Deny"
+        && (try(statement.Action, "") == "s3:PutObject" || contains(try(tolist(statement.Action), []), "s3:PutObject"))
+        && (try(statement.Condition["Null"]["s3:RequestObjectTag/LifecycleClass"], null) == false
+        || try(statement.Condition["Null"]["s3:RequestObjectTag/LifecycleClass"], null) == "false")
+        && try(statement.Condition["StringNotEquals"]["s3:RequestObjectTag/LifecycleClass"], null) == ["transient", "selected-public"]
+      ]) == 1
+    )
+    error_message = "Exactly one s3:PutObject deny statement must reject LifecycleClass values outside {transient, selected-public}."
+  }
+
+  assert {
+    condition = (
+      try(
+        toset([
+          for statement in jsondecode(aws_s3_bucket_policy.artifacts_tls_only.policy).Statement : statement.Sid
+          if try(statement.Effect, "") == "Deny"
+          && (try(statement.Action, "") == "s3:PutObject" || contains(try(tolist(statement.Action), []), "s3:PutObject"))
+          ]) == toset([
+          "DenyPutObjectWithoutLifecycleClass",
+          "DenyPutObjectWithUnknownLifecycleClass",
+          ]) && length([
+          for statement in jsondecode(aws_s3_bucket_policy.artifacts_tls_only.policy).Statement : statement
+          if try(statement.Effect, "") == "Deny"
+          && (try(statement.Action, "") == "s3:PutObject" || contains(try(tolist(statement.Action), []), "s3:PutObject"))
+        ]) == 2,
+        false
+      )
+    )
+    error_message = "The deny statements for lifecycle enforcement must be named and present."
   }
 }
 
