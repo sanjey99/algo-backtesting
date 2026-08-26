@@ -117,6 +117,8 @@ _ROOT = _HARNESS_PATH.parents[2] if len(_HARNESS_PATH.parents) > 2 else Path("/a
 _DOCKERFILE = _ROOT / "Dockerfile"
 _DOCKERIGNORE = _ROOT / ".dockerignore"
 _MAKEFILE = _ROOT / "Makefile"
+_GITIGNORE = _ROOT / ".gitignore"
+_RUNBOOK = _ROOT / "docs" / "aws-research-workflow.md"
 _FIXTURE = Path(__file__).with_name("fixtures") / "spy-daily.parquet"
 _RUN_ID = "123e4567-e89b-12d3-a456-426614174000"
 _PUBLICATION_SEQUENCE = (
@@ -333,10 +335,7 @@ def test_make_cloud_targets_are_frozen_and_container_smoke_enforces_runtime_poli
     assert "cloud-smoke:" in makefile
     assert "cloud-verify:" in makefile
     assert "cloud-container-smoke:" in makefile
-    assert (
-        "uv run --frozen --extra dev --extra cloud pytest tests/cloud/test_packaging.py -q"
-        in makefile
-    )
+    assert "uv run --frozen --extra dev --extra cloud pytest tests/cloud -q" in makefile
     assert (
         "uv run --frozen --extra dev --extra cloud python tests/cloud/test_packaging.py --smoke"
         in makefile
@@ -363,6 +362,206 @@ def test_make_cloud_targets_are_frozen_and_container_smoke_enforces_runtime_poli
     assert "tar -C" not in makefile
     assert "AWS_ACCESS_KEY_ID" not in makefile
     assert "AWS_SECRET_ACCESS_KEY" not in makefile
+
+
+def test_cloud_operations_runbook_and_local_targets_preserve_the_approval_boundary() -> None:
+    """Documentation and local targets must not blur offline verification with deployment."""
+    runbook = _read(_RUNBOOK)
+    makefile = _read(_MAKEFILE)
+    gitignore = _read(_GITIGNORE)
+    normalized_runbook = " ".join(runbook.split())
+
+    for target in ("cloud-test:", "cloud-infra-check:", "cloud-container-smoke:", "cloud-verify:"):
+        assert target in makefile
+    assert (
+        "cloud-verify: cloud-test cloud-smoke cloud-infra-check"
+        in makefile
+    )
+    assert "cloud-container-smoke: cloud-verify" in makefile
+    for command in (
+        "terraform fmt -check -recursive infra",
+        "terraform -chdir=infra validate",
+        "terraform -chdir=infra test -no-color",
+        "tflint --chdir=infra --recursive",
+        "checkov -d infra --config-file .checkov.yml",
+    ):
+        assert command in makefile
+    assert "terraform apply" not in makefile.split("cloud-infra-check:", 1)[1].split(
+        "\n\n", 1
+    )[0]
+
+    required_runbook_fragments = (
+        "# AWS research workflow operations",
+        "GET /repos/{owner}/{repo}/environments/aws-demo",
+        "actions:read",
+        "2026-03-10",
+        "prevent_self_review",
+        "can_admins_bypass",
+        "deployment_branch_policy",
+        "1. Verify the USD 100 promotional-credit eligible products and expiration.",
+        "2. Verify AWS account and region.",
+        "3. Verify budget recipients.",
+        "4. Review the saved Terraform plan.",
+        "5. Verify the schedule is false/disabled.",
+        "6. Verify cleanup date and owner.",
+        "7. Obtain explicit approval.",
+        "use_lockfile=true",
+        "state_machine_arn",
+        "public_results_api_base_url",
+        "aws sts get-caller-identity --query Account --output text",
+        "aws budgets describe-notifications-for-budget",
+        "aws budgets describe-subscribers-for-notification",
+        '"symbol":"SPY"',
+        '"visibility":"PRIVATE"',
+        "EXECUTION_ARN",
+        "manual-$(date -u +%Y%m%d%H%M%S)-1",
+        "QUERY_ID",
+        "PUBLIC run is undiscoverable until finalization marks it SUCCEEDED",
+        "terminal PRIVATE record is not mutated after completion",
+        "no list or compute-start endpoint",
+        "aws s3api list-object-versions",
+        "aws s3api delete-objects",
+        ".[:1000]",
+        "aws ecr list-images",
+        "aws ecr batch-delete-image",
+        "--max-items 100",
+        "NoSuchBucket",
+        "RepositoryNotFoundException",
+        "aws ec2 describe-network-interfaces",
+        "Association.PublicIp",
+        "aws ec2 describe-addresses",
+        "record after approved smoke run",
+        "Keep the bootstrap state bucket",
+        "infra/bootstrap` uses local state because it is initialized with `-backend=false",
+        "APPROVED_STATE_ARCHIVE_DIRECTORY",
+        "runtime test container executes with `--network none`",
+    )
+    for fragment in required_runbook_fragments:
+        assert fragment in normalized_runbook
+    assert "--execution-arn 'record after approved smoke run'" not in runbook
+    assert "--query-id 'record after approved smoke run'" not in runbook
+    assert "aws configure get region" not in runbook
+    assert "container smoke builds locally and executes with no network" not in runbook
+    assert runbook.count("--max-keys 1000") >= 2
+    assert runbook.count(".[:1000]") == 2
+    assert "--max-results 1000" not in runbook
+    assert "--max-results" not in runbook
+    assert runbook.count("--max-items 100") == 2
+    assert "case \"$RETAINED_RESOURCE_KIND\" in" in runbook
+    assert "SubscriptionType == \"EMAIL\"" in runbook
+
+    for ignored in (
+        ".terraform/",
+        "*.tfstate",
+        "*.tfplan",
+        ".env.*",
+        "*.pem",
+        "*.key",
+        "artifacts/cloud/",
+        "reports/cloud/",
+    ):
+        assert ignored in gitignore
+    assert "!.terraform.lock.hcl" in gitignore
+
+
+def test_operations_runbook_fails_closed_for_approved_cleanup_and_private_smoke() -> None:
+    """Destructive runbook commands must have exact review, scope, and receipt gates."""
+    runbook = _read(_RUNBOOK)
+
+    assert '.branch_policies[0].type == "branch"' not in runbook
+    assert runbook.index("runtime-destroy.tfplan") < runbook.index("S3_VERSIONS")
+    assert runbook.index("bootstrap-destroy.tfplan") < runbook.index("STATE_VERSIONS")
+    assert "TF_VAR_enable_schedule=false" in runbook
+    assert ".planned_values.outputs.schedule_enabled.value == false" in runbook
+    assert runbook.count("set -euo pipefail") >= 3
+    assert (
+        "Key=Project,Values=\"$TF_VAR_project\" "
+        "Key=Environment,Values=\"$TF_VAR_environment\""
+    ) in runbook
+    assert "RUNTIME_LOG_GROUPS" in runbook
+    assert "--log-group-name-prefix '/aws/'" not in runbook
+    assert "mktemp -d" in runbook
+    assert "set -o noclobber" in runbook
+    assert "PRIVATE smoke" in runbook
+    assert "PRIVATE_SMOKE_HTTP_STATUS" in runbook
+    assert "test \"$PRIVATE_SMOKE_HTTP_STATUS\" = 404" in runbook
+    assert "mutually exclusive" in runbook
+    assert "preview-only summary" in runbook
+    assert "separately checksummed foundation/runtime saved plans" in runbook
+    assert "later-deployment-only" in runbook
+    assert "FIRST_DEPLOYMENT" in runbook
+    assert "First deployment: do not query the absent budget" in runbook
+    assert "No describe error may be treated as first deployment" in runbook
+    assert "DELETE_ATTEMPT" in runbook
+    assert "S3_DELETE_RESPONSE" in runbook
+    assert "(.Errors // []) | length == 0" in runbook
+    assert (
+        'S3_REMAINING="$(aws s3api list-object-versions --bucket "$ARTIFACT_BUCKET"'
+        in runbook
+    )
+    assert '<<< "$S3_REMAINING"' in runbook
+    assert "ECR_DELETE_RESPONSE" in runbook
+    assert "(.failures // []) | length == 0" in runbook
+    assert (
+        'ECR_REMAINING="$(aws ecr list-images '
+        '--repository-name "$ECR_REPOSITORY_NAME"' in runbook
+    )
+    assert '<<< "$ECR_REMAINING"' in runbook
+    assert (
+        'jq -e \'(.Errors // []) | length == 0\' <<< "$STATE_DELETE_RESPONSE"'
+        in runbook
+    )
+    assert (
+        'STATE_REMAINING="$(aws s3api list-object-versions --bucket "$TF_STATE_BUCKET"'
+        in runbook
+    )
+    assert '<<< "$STATE_REMAINING"' in runbook
+    assert 'test "$(terraform -chdir=infra output -raw schedule_enabled)" = false' in runbook
+    assert "SAVED_ENI_IDS" in runbook
+    assert "SAVED_EIP_ALLOCATION_IDS" in runbook
+    assert "budget-subscribers-${BUDGET_NOTIFICATION_INDEX}.json" in runbook
+    assert "NoSuchBucket|Not Found" not in runbook
+    assert "grep -q 'NoSuchBucket'" in runbook
+    assert runbook.count('--expected-bucket-owner "$ACCOUNT_ID"') >= 8
+
+
+def test_runbook_defers_first_deployment_budget_review_and_never_reads_current_manual_state(
+) -> None:
+    """The later-only local plan cannot be evidence for the first runtime deployment."""
+    runbook = _read(_RUNBOOK)
+    manual_plan_write = (
+        'terraform -chdir=infra show -json manual.tfplan > '
+        '"$EVIDENCE_DIRECTORY/manual-plan.json"'
+    )
+
+    assert runbook.index("manual-plan.json") == runbook.index(manual_plan_write) + len(
+        "terraform -chdir=infra show -json manual.tfplan > \"$EVIDENCE_DIRECTORY/"
+    )
+    manual_block = runbook[runbook.index(manual_plan_write) : runbook.index("## One bounded SPY")]
+    assert "terraform -chdir=infra output schedule_enabled" not in manual_block
+    assert "AWS deploy` `runtime-plan` job" in runbook
+    assert "runtime-apply` environment job" in runbook
+    assert "one Bash session" in " ".join(runbook.split())
+
+
+def test_runbook_uses_supported_ecr_pagination_and_post_deploy_digest_receipt() -> None:
+    """Cleanup paging and digest provenance must match the deployed worker image."""
+    runbook = _read(_RUNBOOK)
+
+    assert "--max-results" not in runbook
+    assert runbook.count("--max-items 100") == 2
+    assert "Mandatory post-deploy image-digest receipt" in runbook
+    assert 'terraform -chdir=infra output -raw ecs_worker_task_definition_arn' in runbook
+    assert 'terraform -chdir=infra output -raw ecr_repository_url' in runbook
+    assert (
+        'aws ecs describe-task-definition --task-definition '
+        '"$WORKER_TASK_DEFINITION_ARN"' in runbook
+    )
+    assert 'select(.name == "worker")' in runbook
+    assert 'EXPECTED_WORKER_IMAGE="${ECR_REPOSITORY_URL}@sha256:${IMAGE_DIGEST}"' in runbook
+    assert '"$WORKER_IMAGE" = "$EXPECTED_WORKER_IMAGE"' in runbook
+    assert '[[ "$IMAGE_DIGEST" =~ ^[0-9a-f]{64}$ ]]' in runbook
+    assert "worker-image-receipt.json" in runbook
 
 
 def test_mounted_harness_imports_without_the_dev_test_runner(

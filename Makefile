@@ -22,7 +22,7 @@ DATA_ARTIFACT_DIR ?= artifacts/data-demo
 DATA_ACQUISITION_ID ?=
 CLOUD_IMAGE ?= algo-backtester-aws:local
 
-.PHONY: test lint verify-warnings serve dashboard report install sql-validate sql-compare sql-benchmark-smoke data-acquire-demo data-inspect-demo cloud-test cloud-smoke cloud-verify cloud-container-smoke
+.PHONY: test lint verify-warnings serve dashboard report install sql-validate sql-compare sql-benchmark-smoke data-acquire-demo data-inspect-demo cloud-test cloud-smoke cloud-infra-check cloud-verify cloud-container-smoke
 
 install:
 	$(PYTHON) -m pip install -e ".[dev]" -q
@@ -78,12 +78,19 @@ data-inspect-demo:
 	$(PYTHON) -m src.data.cli inspect --acquisition-id $(DATA_ACQUISITION_ID) --cache-dir $(DATA_ARTIFACT_DIR)/cache --manifest-dir $(DATA_ARTIFACT_DIR)/reports
 
 cloud-test:
-	uv run --frozen --extra dev --extra cloud pytest tests/cloud/test_packaging.py -q
+	uv run --frozen --extra dev --extra cloud pytest tests/cloud -q
 
 cloud-smoke:
 	uv run --frozen --extra dev --extra cloud python tests/cloud/test_packaging.py --smoke
 
-cloud-verify: cloud-test cloud-smoke
+cloud-infra-check:
+	terraform fmt -check -recursive infra
+	terraform -chdir=infra validate
+	terraform -chdir=infra test -no-color
+	tflint --chdir=infra --recursive
+	checkov -d infra --config-file .checkov.yml
+
+cloud-verify: cloud-test cloud-smoke cloud-infra-check
 
 cloud-container-smoke: cloud-verify
 	@set -eu; \

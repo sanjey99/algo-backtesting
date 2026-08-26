@@ -67,6 +67,28 @@ make verify-warnings
 `make verify-warnings` is a compatibility release gate: it treats Starlette transport deprecations
 and naive-UTC persistence deprecations as errors in their affected test scopes.
 
+## AWS research workflow (approval-gated)
+
+The optional AWS path runs the existing research engine as one bounded Fargate
+task coordinated by Step Functions. Its immutable artifacts stay private; the
+only public route is read-only `GET /runs/{run_id}` after a result is finalized.
+The local verification commands below do not deploy AWS resources or need AWS credentials:
+
+```bash
+uv sync --locked --extra dev --extra cloud
+make cloud-verify
+```
+
+`cloud-verify` runs the offline cloud tests, fake-store smoke receipt, and
+Terraform/TFLint/Checkov checks without `apply`; run `make cloud-container-smoke`
+separately for the isolated hardened-image smoke after that preflight. The manual
+OIDC bootstrap, protected GitHub environment requirement, deployment
+approval, one-run smoke, results, cost checks, and inventory-first cleanup are
+documented in the [AWS research workflow operations runbook](docs/aws-research-workflow.md).
+The approved [design](docs/superpowers/specs/2026-08-24-aws-research-workflow-design.md)
+and [implementation plan](docs/superpowers/plans/2026-08-24-aws-research-workflow.md)
+remain the source of technical and approval constraints.
+
 GitHub Actions runs the full test, coverage, warning, lint, strict type, and lock matrix on Linux
 and native Windows. The Linux job also audits the locked dependency set; the Windows job exercises
 the platform-specific Make paths and SQL smoke workflow.
