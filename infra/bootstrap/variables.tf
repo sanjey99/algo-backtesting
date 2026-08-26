@@ -61,3 +61,35 @@ variable "region" {
     error_message = "region must be a valid lowercase AWS region identifier."
   }
 }
+
+variable "github_repository" {
+  description = "Exact owner/name repository trusted by the GitHub OIDC roles."
+  type        = string
+}
+
+variable "deploy_ref" {
+  description = "Exact Git ref trusted by the read-only GitHub plan role."
+  type        = string
+}
+
+variable "deploy_environment" {
+  description = "Exact protected GitHub environment trusted by the deploy role."
+  type        = string
+}
+
+variable "backend_state_key" {
+  description = "Exact non-secret S3 key used by the application Terraform backend."
+  type        = string
+  default     = "terraform.tfstate"
+
+  validation {
+    condition = (
+      length(var.backend_state_key) >= 1
+      && length(var.backend_state_key) <= 512
+      && var.backend_state_key == trimspace(var.backend_state_key)
+      && !strcontains(var.backend_state_key, "..")
+      && can(regex("^[A-Za-z0-9][A-Za-z0-9._/-]{1,510}[A-Za-z0-9]$", var.backend_state_key))
+    )
+    error_message = "backend_state_key must be a trimmed relative S3 key without traversal segments."
+  }
+}

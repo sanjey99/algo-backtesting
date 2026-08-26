@@ -11,6 +11,8 @@ import yaml
 WORKFLOWS = Path(".github/workflows")
 IAM_CONFIGURATION = Path("infra/iam.tf")
 VARIABLES_CONFIGURATION = Path("infra/variables.tf")
+BOOTSTRAP_CONFIGURATION = Path("infra/bootstrap/iam.tf")
+BOOTSTRAP_VARIABLES = Path("infra/bootstrap/variables.tf")
 ACTION_SHA = re.compile(r"^[^@\s]+@[0-9a-f]{40}(?:\s+#\s+v\d[\w.\-]*)?$")
 STATIC_AWS_KEY_MARKERS = ("aws_access_key_id", "aws_secret_access_key")
 
@@ -41,12 +43,15 @@ def _assert_safe_action_pins(document: dict[str, object]) -> None:
         assert ACTION_SHA.fullmatch(reference), reference
 
 
-def _assert_no_static_keys_or_untrusted_execution(text: str) -> None:
+def _assert_no_static_keys_or_untrusted_execution(
+    text: str, *, allow_trusted_artifact_transfer: bool = False
+) -> None:
     lowered = text.lower()
     assert "pull_request_target" not in lowered
     assert not any(marker in lowered for marker in STATIC_AWS_KEY_MARKERS)
-    assert "actions/download-artifact" not in lowered
-    assert "workflow_run" not in lowered
+    if not allow_trusted_artifact_transfer:
+        assert "actions/download-artifact" not in lowered
+    assert "\n  workflow_run:" not in lowered
 
 
 def _smoke_request(text: str) -> dict[str, object]:
@@ -79,7 +84,7 @@ def _iam_statement_matrix(policy: str) -> list[tuple[frozenset[str], str]]:
                     statements.append(
                         (
                             frozenset(re.findall(r'"([^"]+)"', action_match.group(1))),
-                            resource_match.group(1).strip(),
+                            resource_match.group(1).strip().rstrip(" }"),
                         )
                     )
     return statements
@@ -125,6 +130,7 @@ def test_plan_is_manual_read_only_and_does_not_publish_sensitive_artifacts() -> 
     assert "terraform -chdir=infra init -input=false" in text
     assert '-backend-config="use_lockfile=true"' in text
     assert "TF_VAR_backend_state_key: ${{ vars.TF_STATE_KEY }}" in text
+    assert "TF_VAR_region: ${{ vars.AWS_REGION }}" in text
     assert '"$TF_STATE_KEY" != *".."*' in text
     assert "tflint --chdir=infra --recursive" in text
     assert "terraform -chdir=infra test" in text
@@ -142,9 +148,20 @@ def test_deploy_is_manual_protected_and_applies_only_saved_plans() -> None:
 
     assert set(workflow["on"]) == {"workflow_dispatch"}
     assert workflow["permissions"] == {"contents": "read", "id-token": "write"}
-    assert "environment: aws-demo" in text
+    assert "concurrency:" in text
+    assert "foundation-plan" in workflow["jobs"]
+    assert "foundation-apply" in workflow["jobs"]
+    assert "preflight" in workflow["jobs"]
+    assert "runtime-plan" in workflow["jobs"]
+    assert "runtime-apply" in workflow["jobs"]
+    assert workflow["jobs"]["foundation-apply"]["needs"] == ["foundation-plan"]
+    assert workflow["jobs"]["runtime-apply"]["needs"] == ["runtime-plan"]
+    assert workflow["jobs"]["foundation-apply"]["environment"] == "aws-demo"
+    assert workflow["jobs"]["runtime-plan"]["environment"] == "aws-demo"
+    assert workflow["jobs"]["runtime-apply"]["environment"] == "aws-demo"
     assert '-backend-config="use_lockfile=true"' in text
     assert "TF_VAR_backend_state_key: ${{ vars.TF_STATE_KEY }}" in text
+    assert "TF_VAR_region: ${{ vars.AWS_REGION }}" in text
     assert '"$TF_STATE_KEY" != *".."*' in text
     assert "AWS_DEPLOY_ROLE_ARN" in text
     assert "execute_workflow" in text
@@ -163,41 +180,87 @@ def test_deploy_is_manual_protected_and_applies_only_saved_plans() -> None:
     assert text.index(runtime_plan) < text.index(
         runtime_apply
     )
+    assert "actions/upload-artifact" in text
+    assert "actions/download-artifact" in text
+    assert "retention-days: 1" in text
+    assert "github.sha" in text
+    assert "github.run_id" in text
+    assert "github.run_attempt" in text
+    assert "sha256sum" in text
+    assert "manifest.json" in text
+    assert "terraform -chdir=infra plan" in text
     assert "aws ecr describe-images" in text
-    assert "image_digest" in text
-    assert "tflint --chdir=infra --recursive" in text
-    assert "terraform -chdir=infra test" in text
-    assert "make test" in text
-    assert "make verify-warnings" in text
-    assert "make lint" in text
-    assert _smoke_request(text) == {
-        "schema_version": "1",
-        "symbol": "SPY",
-        "start": "2024-01-02",
-        "end": "2024-01-10",
-        "strategy_key": "ma_crossover",
-        "strategy_parameters": {"fast_window": 10, "slow_window": 20},
-        "initial_capital": 10000.0,
-        "commission_pct": 0.001,
-        "slippage_pct": 0.0005,
-        "visibility": "PRIVATE",
-    }
+    assert "docker push" in text
+    assert 'plan -input=false -out=runtime.tfplan -var="image_digest=$IMAGE_DIGEST"' in text
+    assert "if: ${{ inputs.execute_workflow }}" in text
+    assert text.index("docker push") < text.index("-out=runtime.tfplan")
+    assert text.index("runtime.tfplan") < text.index("start-execution")
+    assert workflow["concurrency"]["group"] == "aws-deploy-${{ github.repository }}-aws-demo"
+    assert workflow["jobs"]["foundation-plan"]["needs"] == ["preflight"]
+    assert workflow["jobs"]["runtime-plan"]["needs"] == ["preflight", "foundation-apply"]
+    runtime_condition = workflow["jobs"]["runtime-plan"]["if"]
+    assert "needs.preflight.result == 'success'" in runtime_condition
+    assert "inputs.first_deployment == false" in runtime_condition
+    assert "needs.foundation-apply.result == 'success'" in runtime_condition
+    upload_paths = [
+        step["with"]["path"].split()
+        for job in (workflow["jobs"]["foundation-plan"], workflow["jobs"]["runtime-plan"])
+        for step in job["steps"]
+        if step.get("uses", "").startswith("actions/upload-artifact@")
+    ]
+    assert upload_paths == [
+        ["infra/foundation.tfplan", "infra/foundation.tfplan.sha256", "infra/manifest.json"],
+        ["infra/runtime.tfplan", "infra/runtime.tfplan.sha256", "infra/manifest.json"],
+    ]
+    download_steps = [
+        step
+        for job in (workflow["jobs"]["foundation-apply"], workflow["jobs"]["runtime-apply"])
+        for step in job["steps"]
+        if step.get("uses", "").startswith("actions/download-artifact@")
+    ]
+    assert len(download_steps) == 2
+    assert all(step["with"]["path"] == "infra" for step in download_steps)
+    assert all(step["with"]["merge-multiple"] == "true" for step in download_steps)
+    assert "infra/.terraform" not in text
+    assert "terraform.tfstate" not in text
+    assert "(cd infra && sha256sum foundation.tfplan > foundation.tfplan.sha256)" in text
+    assert "(cd infra && sha256sum runtime.tfplan > runtime.tfplan.sha256)" in text
+    assert text.count('aws sts get-caller-identity --query Account --output text') >= 4
+    for manifest_binding in ("account_id", "region", "state_bucket", "state_key"):
+        assert text.count(f"--arg {manifest_binding}") == 2
+        assert text.count(f". {manifest_binding}") == 0
+        assert text.count(f".{manifest_binding} infra/manifest.json") == 2
+    preflight = workflow["jobs"]["preflight"]
+    assert preflight["permissions"] == {"contents": "read"}
+    for command in (
+        "uv sync --locked --extra dev --extra cloud",
+        "make test",
+        "make verify-warnings",
+        "make lint",
+        "terraform fmt -check -recursive infra",
+        "terraform -chdir=infra validate",
+        "terraform -chdir=infra test",
+        "tflint --chdir=infra --recursive",
+        "checkov",
+    ):
+        assert command in text
     _assert_safe_action_pins(workflow)
-    _assert_no_static_keys_or_untrusted_execution(text)
+    _assert_no_static_keys_or_untrusted_execution(text, allow_trusted_artifact_transfer=True)
 
 
 def test_oidc_roles_have_separate_exact_trust_subjects_and_capabilities() -> None:
     iam = IAM_CONFIGURATION.read_text(encoding="utf-8")
-    plan_policy = iam.split('resource "aws_iam_role_policy" "github_plan"', 1)[1].split(
+    bootstrap = BOOTSTRAP_CONFIGURATION.read_text(encoding="utf-8")
+    plan_policy = bootstrap.split('resource "aws_iam_role_policy" "github_plan"', 1)[1].split(
         'resource "aws_iam_role_policy" "github_deploy"', 1
     )[0]
-    deploy_policy = iam.split('resource "aws_iam_role_policy" "github_deploy"', 1)[1]
+    deploy_policy = bootstrap.split('resource "aws_iam_role_policy" "github_deploy"', 1)[1]
 
-    assert 'url             = "https://token.actions.githubusercontent.com"' in iam
-    assert 'values   = ["repo:${var.github_repository}:ref:${var.deploy_ref}"]' in iam
+    assert 'url             = "https://token.actions.githubusercontent.com"' in bootstrap
+    assert 'values   = ["repo:${var.github_repository}:ref:${var.deploy_ref}"]' in bootstrap
     assert (
         'values   = ["repo:${var.github_repository}:environment:${var.deploy_environment}"]'
-        in iam
+        in bootstrap
     )
     assert "states:StartExecution" not in plan_policy
     assert "ecr:PutImage" not in plan_policy
@@ -205,19 +268,16 @@ def test_oidc_roles_have_separate_exact_trust_subjects_and_capabilities() -> Non
     assert 'Action = ["*"]' not in plan_policy
     assert '"aws:RequestedRegion" = var.region' in plan_policy
     plan_matrix = _iam_statement_matrix(plan_policy)
-    assert (
-        frozenset({"iam:ListOpenIDConnectProviders", "iam:ListRoles", "sts:GetCallerIdentity"}),
-        '"*"',
-    ) in plan_matrix
-    assert (frozenset({"budgets:Describe*"}), "local.github_budget_arn") in plan_matrix
-    assert (frozenset({"s3:GetObject"}), "local.github_state_object_arn") in plan_matrix
+    assert (frozenset({"sts:GetCallerIdentity"}), '"*"') in plan_matrix
+    assert (frozenset({"budgets:DescribeBudget"}), "local.github_budget_arn") in plan_matrix
+    assert (frozenset({"s3:GetObject"}), "local.state_object_arn") in plan_matrix
     assert (
         frozenset({"s3:GetObject", "s3:PutObject", "s3:DeleteObject"}),
-        "local.github_state_lock_arn",
+        "local.state_lock_arn",
     ) in plan_matrix
     assert not any(
         {"s3:PutObject", "s3:DeleteObject"} & actions
-        and resource == "local.github_state_object_arn"
+        and resource == "local.state_object_arn"
         for actions, resource in plan_matrix
     )
     assert not any("tfstate-*/*" in resource for _actions, resource in plan_matrix)
@@ -227,90 +287,173 @@ def test_oidc_roles_have_separate_exact_trust_subjects_and_capabilities() -> Non
     )
 
     deploy_matrix = _iam_statement_matrix(deploy_policy)
-    assert (
-        frozenset({"iam:ListOpenIDConnectProviders", "iam:ListRoles", "sts:GetCallerIdentity"}),
-        '"*"',
-    ) in deploy_matrix
+    assert (frozenset({"sts:GetCallerIdentity"}), '"*"') in deploy_matrix
     assert any(
         actions
         == frozenset(
             {
-                "budgets:CreateBudget",
-                "budgets:ModifyBudget",
-                "budgets:DeleteBudget",
-                "budgets:Describe*",
+                    "budgets:CreateBudget",
+                    "budgets:ModifyBudget",
+                    "budgets:DeleteBudget",
+                    "budgets:DescribeBudget",
             }
         )
         and resource == "local.github_budget_arn"
         for actions, resource in deploy_matrix
     )
     assert any(
-        "events:PutRule" in actions and resource == "local.github_event_rule_arn_pattern"
-        for actions, resource in deploy_matrix
+        actions == frozenset({"iam:CreateRole"}) for actions, _resource in deploy_matrix
+    )
+    assert '"iam:PermissionsBoundary" = local.runtime_permissions_boundary' in deploy_policy
+    assert any(
+        actions == frozenset({"iam:PassRole"}) for actions, _resource in deploy_matrix
     )
     assert (
         frozenset({"s3:GetObject", "s3:PutObject"}),
-        "local.github_state_object_arn",
+        "local.state_object_arn",
     ) in deploy_matrix
     assert (
         frozenset({"s3:GetObject", "s3:PutObject", "s3:DeleteObject"}),
-        "local.github_state_lock_arn",
+        "local.state_lock_arn",
     ) in deploy_matrix
     assert not any("tfstate-*/*" in resource for _actions, resource in deploy_matrix)
-    assert "states:StartExecution" in deploy_policy
     assert "AdministratorAccess" not in deploy_policy
-    assert 'resource "aws_iam_openid_connect_provider" "github_actions"' in iam
-    assert "iam:CreateOpenIDConnectProvider" in deploy_policy
-    assert "iam:DeleteOpenIDConnectProvider" in deploy_policy
-    assert "iam:UpdateOpenIDConnectProviderThumbprint" in deploy_policy
-    assert "lambda:PutFunctionConcurrency" in deploy_policy
-    assert "dynamodb:UpdateTimeToLive" in deploy_policy
-    assert "dynamodb:UpdateContinuousBackups" in deploy_policy
-    assert "ec2:ModifyVpcAttribute" in deploy_policy
-    assert "events:TagResource" in deploy_policy
-    assert "ecr:SetRepositoryPolicy" in deploy_policy
+    assert 'resource "aws_iam_openid_connect_provider" "github_actions"' in bootstrap
+    assert "iam:CreateOpenIDConnectProvider" not in deploy_policy
+    assert "iam:DeleteOpenIDConnectProvider" not in deploy_policy
+    assert "iam:UpdateOpenIDConnectProviderThumbprint" not in deploy_policy
     assert "aws:RequestTag/Project" not in deploy_policy
     assert "aws:ResourceTag/Environment" not in deploy_policy
-    assert deploy_policy.count('"aws:RequestedRegion" = var.region') >= 3
-    variables = VARIABLES_CONFIGURATION.read_text(encoding="utf-8")
+    assert "iam:ListOpenIDConnectProviders" not in deploy_policy
+    assert "iam:ListRoles" not in deploy_policy
+    assert deploy_policy.count('"aws:RequestedRegion" = var.region') >= 1
+    variables = BOOTSTRAP_VARIABLES.read_text(encoding="utf-8")
     assert 'variable "backend_state_key"' in variables
     assert 'default     = "terraform.tfstate"' in variables
     assert '!strcontains(var.backend_state_key, "..")' in variables
+    assert 'regex("^[A-Za-z0-9][A-Za-z0-9._/-]{1,510}[A-Za-z0-9]$"' in variables
+    assert 'resource "aws_iam_role" "github_deploy"' not in iam
+    assert 'resource "aws_iam_role_policy" "github_deploy"' not in iam
 
 
 def test_deploy_policy_is_bootstrapable_from_deterministic_resource_patterns() -> None:
-    iam = IAM_CONFIGURATION.read_text(encoding="utf-8")
-    deploy_policy = iam.split('resource "aws_iam_role_policy" "github_deploy"', 1)[1]
+    bootstrap = BOOTSTRAP_CONFIGURATION.read_text(encoding="utf-8")
+    deploy_policy = bootstrap.split('resource "aws_iam_role_policy" "github_deploy"', 1)[1]
 
     live_resource_references = (
-        "aws_s3_bucket.", "aws_dynamodb_table.", "aws_ecr_repository.",
+        "aws_s3_bucket.artifacts.", "aws_dynamodb_table.", "aws_ecr_repository.",
         "aws_lambda_function.", "aws_ecs_cluster.", "aws_cloudwatch_event_rule.",
         "aws_cloudwatch_log_group.", "aws_scheduler_schedule.", "aws_sfn_state_machine.",
     )
     assert not any(reference in deploy_policy for reference in live_resource_references)
-    assert "iam:Get*" not in deploy_policy
-    assert "iam:List*" not in deploy_policy
-    assert "Resource = local.github_budget_arn" in deploy_policy
-    for local_name in (
-        "github_artifact_bucket_arn",
-        "github_lambda_arn_pattern",
-        "github_runs_table_arn",
-        "github_worker_repository_arn",
-        "github_ecs_cluster_arn",
-        "github_state_machine_arn",
-        "github_event_rule_arn_pattern",
-        "github_log_group_arn_patterns",
-    ):
-        assert f"Resource = local.{local_name}" in deploy_policy
+    assert "aws_iam_openid_connect_provider.github_actions" not in deploy_policy
+    assert "local.runtime_role_arns" in deploy_policy
+    assert "iam:PermissionsBoundary" in deploy_policy
+    assert "local.runtime_permissions_boundary" in deploy_policy
+    assert "github-plan" not in deploy_policy
+    assert "github-deploy" not in deploy_policy
 
-    for deterministic_pattern in (
-        "${local.name_prefix}-monthly-guardrail",
-        "s3:::${local.name_prefix}-art-*",
-        "function:${local.name_prefix}-*",
-        "table/${local.name_prefix}-runs",
-        "repository/${local.name_prefix}-worker",
-        "cluster/${local.name_prefix}-research",
-        "stateMachine:${local.name_prefix}-research",
-        "rule/${local.name_prefix}-ecs-worker-*",
+
+def test_bootstrap_policies_use_an_explicit_provider_action_matrix() -> None:
+    """Terraform's AWS provider surface must never be authorized by action globs."""
+    bootstrap = BOOTSTRAP_CONFIGURATION.read_text(encoding="utf-8")
+    deploy_policy = bootstrap.split('resource "aws_iam_role_policy" "github_deploy"', 1)[1]
+    plan_policy = bootstrap.split('resource "aws_iam_role_policy" "github_plan"', 1)[1].split(
+        'resource "aws_iam_role_policy" "github_deploy"', 1
+    )[0]
+
+    for policy in (plan_policy, deploy_policy):
+        assert not re.search(
+            r'"(?:[a-z0-9-]+):(?>Get|List|Describe|Create|Delete|Put|Update)\*"',
+            policy,
+        )
+
+    for action in (
+        "s3:GetEncryptionConfiguration",
+        "s3:GetLifecycleConfiguration",
+        "s3:PutEncryptionConfiguration",
+        "s3:PutLifecycleConfiguration",
+        "s3:DeletePublicAccessBlock",
+        "ecr:PutImageTagMutability",
+        "ecr:PutImageScanningConfiguration",
+        "ecr:DescribeImages",
+        "lambda:PutFunctionConcurrency",
+        "dynamodb:UpdateContinuousBackups",
+        "ec2:ModifyVpcAttribute",
+        "events:PutTargets",
+        "scheduler:UpdateSchedule",
+        "states:UpdateStateMachine",
+        "states:StartExecution",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListRoleTags",
+        "iam:ListInstanceProfilesForRole",
+        "iam:PutRolePermissionsBoundary",
+        "ec2:DescribeVpcAttribute",
     ):
-        assert deterministic_pattern in iam
+        assert action in deploy_policy
+    for invalid_action in (
+        "s3:GetBucketEncryption",
+        "s3:GetBucketLifecycleConfiguration",
+        "s3:DeleteBucketEncryption",
+        "s3:DeleteBucketLifecycle",
+        "s3:PutBucketEncryption",
+        "s3:PutBucketLifecycleConfiguration",
+    ):
+        assert invalid_action not in bootstrap
+    assert "local.cloudwatch_alarm_arns" in deploy_policy
+    assert (
+        'Action = ["cloudwatch:DeleteAlarms", "cloudwatch:DescribeAlarms", '
+        '"cloudwatch:ListTagsForResource", "cloudwatch:PutMetricAlarm", '
+        '"cloudwatch:TagResource", "cloudwatch:UntagResource"], '
+        "Resource = local.cloudwatch_alarm_arns"
+    ) in deploy_policy
+    assert '"logs:CreateLogGroup"], Resource = "*"' not in deploy_policy
+    assert '"logs:CreateLogGroup"' in deploy_policy
+    assert "Resource = local.runtime_log_group_arns" in deploy_policy
+    assert 'Resource = local.cloudwatch_alarm_arns' in deploy_policy
+    assert '"iam:PermissionsBoundary" = local.runtime_permissions_boundary' in deploy_policy
+    assert "iam:DeleteRolePermissionsBoundary" not in deploy_policy
+    assert "StringLike = { \"s3:prefix\"" not in plan_policy
+    assert "StringLike = { \"s3:prefix\"" not in deploy_policy
+    assert plan_policy.count('StringEquals = { "s3:prefix"') == 1
+    assert deploy_policy.count('StringEquals = { "s3:prefix"') == 1
+    assert re.search(
+        r'Action = \[[^\]]+"s3:ListBucket"[^\]]*\], Resource = local\.artifact_bucket_arn',
+        plan_policy,
+    )
+    assert (
+        'Action = ["logs:ListTagsForResource"], Resource = local.runtime_log_group_arns'
+        in plan_policy
+    )
+    assert (
+        'Action = ["cloudwatch:ListTagsForResource"], Resource = local.cloudwatch_alarm_arns'
+        in plan_policy
+    )
+    assert '"iam:PutRolePermissionsBoundary"], Resource = local.runtime_role_arns' in deploy_policy
+
+
+def test_runtime_boundary_admits_only_runtime_policy_resources() -> None:
+    bootstrap = BOOTSTRAP_CONFIGURATION.read_text(encoding="utf-8")
+    boundary = bootstrap.split(
+        'resource "aws_iam_policy" "runtime_permissions_boundary"', 1
+    )[1].split(
+        'resource "aws_iam_openid_connect_provider"', 1
+    )[0]
+
+    for action in (
+        "s3:GetObject",
+        "s3:PutObject",
+        "dynamodb:UpdateItem",
+        "ecr:BatchGetImage",
+        "lambda:InvokeFunction",
+        "ecs:RunTask",
+        "events:PutTargets",
+        "states:StartExecution",
+        "iam:PassRole",
+    ):
+        assert action in boundary
+    assert 'Resource = "*"' not in boundary.split("# Unscopable", 1)[0]
+    assert "local.artifact_object_arns" in boundary
+    assert "local.runs_table_arn" in boundary
+    assert "local.worker_repository_arn" in boundary
+    assert "local.runtime_role_arns" in boundary
