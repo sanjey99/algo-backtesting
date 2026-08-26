@@ -1,0 +1,121 @@
+name: AWS plan
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: Maintainer-provided change reason recorded only in the job summary.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  plan:
+    name: Generate read-only infrastructure plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_STATE_KEY: ${{ vars.TF_STATE_KEY }}
+      TF_VAR_backend_state_key: ${{ vars.TF_STATE_KEY }}
+      TF_VAR_project: ${{ vars.TF_PROJECT }}
+      TF_VAR_environment: ${{ vars.TF_ENVIRONMENT }}
+      TF_VAR_owner: ${{ vars.TF_OWNER }}
+      TF_VAR_cost_center: ${{ vars.TF_COST_CENTER }}
+      TF_VAR_expiry_date: ${{ vars.TF_EXPIRY_DATE }}
+      TF_VAR_alert_emails: ${{ vars.TF_ALERT_EMAILS_JSON }}
+      TF_VAR_image_digest: ${{ vars.TF_IMAGE_DIGEST }}
+      TF_VAR_github_repository: ${{ github.repository }}
+      TF_VAR_deploy_ref: ${{ github.ref }}
+      TF_VAR_deploy_environment: aws-demo
+      PLAN_REASON: ${{ inputs.reason }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.12"
+          version: "0.11.29"
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.10.0"
+          terraform_wrapper: false
+
+      - name: Install TFLint
+        uses: terraform-linters/setup-tflint@6e1e0642c0289bd619021bf6b34e3c08ed1e005a # v6.3.0
+        with:
+          tflint_version: "v0.59.1"
+
+      - name: Configure planning role through GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@99214aa6889fcddfa57764031d71add364327e59 # v6.1.3
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: github-terraform-plan
+
+      - name: Validate non-secret backend and configuration inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$AWS_REGION" =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]$ ]]
+          [[ "$TF_STATE_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]
+          [[ "$TF_STATE_KEY" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{1,510}[A-Za-z0-9]$ ]]
+          [[ "$TF_STATE_KEY" != *".."* && "$TF_STATE_KEY" != *"//"* && "$TF_STATE_KEY" != */./* ]]
+          [[ "$PLAN_REASON" =~ ^[[:print:]]{1,200}$ ]]
+
+      - name: Install and audit locked dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --locked --extra dev --extra cloud
+          uv lock --check
+          make test
+          make verify-warnings
+          make lint
+          uvx --python 3.12 --from pip-audit==2.10.1 pip-audit --strict \
+            -r <(uv export --locked --extra dev --extra cloud --no-hashes --format requirements-txt \
+              | rg -v '^-e \.$')
+
+      - name: Validate cloud code and Terraform locally
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --locked --extra dev --extra cloud pytest tests/cloud -q
+          terraform fmt -check -recursive infra
+          terraform -chdir=infra init -input=false \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=$TF_STATE_KEY" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="use_lockfile=true"
+          terraform -chdir=infra validate
+          terraform -chdir=infra test
+          tflint --chdir=infra --recursive
+          uvx --from checkov==3.2.485 checkov -d infra --config-file .checkov.yml
+
+      - name: Create saved Terraform plan
+        shell: bash
+        run: terraform -chdir=infra plan -input=false -out=tfplan
+
+      - name: Publish non-sensitive plan summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '## AWS plan'
+            echo
+            echo "Reason: $PLAN_REASON"
+            echo
+            echo '```text'
+            terraform -chdir=infra show -no-color tfplan | sed -n '/Plan:/,$p'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

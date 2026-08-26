@@ -94,7 +94,25 @@ variable "image_digest" {
   }
 }
 
-# Task 11 consumes this approved OIDC repository interface.
+# The remote state location is operational metadata, never a credential. It is
+# admitted separately so OIDC policies can distinguish state from its S3 lock.
+# tflint-ignore: terraform_unused_declarations
+variable "backend_state_key" {
+  description = "Exact non-secret S3 object key for the Terraform state file."
+  type        = string
+  default     = "terraform.tfstate"
+
+  validation {
+    condition = (
+      can(regex("^[A-Za-z0-9][A-Za-z0-9._/-]{0,510}[A-Za-z0-9]$", var.backend_state_key)) &&
+      !strcontains(var.backend_state_key, "..") &&
+      alltrue([for segment in split("/", var.backend_state_key) : segment != "." && segment != ".." && length(segment) > 0])
+    )
+    error_message = "backend_state_key must be a bounded relative S3 key without dot segments, traversal, or duplicate separators."
+  }
+}
+
+# Task 11 restricts GitHub OIDC trust to this exact repository.
 # tflint-ignore: terraform_unused_declarations
 variable "github_repository" {
   description = "GitHub repository in owner/name form for later OIDC restrictions."
@@ -106,7 +124,7 @@ variable "github_repository" {
   }
 }
 
-# Task 11 consumes this approved OIDC ref interface.
+# Task 11 restricts the read-only GitHub planning role to this exact ref.
 # tflint-ignore: terraform_unused_declarations
 variable "deploy_ref" {
   description = "Bounded Git ref admitted by the later deployment role."
@@ -125,7 +143,7 @@ variable "deploy_ref" {
   }
 }
 
-# Task 11 consumes this approved protected-environment interface.
+# Task 11 restricts the deployment role to this protected GitHub environment.
 # tflint-ignore: terraform_unused_declarations
 variable "deploy_environment" {
   description = "Protected GitHub environment admitted by the later deployment role."

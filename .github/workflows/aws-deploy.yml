@@ -1,0 +1,157 @@
+name: AWS deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      first_deployment:
+        description: Create the ECR foundation before building the first immutable worker image.
+        required: true
+        default: false
+        type: boolean
+      execute_workflow:
+        description: Start one bounded research workflow after the infrastructure deployment.
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: Apply reviewed AWS infrastructure
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: aws-demo
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_STATE_KEY: ${{ vars.TF_STATE_KEY }}
+      TF_VAR_backend_state_key: ${{ vars.TF_STATE_KEY }}
+      TF_VAR_project: ${{ vars.TF_PROJECT }}
+      TF_VAR_environment: ${{ vars.TF_ENVIRONMENT }}
+      TF_VAR_owner: ${{ vars.TF_OWNER }}
+      TF_VAR_cost_center: ${{ vars.TF_COST_CENTER }}
+      TF_VAR_expiry_date: ${{ vars.TF_EXPIRY_DATE }}
+      TF_VAR_alert_emails: ${{ vars.TF_ALERT_EMAILS_JSON }}
+      TF_VAR_image_digest: "0000000000000000000000000000000000000000000000000000000000000000"
+      TF_VAR_github_repository: ${{ github.repository }}
+      TF_VAR_deploy_ref: ${{ github.ref }}
+      TF_VAR_deploy_environment: aws-demo
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.12"
+          version: "0.11.29"
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.10.0"
+          terraform_wrapper: false
+
+      - name: Install TFLint
+        uses: terraform-linters/setup-tflint@6e1e0642c0289bd619021bf6b34e3c08ed1e005a # v6.3.0
+        with:
+          tflint_version: "v0.59.1"
+
+      - name: Configure deployment role through GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@99214aa6889fcddfa57764031d71add364327e59 # v6.1.3
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: github-terraform-deploy
+
+      - name: Validate non-secret deployment inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$AWS_REGION" =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]$ ]]
+          [[ "$TF_STATE_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]
+          [[ "$TF_STATE_KEY" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{1,510}[A-Za-z0-9]$ ]]
+          [[ "$TF_STATE_KEY" != *".."* && "$TF_STATE_KEY" != *"//"* && "$TF_STATE_KEY" != */./* ]]
+          [[ "$TF_VAR_project" =~ ^[a-z][a-z0-9-]{1,14}[a-z0-9]$ ]]
+          [[ "$TF_VAR_environment" =~ ^[a-z][a-z0-9-]{0,8}[a-z0-9]$ ]]
+          [[ "${{ inputs.first_deployment }}" == "true" || "${{ inputs.first_deployment }}" == "false" ]]
+          [[ "${{ inputs.execute_workflow }}" == "true" || "${{ inputs.execute_workflow }}" == "false" ]]
+
+      - name: Run locked validation gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --locked --extra dev --extra cloud
+          uv lock --check
+          uvx --python 3.12 --from pip-audit==2.10.1 pip-audit --strict \
+            -r <(uv export --locked --extra dev --extra cloud --no-hashes --format requirements-txt \
+              | rg -v '^-e \.$')
+          make test
+          make verify-warnings
+          make lint
+          terraform fmt -check -recursive infra
+          terraform -chdir=infra init -input=false \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=$TF_STATE_KEY" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="use_lockfile=true"
+          terraform -chdir=infra validate
+          terraform -chdir=infra test
+          tflint --chdir=infra --recursive
+          uvx --from checkov==3.2.485 checkov -d infra --config-file .checkov.yml
+
+      - name: Create and apply the exact first-deployment foundation plan
+        if: ${{ inputs.first_deployment }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          terraform -chdir=infra plan -input=false -out=foundation.tfplan \
+            -target=aws_ecr_repository.worker \
+            -target=aws_ecr_lifecycle_policy.worker
+          terraform -chdir=infra apply -input=false -auto-approve foundation.tfplan
+
+      - name: Build, push, and validate the immutable worker image digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          [[ "$ACCOUNT_ID" =~ ^[0-9]{12}$ ]]
+          REPOSITORY_NAME="${TF_VAR_project}-${TF_VAR_environment}-worker"
+          [[ "$REPOSITORY_NAME" =~ ^[a-z0-9][a-z0-9-]{1,254}$ ]]
+          IMAGE_TAG="$GITHUB_SHA"
+          [[ "$IMAGE_TAG" =~ ^[0-9a-f]{40}$ ]]
+          REGISTRY="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+          IMAGE_URI="$REGISTRY/$REPOSITORY_NAME"
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+          docker build --tag "$IMAGE_URI:$IMAGE_TAG" .
+          docker push "$IMAGE_URI:$IMAGE_TAG"
+          IMAGE_DIGEST="$(aws ecr describe-images --repository-name "$REPOSITORY_NAME" --image-ids imageTag="$IMAGE_TAG" --query 'imageDetails[0].imageDigest' --output text)"
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "IMAGE_DIGEST=${IMAGE_DIGEST#sha256:}" >> "$GITHUB_ENV"
+
+      - name: Create and apply the exact runtime plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          terraform -chdir=infra plan -input=false -out=runtime.tfplan -var="image_digest=$IMAGE_DIGEST"
+          terraform -chdir=infra apply -input=false -auto-approve runtime.tfplan
+
+      - name: Optionally start one bounded workflow
+        if: ${{ inputs.execute_workflow }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          STATE_MACHINE_ARN="$(terraform -chdir=infra output -raw state_machine_arn)"
+          [[ "$STATE_MACHINE_ARN" =~ ^arn:aws[a-z-]*:states:[a-z0-9-]+:[0-9]{12}:stateMachine:[A-Za-z0-9._-]+$ ]]
+          EXECUTION_NAME="manual-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ "$EXECUTION_NAME" =~ ^manual-[0-9]+-[0-9]+$ ]]
+          aws stepfunctions start-execution \
+            --state-machine-arn "$STATE_MACHINE_ARN" \
+            --name "$EXECUTION_NAME" \
+            --input '{"schema_version":"1","symbol":"SPY","start":"2024-01-02","end":"2024-01-10","strategy_key":"ma_crossover","strategy_parameters":{"fast_window":10,"slow_window":20},"initial_capital":10000.0,"commission_pct":0.001,"slippage_pct":0.0005,"visibility":"PRIVATE"}'
