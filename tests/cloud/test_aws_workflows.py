@@ -38,6 +38,27 @@ def _all_action_references(document: object) -> list[str]:
     return []
 
 
+def _setup_terraform_versions(document: object) -> list[str]:
+    """Return every parsed hashicorp/setup-terraform version pin."""
+    if isinstance(document, dict):
+        version: list[str] = []
+        uses = document.get("uses")
+        if isinstance(uses, str) and uses.startswith("hashicorp/setup-terraform@"):
+            configuration = document.get("with")
+            assert isinstance(configuration, dict)
+            terraform_version = configuration.get("terraform_version")
+            assert isinstance(terraform_version, str)
+            version.append(terraform_version)
+        return version + [
+            configured_version
+            for child in document.values()
+            for configured_version in _setup_terraform_versions(child)
+        ]
+    if isinstance(document, list):
+        return [version for child in document for version in _setup_terraform_versions(child)]
+    return []
+
+
 def _assert_safe_action_pins(document: dict[str, object]) -> None:
     for reference in _all_action_references(document):
         assert ACTION_SHA.fullmatch(reference), reference
@@ -114,6 +135,52 @@ def test_checks_is_pr_safe_and_has_no_aws_identity() -> None:
     assert "checkov" in text
     _assert_safe_action_pins(workflow)
     _assert_no_static_keys_or_untrusted_execution(text)
+
+
+def test_aws_workflows_pin_all_setup_terraform_steps_to_stable_version() -> None:
+    """Terraform test syntax needs the stable version that supports this repository."""
+    for workflow_name in ("aws-checks.yml", "aws-plan.yml", "aws-deploy.yml"):
+        workflow, _ = _workflow(workflow_name)
+        versions = _setup_terraform_versions(workflow)
+        assert versions
+        assert set(versions) == {"1.15.9"}
+
+
+def test_ci_installs_and_audits_cloud_dependencies_before_the_full_suite() -> None:
+    """Removing the cloud extra would make CI fail while collecting cloud tests."""
+    workflow, _ = _workflow("ci.yml")
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+
+    for job_name in ("linux-quality", "windows-quality"):
+        job = jobs[job_name]
+        assert isinstance(job, dict)
+        steps = job["steps"]
+        assert isinstance(steps, list)
+        install_index = next(
+            index
+            for index, step in enumerate(steps)
+            if step.get("name") == "Install locked dependencies"
+        )
+        full_suite_index = next(
+            index
+            for index, step in enumerate(steps)
+            if step.get("name") == "Run full test suite with coverage"
+        )
+        install_step = steps[install_index]
+        assert isinstance(install_step, dict)
+        assert re.findall(r"--extra\s+(\w+)", install_step["run"]) == ["dev", "cloud"]
+        assert install_index < full_suite_index
+
+    linux_steps = jobs["linux-quality"]["steps"]
+    assert isinstance(linux_steps, list)
+    audit_step = next(
+        step for step in linux_steps if step.get("name") == "Audit locked dependencies"
+    )
+    assert isinstance(audit_step, dict)
+    export = re.search(r"uv export[^\n]+", audit_step["run"])
+    assert export is not None
+    assert re.findall(r"--extra\s+(\w+)", export.group()) == ["dev", "cloud"]
 
 
 def test_plan_is_manual_read_only_and_does_not_publish_sensitive_artifacts() -> None:
