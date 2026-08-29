@@ -128,7 +128,7 @@ def acquire_dataset(
             symbol=request.symbol,
             started_at=started_at,
         )
-        with TemporaryDirectory(dir="/tmp") as temporary_directory:
+        with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             service = service_factory(cache_dir=root / "cache", manifest_dir=root / "manifests")
             result = service.acquire(_acquisition_request(request))

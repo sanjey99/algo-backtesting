@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import logging
+import tempfile
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -203,7 +204,10 @@ def test_handle_ingestion_uses_fresh_temporary_children_for_each_acquisition() -
     assert factory.calls[0][0].parent != factory.calls[1][0].parent
     assert all(cache_dir.name == "cache" for cache_dir, _ in factory.calls)
     assert all(manifest_dir.name == "manifests" for _, manifest_dir in factory.calls)
-    assert all(cache_dir.parent.parent == Path("/tmp") for cache_dir, _ in factory.calls)
+    assert all(
+        cache_dir.parent.parent == Path(tempfile.gettempdir())
+        for cache_dir, _ in factory.calls
+    )
     assert all(not cache_dir.parent.exists() for cache_dir, _ in factory.calls)
 
 
