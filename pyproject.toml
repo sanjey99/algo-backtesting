@@ -29,6 +29,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+cloud = [
+    "awslambdaric>=3.0,<4",
+    "boto3>=1.35,<2",
+]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=4.1",
@@ -38,6 +42,7 @@ dev = [
     "ruff>=0.3",
     "pandas-stubs>=2.0",
     "httpx2>=2.10.0",
+    "PyYAML>=6,<7",
 ]
 
 [tool.hatch.build.targets.wheel]

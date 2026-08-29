@@ -1,0 +1,80 @@
+name: AWS checks
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  cloud-quality:
+    name: Cloud quality and infrastructure checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.12"
+          version: "0.11.29"
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.15.9"
+          terraform_wrapper: false
+
+      - name: Install TFLint
+        uses: terraform-linters/setup-tflint@6e1e0642c0289bd619021bf6b34e3c08ed1e005a # v6.3.0
+        with:
+          tflint_version: "v0.59.1"
+
+      - name: Install locked dependencies
+        run: uv sync --locked --extra dev --extra cloud
+
+      - name: Run cloud tests
+        run: uv run --locked --extra dev --extra cloud pytest tests/cloud -q
+
+      - name: Run full Python quality gates
+        run: |
+          set -euo pipefail
+          make test
+          make verify-warnings
+          make lint
+          uv lock --check
+
+      - name: Audit locked dependencies including cloud extra
+        shell: bash
+        run: |
+          set -euo pipefail
+          uvx --python 3.12 --from pip-audit==2.10.1 pip-audit --strict \
+            -r <(uv export --locked --extra dev --extra cloud --no-hashes --format requirements-txt \
+              | rg -v '^-e \.$')
+
+      - name: Build worker image without publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --tag algo-backtesting-worker:checks .
+
+      - name: Initialize Terraform without a remote backend
+        run: terraform -chdir=infra init -backend=false -input=false
+
+      - name: Check Terraform formatting and validate configuration
+        run: |
+          set -euo pipefail
+          terraform fmt -check -recursive infra
+          terraform -chdir=infra validate
+          terraform -chdir=infra test
+
+      - name: Lint Terraform
+        run: tflint --chdir=infra --recursive
+
+      - name: Scan Terraform with Checkov
+        run: uvx --from checkov==3.2.485 checkov -d infra --config-file .checkov.yml

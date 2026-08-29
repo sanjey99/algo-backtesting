@@ -1,0 +1,274 @@
+name: AWS deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      first_deployment:
+        description: Apply the ECR foundation before the first runtime plan.
+        required: true
+        default: false
+        type: boolean
+      execute_workflow:
+        description: Start the fixed bounded workflow after the approved runtime apply.
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: aws-deploy-${{ github.repository }}-aws-demo
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  TF_STATE_KEY: ${{ vars.TF_STATE_KEY }}
+  TF_VAR_backend_state_key: ${{ vars.TF_STATE_KEY }}
+  TF_VAR_region: ${{ vars.AWS_REGION }}
+  TF_VAR_project: ${{ vars.TF_PROJECT }}
+  TF_VAR_environment: ${{ vars.TF_ENVIRONMENT }}
+  TF_VAR_owner: ${{ vars.TF_OWNER }}
+  TF_VAR_cost_center: ${{ vars.TF_COST_CENTER }}
+  TF_VAR_expiry_date: ${{ vars.TF_EXPIRY_DATE }}
+  TF_VAR_alert_emails: ${{ vars.TF_ALERT_EMAILS_JSON }}
+  TF_VAR_image_digest: "0000000000000000000000000000000000000000000000000000000000000000"
+  TF_VAR_github_repository: ${{ github.repository }}
+  TF_VAR_deploy_ref: ${{ github.ref }}
+  TF_VAR_deploy_environment: aws-demo
+  WORKFLOW_SHA: ${{ github.sha }}
+  WORKFLOW_RUN_ID: ${{ github.run_id }}
+  WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+
+jobs:
+  preflight:
+    name: Offline quality and Terraform checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with: { python-version: "3.12", version: "0.11.29" }
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with: { terraform_version: "1.15.9", terraform_wrapper: false }
+      - uses: terraform-linters/setup-tflint@6e1e0642c0289bd619021bf6b34e3c08ed1e005a # v6.3.0
+        with: { tflint_version: "v0.59.1" }
+      - name: Run locked offline quality gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --locked --extra dev --extra cloud
+          uv run --locked --extra dev --extra cloud pytest tests/cloud -q
+          make test
+          make verify-warnings
+          make lint
+          uv lock --check
+          uvx --python 3.12 --from pip-audit==2.10.1 pip-audit --strict \
+            -r <(uv export --locked --extra dev --extra cloud --no-hashes --format requirements-txt | rg -v '^-e \.$')
+          docker build --tag algo-backtesting-worker:deploy-preflight .
+          terraform -chdir=infra init -backend=false -input=false
+          terraform fmt -check -recursive infra
+          terraform -chdir=infra validate
+          terraform -chdir=infra test
+          tflint --chdir=infra --recursive
+          uvx --from checkov==3.2.485 checkov -d infra --config-file .checkov.yml
+
+  foundation-plan:
+    needs: [preflight]
+    if: ${{ needs.preflight.result == 'success' && inputs.first_deployment }}
+    runs-on: ubuntu-24.04
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with: { terraform_version: "1.15.9", terraform_wrapper: false }
+      - uses: aws-actions/configure-aws-credentials@99214aa6889fcddfa57764031d71add364327e59 # v6.1.3
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: foundation-plan
+      - name: Create and summarize exact foundation plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TF_STATE_KEY" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{1,510}[A-Za-z0-9]$ ]]
+          [[ "$TF_STATE_KEY" != *".."* && "$TF_STATE_KEY" != *"//"* && "$TF_STATE_KEY" != */./* ]]
+          [[ "$AWS_REGION" =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]$ ]]
+          [[ "$TF_STATE_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          [[ "$ACCOUNT_ID" =~ ^[0-9]{12}$ ]]
+          terraform -chdir=infra init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="key=$TF_STATE_KEY" -backend-config="region=$AWS_REGION" -backend-config="use_lockfile=true"
+          terraform -chdir=infra plan -input=false -out=foundation.tfplan -target=aws_ecr_repository.worker -target=aws_ecr_lifecycle_policy.worker
+          (cd infra && sha256sum foundation.tfplan > foundation.tfplan.sha256)
+          jq -n --arg sha "$GITHUB_SHA" --arg run_id "$GITHUB_RUN_ID" --arg run_attempt "$GITHUB_RUN_ATTEMPT" --arg account_id "$ACCOUNT_ID" --arg region "$AWS_REGION" --arg state_bucket "$TF_STATE_BUCKET" --arg state_key "$TF_STATE_KEY" --arg plan "foundation.tfplan" '{sha: $sha, run_id: $run_id, run_attempt: $run_attempt, account_id: $account_id, region: $region, state_bucket: $state_bucket, state_key: $state_key, plan: $plan}' > infra/manifest.json
+          terraform -chdir=infra show -no-color foundation.tfplan >> "$GITHUB_STEP_SUMMARY"
+      - id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: foundation-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            infra/foundation.tfplan
+            infra/foundation.tfplan.sha256
+            infra/manifest.json
+          retention-days: 1
+          if-no-files-found: error
+
+  foundation-apply:
+    if: ${{ inputs.first_deployment }}
+    needs: [foundation-plan]
+    runs-on: ubuntu-24.04
+    environment: aws-demo
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with: { terraform_version: "1.15.9", terraform_wrapper: false }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.foundation-plan.outputs.artifact_id }}
+          path: infra
+          merge-multiple: true
+      - uses: aws-actions/configure-aws-credentials@99214aa6889fcddfa57764031d71add364327e59 # v6.1.3
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: foundation-apply
+      - name: Verify then apply the exact reviewed foundation plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(jq -r .sha infra/manifest.json)" = "$GITHUB_SHA"
+          test "$(jq -r .run_id infra/manifest.json)" = "$GITHUB_RUN_ID"
+          test "$(jq -r .run_attempt infra/manifest.json)" = "$GITHUB_RUN_ATTEMPT"
+          test "$(jq -r .plan infra/manifest.json)" = "foundation.tfplan"
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          [[ "$ACCOUNT_ID" =~ ^[0-9]{12}$ ]]
+          [[ "$AWS_REGION" =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]$ ]]
+          [[ "$TF_STATE_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]
+          [[ "$TF_STATE_KEY" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{1,510}[A-Za-z0-9]$ ]]
+          test "$(jq -r .account_id infra/manifest.json)" = "$ACCOUNT_ID"
+          test "$(jq -r .region infra/manifest.json)" = "$AWS_REGION"
+          test "$(jq -r .state_bucket infra/manifest.json)" = "$TF_STATE_BUCKET"
+          test "$(jq -r .state_key infra/manifest.json)" = "$TF_STATE_KEY"
+          (cd infra && sha256sum --check foundation.tfplan.sha256)
+          terraform -chdir=infra init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="key=$TF_STATE_KEY" -backend-config="region=$AWS_REGION" -backend-config="use_lockfile=true"
+          terraform -chdir=infra apply -input=false -auto-approve foundation.tfplan
+
+  runtime-plan:
+    needs: [preflight, foundation-apply]
+    if: ${{ always() && needs.preflight.result == 'success' && (inputs.first_deployment == false || needs.foundation-apply.result == 'success') }}
+    runs-on: ubuntu-24.04
+    environment: aws-demo
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with: { terraform_version: "1.15.9", terraform_wrapper: false }
+      - uses: aws-actions/configure-aws-credentials@99214aa6889fcddfa57764031d71add364327e59 # v6.1.3
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: runtime-plan
+      - name: Build, push, and capture the immutable worker image
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          [[ "$ACCOUNT_ID" =~ ^[0-9]{12}$ ]]
+          REPOSITORY_NAME="${TF_VAR_project}-${TF_VAR_environment}-worker"
+          [[ "$REPOSITORY_NAME" =~ ^[a-z0-9][a-z0-9-]{1,254}$ ]]
+          IMAGE_TAG="$GITHUB_SHA"
+          [[ "$IMAGE_TAG" =~ ^[0-9a-f]{40}$ ]]
+          REGISTRY="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+          IMAGE_URI="$REGISTRY/$REPOSITORY_NAME"
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+          docker build --tag "$IMAGE_URI:$IMAGE_TAG" .
+          docker push "$IMAGE_URI:$IMAGE_TAG"
+          IMAGE_DIGEST="$(aws ecr describe-images --repository-name "$REPOSITORY_NAME" --image-ids imageTag="$IMAGE_TAG" --query 'imageDetails[0].imageDigest' --output text)"
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "IMAGE_DIGEST=${IMAGE_DIGEST#sha256:}" >> "$GITHUB_ENV"
+      - name: Create and summarize exact runtime plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TF_STATE_KEY" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{1,510}[A-Za-z0-9]$ ]]
+          [[ "$TF_STATE_KEY" != *".."* && "$TF_STATE_KEY" != *"//"* && "$TF_STATE_KEY" != */./* ]]
+          [[ "$AWS_REGION" =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]$ ]]
+          [[ "$TF_STATE_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          [[ "$ACCOUNT_ID" =~ ^[0-9]{12}$ ]]
+          terraform -chdir=infra init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="key=$TF_STATE_KEY" -backend-config="region=$AWS_REGION" -backend-config="use_lockfile=true"
+          [[ "$IMAGE_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          terraform -chdir=infra plan -input=false -out=runtime.tfplan -var="image_digest=$IMAGE_DIGEST"
+          (cd infra && sha256sum runtime.tfplan > runtime.tfplan.sha256)
+          jq -n --arg sha "$GITHUB_SHA" --arg run_id "$GITHUB_RUN_ID" --arg run_attempt "$GITHUB_RUN_ATTEMPT" --arg account_id "$ACCOUNT_ID" --arg region "$AWS_REGION" --arg state_bucket "$TF_STATE_BUCKET" --arg state_key "$TF_STATE_KEY" --arg plan "runtime.tfplan" '{sha: $sha, run_id: $run_id, run_attempt: $run_attempt, account_id: $account_id, region: $region, state_bucket: $state_bucket, state_key: $state_key, plan: $plan}' > infra/manifest.json
+          terraform -chdir=infra show -no-color runtime.tfplan >> "$GITHUB_STEP_SUMMARY"
+      - id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: runtime-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            infra/runtime.tfplan
+            infra/runtime.tfplan.sha256
+            infra/manifest.json
+          retention-days: 1
+          if-no-files-found: error
+
+  runtime-apply:
+    needs: [runtime-plan]
+    runs-on: ubuntu-24.04
+    environment: aws-demo
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with: { terraform_version: "1.15.9", terraform_wrapper: false }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.runtime-plan.outputs.artifact_id }}
+          path: infra
+          merge-multiple: true
+      - uses: aws-actions/configure-aws-credentials@99214aa6889fcddfa57764031d71add364327e59 # v6.1.3
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: runtime-apply
+      - name: Verify then apply the exact reviewed runtime plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(jq -r .sha infra/manifest.json)" = "$GITHUB_SHA"
+          test "$(jq -r .run_id infra/manifest.json)" = "$GITHUB_RUN_ID"
+          test "$(jq -r .run_attempt infra/manifest.json)" = "$GITHUB_RUN_ATTEMPT"
+          test "$(jq -r .plan infra/manifest.json)" = "runtime.tfplan"
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          [[ "$ACCOUNT_ID" =~ ^[0-9]{12}$ ]]
+          [[ "$AWS_REGION" =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]$ ]]
+          [[ "$TF_STATE_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]
+          [[ "$TF_STATE_KEY" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{1,510}[A-Za-z0-9]$ ]]
+          test "$(jq -r .account_id infra/manifest.json)" = "$ACCOUNT_ID"
+          test "$(jq -r .region infra/manifest.json)" = "$AWS_REGION"
+          test "$(jq -r .state_bucket infra/manifest.json)" = "$TF_STATE_BUCKET"
+          test "$(jq -r .state_key infra/manifest.json)" = "$TF_STATE_KEY"
+          (cd infra && sha256sum --check runtime.tfplan.sha256)
+          terraform -chdir=infra init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="key=$TF_STATE_KEY" -backend-config="region=$AWS_REGION" -backend-config="use_lockfile=true"
+          terraform -chdir=infra apply -input=false -auto-approve runtime.tfplan
+      - name: Optionally start one bounded workflow after apply
+        if: ${{ inputs.execute_workflow }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          STATE_MACHINE_ARN="$(terraform -chdir=infra output -raw state_machine_arn)"
+          [[ "$STATE_MACHINE_ARN" =~ ^arn:aws[a-z-]*:states:[a-z0-9-]+:[0-9]{12}:stateMachine:[A-Za-z0-9._-]+$ ]]
+          EXECUTION_NAME="manual-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ "$EXECUTION_NAME" =~ ^manual-[0-9]+-[0-9]+$ ]]
+          aws stepfunctions start-execution --state-machine-arn "$STATE_MACHINE_ARN" --name "$EXECUTION_NAME" --input '{"schema_version":"1","symbol":"SPY","start":"2024-01-02","end":"2024-01-10","strategy_key":"ma_crossover","strategy_parameters":{"fast_window":10,"slow_window":20},"initial_capital":10000.0,"commission_pct":0.001,"slippage_pct":0.0005,"visibility":"PRIVATE"}'

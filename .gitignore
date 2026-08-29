@@ -12,8 +12,40 @@ data/raw/
 data/adjusted/
 data/*.db
 .env
+.env.*
+!.env.example
+**/.env
+**/.env.*
 *.parquet
 notebooks/.ipynb_checkpoints/
 htmlcov/
 .coverage
 .worktrees/
+
+# Terraform and generated cloud-operation state.  The lockfile is a reviewed
+# dependency input and must stay under version control.
+.terraform/
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfplan.*
+*.tfvars
+*.tfvars.json
+!.terraform.lock.hcl
+
+# Local cloud smoke receipts, plans, reports, and copied artifacts.
+artifacts/cloud/
+reports/cloud/
+cloud-artifacts/
+cloud-reports/
+*.aws-plan
+
+# Credentials and private key material never belong in source control.
+.aws/
+credentials
+credentials.*
+*.pem
+*.key
+*.p12
+*.pfx

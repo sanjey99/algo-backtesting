@@ -15,7 +15,9 @@ except ImportError:
     PLOTLY_AVAILABLE = False
 
 
-def _build_equity_chart_html(equity_curve: list[Any]) -> str:
+def _build_equity_chart_html(
+    equity_curve: list[Any], *, chart_div_id: str | None = None
+) -> str:
     """Return a standalone Plotly chart HTML snippet."""
     if not PLOTLY_AVAILABLE:
         return "<p>Plotly not available — install plotly to see the equity chart.</p>"
@@ -47,15 +49,27 @@ def _build_equity_chart_html(equity_curve: list[Any]) -> str:
         height=400,
         margin=dict(l=20, r=20, t=40, b=20),
     )
-    return str(pio.to_html(fig, full_html=False, include_plotlyjs=True))
+    return str(
+        pio.to_html(
+            fig,
+            full_html=False,
+            include_plotlyjs=True,
+            div_id=chart_div_id,
+        )
+    )
 
 
-def generate_html_report(result: BacktestResult, metrics: dict[str, Any] | None = None) -> str:
+def generate_html_report(
+    result: BacktestResult,
+    metrics: dict[str, Any] | None = None,
+    *,
+    chart_div_id: str | None = None,
+) -> str:
     """Return a fully standalone HTML report with embedded Plotly equity chart."""
     if metrics is None:
         metrics = compute_all_metrics(result)
 
-    chart_html = _build_equity_chart_html(result.equity_curve)
+    chart_html = _build_equity_chart_html(result.equity_curve, chart_div_id=chart_div_id)
     strategy_name = escape(str(result.strategy_name), quote=True)
     symbol = escape(str(result.symbol), quote=True)
     start_date = escape(str(result.start_date), quote=True)
